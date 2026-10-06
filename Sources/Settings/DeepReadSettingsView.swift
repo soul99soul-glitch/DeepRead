@@ -10,7 +10,7 @@ struct DeepReadSettingsView: View {
             Group {
                 Section {
                     DeepReadAccentPicker()
-                    NavigationLink { DeepReadTemplatesView(settings: store) } label: {
+                    NavigationLink { DeepReadTemplatesView(settings: store).deepReadDockClearance() } label: {
                         LabeledContent("版式与样式", value: "\(DeepReadAppearance.shared.readerLayout.name) · \(DeepReadAppearance.shared.readerStyle.name)")
                     }
                 } header: {
@@ -35,7 +35,7 @@ struct DeepReadSettingsView: View {
                     .id(DeepReadAppearance.shared.accent)
                     ForEach($store.models) { $model in
                         NavigationLink {
-                            DeepReadModelEditor(model: $model)
+                            DeepReadModelEditor(model: $model).deepReadDockClearance()
                         } label: {
                             VStack(alignment: .leading) {
                                 Text(model.name)
@@ -61,7 +61,7 @@ struct DeepReadSettingsView: View {
                     .id(DeepReadAppearance.shared.accent)
                     ForEach($store.searchServices) { $service in
                         NavigationLink {
-                            DeepReadSearchEditor(service: $service)
+                            DeepReadSearchEditor(service: $service).deepReadDockClearance()
                         } label: {
                             HStack {
                                 Text(service.kind.title)
@@ -116,7 +116,7 @@ struct DeepReadSettingsView: View {
                         }
                     }
                     .id(DeepReadAppearance.shared.accent)
-                    NavigationLink("管理与创建模板") { DeepReadTemplatesView(settings: store) }
+                    NavigationLink("管理与创建模板") { DeepReadTemplatesView(settings: store).deepReadDockClearance() }
                 }
                     Section {
                     Button {
@@ -142,7 +142,6 @@ struct DeepReadSettingsView: View {
             .listRowBackground(DeepReadPalette.card)
         }
         .scrollContentBackground(.hidden)
-        .modifier(DeepReadTabVisibility())
         .background { DeepReadPaperBackground(night: DeepReadMoment.isNight(.now)) }
         .animation(.snappy, value: saved)
         .sensoryFeedback(.success, trigger: savedCount)

@@ -2,6 +2,15 @@ import XCTest
 @testable import AmberDeepRead
 
 final class DeepReadTemplateExportTests: XCTestCase {
+    func testTextExportPreservesOrderedListStart() {
+        XCTAssertEqual(DeepReadTextExporter.text(from: "3. 第三步\n4. 第四步"), "3. 第三步\n4. 第四步")
+    }
+
+    func testTextExportPreservesHTMLBlockContent() {
+        let markdown = "前文\n\n<div>\n正文不可丢失\n</div>\n\n后文"
+        XCTAssertEqual(DeepReadTextExporter.text(from: markdown), markdown)
+    }
+
     func testCustomTemplateUsesFullConfiguredFontScale() throws {
         let template = IOSDeepReadCustomTemplate(name: "默认", description: "", html: IOSDeepReadHTMLTemplateRenderer.starterHTML(), createdByAI: false)
         let task = IOSDeepReadTask(id: "test", title: "标题", status: .succeeded, templateId: template.id, sources: [], resultMarkdown: "正文", failureMessage: nil, createdAt: 0, updatedAt: 0, completedAt: 0, retryCount: 0)

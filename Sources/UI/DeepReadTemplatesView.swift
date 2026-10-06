@@ -113,7 +113,7 @@ struct DeepReadTemplatesView: View {
                     Button("新建 HTML 模板", systemImage: "plus") {
                         editing = .init(name: "自定义模板", description: "", html: IOSDeepReadHTMLTemplateRenderer.starterHTML(), createdByAI: false)
                     }
-                    NavigationLink("用 AI 生成模板", destination: DeepReadTemplateGeneratorView(settings: settings))
+                    NavigationLink("用 AI 生成模板", destination: DeepReadTemplateGeneratorView(settings: settings).deepReadDockClearance())
                 }
                 if let error = settings.errorMessage { Text(error).foregroundStyle(DeepReadPalette.danger) }
                 if let error = store.persistenceError { Text(error).foregroundStyle(DeepReadPalette.danger) }

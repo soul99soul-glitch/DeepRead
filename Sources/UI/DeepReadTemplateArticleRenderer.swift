@@ -3,12 +3,14 @@ import Foundation
 /// Page for template syntheses. Shares the close-reading head (palette, fonts, reader style)
 /// and its block styles; adds Q&A, camps, citations and the numbered source list.
 enum DeepReadTemplateArticleRenderer {
+    /// `galaxyEntry` adds the easter-egg card that opens a debate as the Jupiter scene (never in print).
     static func html(_ a: DeepReadTemplateArticle, palette: DeepReadCloseReadingRenderer.Palette,
-                     fontMode: String, styleCSS: String, scale: Double) -> String {
+                     fontMode: String, styleCSS: String, scale: Double, galaxyEntry: Bool = false) -> String {
         var b = DeepReadCloseReadingRenderer.head(palette: palette, fontMode: fontMode, styleCSS: styleCSS, scale: scale, extraCSS: css)
         b += #"<article class="template">"#
         b += #"<section class="headline"><p class="kicker">"# + esc(a.kind.name) + "</p><h1>" + esc(a.title) + "</h1>"
         if !a.lede.isEmpty { b += #"<div class="summary markdown-body"><p>"# + inline(a.lede) + "</p></div>" }
+        if galaxyEntry, let debate = a.debate { b += galaxyCard(campCount: debate.camps.count) }
         b += "</section>"
 
         if let brief = a.brief {
@@ -94,6 +96,11 @@ enum DeepReadTemplateArticleRenderer {
         }
         b += "</article></body></html>"
         return b
+    }
+
+    private static func galaxyCard(campCount: Int) -> String {
+        #"<style>.galaxy-entry{display:flex;align-items:center;gap:14px;margin:18px 0 6px;padding:14px 16px;border-radius:18px;text-decoration:none;color:#f3ece2;background:radial-gradient(120% 140% at 0% 0%,#3a2d4f 0%,#141022 55%,#07060d 100%);box-shadow:0 10px 28px rgba(20,10,40,.28),inset 0 0 0 1px rgba(255,255,255,.08)}.galaxy-entry .planet{flex:0 0 auto;width:46px;height:46px;border-radius:50%;background:repeating-linear-gradient(172deg,#efe2c8 0 4px,#b9814f 4px 7px,#e2cba5 7px 10px,#9c6440 10px 12px);box-shadow:inset -9px -6px 12px rgba(0,0,0,.6),0 0 18px rgba(232,199,154,.25)}.galaxy-entry .text{flex:1;display:flex;flex-direction:column;gap:3px}.galaxy-entry b{font-size:16px}.galaxy-entry small{font-size:12.5px;color:rgba(243,236,226,.66)}.galaxy-entry .go{font-size:22px;color:rgba(243,236,226,.6)}</style>"#
+            + #"<a class="galaxy-entry" href="\#(DeepReadGalaxySchemeHandler.entryLink)"><span class="planet"></span><span class="text"><b>你发现了一个隐藏星系</b><small>争议化作木星，\#(campCount) 方阵营绕它运行</small></span><span class="go">›</span></a>"#
     }
 
     private static func section(_ title: String, _ body: String) -> String {

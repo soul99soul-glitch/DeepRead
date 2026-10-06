@@ -1,49 +1,64 @@
 import Foundation
+import Markdown
 
+/// Markdown → 纯文本导出。基于 swift-markdown AST（原实现经 Rust
+/// AmberNative FFI 的 packed-AST 遍历）。
 enum DeepReadTextExporter {
     static func text(from markdown: String) -> String {
-        guard let data = MarkdownBridge.parse(markdown),
-              let root = PackedAstReader(data: data)?.root() else { return markdown }
-        return render(root, source: Array(markdown.utf8)).trimmingCharacters(in: .newlines)
+        let document = Document(parsing: markdown)
+        return render(document).trimmingCharacters(in: .newlines)
     }
 
-    private static func render(_ node: PackedAstNode, source: [UInt8]) -> String {
-        let children = node.children
-        switch node.type {
-        case .root, .blockquote:
-            return children.map { render($0, source: source) }.joined(separator: "\n\n")
-        case .listUnordered, .listOrdered:
-            let start = node.extras.enumerated().reduce(UInt64(0)) { $0 | UInt64($1.element) << ($1.offset * 8) }
+    private static func render(_ node: some Markup) -> String {
+        let children = Array(node.children)
+        switch node {
+        case is Document, is BlockQuote:
+            return children.map { render($0) }.joined(separator: "\n\n")
+        case let list as OrderedList:
             return children.enumerated().map { index, item in
-                let marker = node.type == .listOrdered ? "\(start + UInt64(index))." : "-"
-                return marker + " " + render(item, source: source).replacingOccurrences(of: "\n", with: "\n  ")
+                "\(list.startIndex + UInt(index)). " + render(item).replacingOccurrences(of: "\n", with: "\n  ")
             }.joined(separator: "\n")
-        case .listItem:
-            let hasBlocks = children.contains { [.paragraph, .listOrdered, .listUnordered, .codeBlock, .blockquote].contains($0.type) }
-            return children.map { render($0, source: source) }.joined(separator: hasBlocks ? "\n" : "")
-        case .table:
-            return children.map { render($0, source: source) }.joined(separator: "\n")
-        case .tableHead, .tableRow:
-            let separator = children.first?.type == .tableRow ? "\n" : "\t"
-            return children.map { render($0, source: source) }.joined(separator: separator)
-        case .codeBlock:
-            return children.map { slice($0, source: source) }.joined().trimmingCharacters(in: .newlines)
-        case .inlineCode, .text:
-            let raw = slice(node, source: source)
-            let inline = try? AttributedString(markdown: raw, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))
-            return inline.map { String($0.characters) } ?? raw
-        case .softBreak, .hardBreak:
+        case let list as UnorderedList:
+            return children.map { item in
+                "- " + render(item).replacingOccurrences(of: "\n", with: "\n  ")
+            }.joined(separator: "\n")
+        case let item as ListItem:
+            var prefix = ""
+            if let checkbox = item.checkbox { prefix = (checkbox == .checked ? "[x]" : "[ ]") + " " }
+            let hasBlocks = children.contains { isBlockElement($0) }
+            return prefix + children.map { render($0) }.joined(separator: hasBlocks ? "\n" : "")
+        case let table as Table:
+            return children.map { render($0) }.joined(separator: "\n")
+        case let body as Table.Body:
+            return children.map { render($0) }.joined(separator: "\n")
+        case let head as Table.Head:
+            return head.children.compactMap { $0 as? Table.Cell }.map { render($0) }.joined(separator: "\t")
+        case let row as Table.Row:
+            return row.children.compactMap { $0 as? Table.Cell }.map { render($0) }.joined(separator: "\t")
+        case let code as CodeBlock:
+            return code.code.trimmingCharacters(in: .newlines)
+        case let inline as InlineCode:
+            return inline.code
+        case let text as Text:
+            return text.plainText
+        case let html as HTMLBlock:
+            return html.rawHTML.trimmingCharacters(in: .newlines)
+        case is SoftBreak, is LineBreak:
             return "\n"
-        case .taskListMarker:
-            return slice(node, source: source) + " "
-        case .horizontalRule:
+        case is ThematicBreak:
             return "---"
         default:
-            return children.isEmpty ? slice(node, source: source) : children.map { render($0, source: source) }.joined()
+            // 强调/链接/图片等：只保留文字内容（与旧实现一致）。
+            return children.map { render($0) }.joined()
         }
     }
 
-    private static func slice(_ node: PackedAstNode, source: [UInt8]) -> String {
-        String(decoding: source[node.startOffset..<node.endOffset], as: UTF8.self)
+    private static func isBlockElement(_ node: some Markup) -> Bool {
+        switch node {
+        case is Paragraph, is CodeBlock, is BlockQuote, is UnorderedList, is OrderedList:
+            return true
+        default:
+            return false
+        }
     }
 }

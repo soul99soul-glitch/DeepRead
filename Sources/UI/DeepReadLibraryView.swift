@@ -5,8 +5,9 @@ struct DeepReadLibraryView: View {
     let runtime: DeepReadRuntime
     @State private var query = ""
     @State private var status: IOSDeepReadTaskStatus?
-    @State private var presentingCreate = false
-    @State private var selectedTaskId: String?
+    @Binding var presentingCreate: Bool
+    @Binding var selectedTaskId: String?
+    @Binding var isSearchPresented: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Namespace private var zoom
     @Namespace private var filter
@@ -35,10 +36,7 @@ struct DeepReadLibraryView: View {
                     .padding(.top, 40)
                 } else {
                     ForEach(tasks) { task in
-                        NavigationLink {
-                            DeepReadDetailView(taskId: task.id, settings: settings, runtime: runtime)
-                                .navigationTransition(.zoom(sourceID: task.id, in: zoom))
-                        } label: { card(task) }
+                        Button { selectedTaskId = task.id } label: { card(task) }
                         .buttonStyle(DeepReadPressableStyle())
                         .matchedTransitionSource(id: task.id, in: zoom)
                         .scrollTransition { card, phase in
@@ -53,16 +51,10 @@ struct DeepReadLibraryView: View {
             .frame(maxWidth: 760)
             .frame(maxWidth: .infinity)
         }
-        .modifier(DeepReadTabVisibility())
         .background { DeepReadPaperBackground(night: DeepReadMoment.isNight(.now)) }
         .navigationTitle("阅读库")
-        .searchable(text: $query, prompt: "搜索标题与正文")
-        .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Button("创建", systemImage: "square.and.pencil") { presentingCreate = true }
-                    .accessibilityIdentifier("deepread.library.create")
-            }
-        }
+        .searchable(text: $query, isPresented: $isSearchPresented,
+            placement: .navigationBarDrawer(displayMode: .always), prompt: "搜索标题与正文")
         .sheet(isPresented: $presentingCreate) {
             NavigationStack {
                 DeepReadComposerView(settings: settings, runtime: runtime) { selectedTaskId = $0 }

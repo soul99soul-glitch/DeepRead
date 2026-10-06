@@ -1,5 +1,4 @@
 import XCTest
-@preconcurrency import Shared
 @testable import AmberDeepRead
 
 @MainActor
@@ -139,7 +138,7 @@ final class DeepReadCloseReadingTests: XCTestCase {
                 return DeepReadCloseReader.parseJina(self.article)
             },
             searchReports: { title, _ in probe.reportSearches.append(title); return probe.reports },
-            beginBackgroundTask: { _, _ in .invalid }, endBackgroundTask: { _ in })
+            continuedProcessing: nil, beginBackgroundTask: { _, _ in .invalid }, endBackgroundTask: { _ in })
     }
 
     private func waitForFinish(_ runtime: DeepReadRuntime) async {
@@ -567,4 +566,31 @@ final class DeepReadCloseReadingReviewFixTests: XCTestCase {
         XCTAssertNil(DeepReadCloseReader.mergeComparison(#"{"others":[{"source":7,"stance":"agree"}],"notes":[]}"#, into: reading, others: others),
                      "reports that all fail to parse are a failure, not an all-off-topic answer")
     }
+    func testSSPaiImagesSendOriginInBothReadingModes() {
+        let image = "https://cdnfile.sspai.com/2026/09/24/734ab4514cec7ae072a4357495308cf6.png?imageView2/2/w/1120/format/webp"
+        let paragraphs = [DeepReadCloseReading.Paragraph(id: 1, kind: .image, text: image),
+                          .init(id: 2, kind: .image, text: "https://example.org/image.jpg")]
+        let reading = DeepReadCloseReader.unannotated(page: .init(title: "T", text: "", heroImageURL: nil),
+                                                     url: "https://sspai.com/post/114945", site: "少数派", paragraphs: paragraphs)
+        let palette = DeepReadCloseReadingRenderer.Palette(accent: "#C8402F", bg: "#FBF7F1", fg: "#2A2320",
+                                                           surface: "#F2EADE", muted: "#6E6254", border: "#DBCEBC", dark: false)
+        for originalOnly in [false, true] {
+            let page = DeepReadCloseReadingRenderer.html(reading, palette: palette, fontMode: "system",
+                                                        styleCSS: "", scale: 1, originalOnly: originalOnly)
+            XCTAssertTrue(page.contains("<img src=\"\(image)\" referrerpolicy=\"origin\"/>"))
+            XCTAssertTrue(page.contains(#"<img src="https://example.org/image.jpg"/>"#))
+            XCTAssertTrue(page.contains(#"<meta name="referrer" content="no-referrer">"#))
+        }
+    }
+
+    func testSSPaiHeroUsesSameImagePolicy() {
+        let reading = DeepReadCloseReader.unannotated(page: .init(title: "T", text: "", heroImageURL: "https://cdnfile.sspai.com/hero.png"),
+                                                     url: nil, site: "少数派", paragraphs: [.init(id: 1, kind: .text, text: "正文")])
+        let palette = DeepReadCloseReadingRenderer.Palette(accent: "#C8402F", bg: "#FBF7F1", fg: "#2A2320",
+                                                           surface: "#F2EADE", muted: "#6E6254", border: "#DBCEBC", dark: false)
+        let page = DeepReadCloseReadingRenderer.html(reading, palette: palette, fontMode: "system", styleCSS: "", scale: 1)
+        XCTAssertTrue(page.contains(#"<img src="https://cdnfile.sspai.com/hero.png" referrerpolicy="origin"/>"#))
+    }
+
+
 }

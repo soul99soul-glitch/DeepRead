@@ -1,6 +1,5 @@
 import Foundation
 import Observation
-@preconcurrency import Shared
 
 @MainActor
 @Observable
@@ -16,18 +15,16 @@ final class IOSHotListDashboardStore {
 
     private let directory: URL
     private let fileURL: URL
-    private let encoder = JSONEncoder()
-    private let decoder = JSONDecoder()
-    private let fileManager: FileManager
+    @ObservationIgnored private var projection: Projection?
+    @ObservationIgnored private var rawTopicsLimit: Int?
 
     init(baseDirectory: URL? = nil, fileManager: FileManager = .default) {
-        self.fileManager = fileManager
         let root = baseDirectory
             ?? fileManager.urls(for: .documentDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
         directory = root.appendingPathComponent("deep_read", isDirectory: true)
         fileURL = directory.appendingPathComponent("hotlist_dashboard.json", isDirectory: false)
-        let cachedDashboard = Self.load(from: fileURL, decoder: decoder, fileManager: fileManager) ?? .empty
+        let cachedDashboard = Self.load(from: fileURL, decoder: JSONDecoder(), fileManager: fileManager) ?? .empty
         rawDashboard = cachedDashboard
         dashboard = cachedDashboard
     }
@@ -43,10 +40,16 @@ final class IOSHotListDashboardStore {
         defer { isRefreshing = false }
         let enabledIds = IOSHotlistProviders.effectiveEnabledProviderIds(setting: setting)
         guard !enabledIds.isEmpty else {
-            rawDashboard = .empty
-            dashboard = rawDashboard
+            if rawDashboard == .empty, projection == Projection(setting: setting, limit: limit) {
+                lastError = nil
+                return
+            }
+            guard let result = await rebuild(
+                raw: .empty, setting: setting, limit: limit,
+                rebuildRawTopics: false, persistRaw: rawDashboard != .empty
+            ), !Task.isCancelled else { return }
+            publish(result, setting: setting, limit: limit)
             lastError = nil
-            persist()
             return
         }
         if !force, !shouldRefresh(setting: setting) {
@@ -58,15 +61,16 @@ final class IOSHotListDashboardStore {
             let cached = rawDashboard.providers
             let prev = Dictionary(uniqueKeysWithValues: cached.map { ($0.providerId, $0) })
             let translated = await Self.applyTitleTranslations(to: cached, previous: prev, translate: translate)
-            let topics = IOSHotListAggregator.aggregate(providerSnapshots: translated, limit: limit)
-            rawDashboard = IOSHotListDashboard(
-                topics: topics,
-                providers: translated,
-                lastUpdatedAt: rawDashboard.lastUpdatedAt,
-                enabledSourceCount: rawDashboard.enabledSourceCount
-            )
-            dashboard = filteredDashboard(rawDashboard, setting: setting, limit: limit)
-            persist()
+            guard !Task.isCancelled else { return }
+            let changed = translated != cached
+            if !changed, projection == Projection(setting: setting, limit: limit) { return }
+            var raw = rawDashboard
+            raw.providers = translated
+            guard let result = await rebuild(
+                raw: raw, setting: setting, limit: limit,
+                rebuildRawTopics: changed, persistRaw: changed
+            ), !Task.isCancelled else { return }
+            publish(result, setting: setting, limit: limit)
             return
         }
 
@@ -119,25 +123,31 @@ final class IOSHotListDashboardStore {
         // Reuse cached translations so only new titles need a model request.
         snapshots = await Self.applyTitleTranslations(to: snapshots, previous: previous, translate: translate)
 
-        let topics = IOSHotListAggregator.aggregate(providerSnapshots: snapshots, limit: limit)
-        self.rawDashboard = IOSHotListDashboard(
-            topics: topics,
+        guard !Task.isCancelled else { return }
+        let raw = IOSHotListDashboard(
+            topics: [],
             providers: snapshots,
             lastUpdatedAt: snapshots.map(\.fetchedAt).max() ?? now,
             enabledSourceCount: enabledIds.count
         )
-        dashboard = filteredDashboard(self.rawDashboard, setting: setting, limit: limit)
+        guard let result = await rebuild(
+            raw: raw, setting: setting, limit: limit,
+            rebuildRawTopics: true, persistRaw: true
+        ), !Task.isCancelled else { return }
+        publish(result, setting: setting, limit: limit)
         if dashboard.hasErrors {
             lastError = dashboard.providers.compactMap(\.error).first
         }
-        persist()
     }
 
-    /// Re-applies local source and interest filters without starting a network
-    /// fetch or title translation. Used when Wi-Fi-only mode keeps the cache
-    /// visible while the current network is unavailable.
-    func applyCached(setting: TodayBoardSetting, limit: Int = 20) {
-        dashboard = filteredDashboard(rawDashboard, setting: setting, limit: limit)
+    /// Re-applies local source and interest filters without fetching or translating.
+    func applyCached(setting: TodayBoardSetting, limit: Int = 20) async {
+        guard projection != Projection(setting: setting, limit: limit) else { return }
+        guard let result = await rebuild(
+            raw: rawDashboard, setting: setting, limit: limit,
+            rebuildRawTopics: false, persistRaw: false
+        ), !Task.isCancelled else { return }
+        publish(result, setting: setting, limit: limit)
     }
 
     /// Fills `displayTitle` with a Chinese translation for non-Chinese titles.
@@ -238,16 +248,86 @@ final class IOSHotListDashboardStore {
         return IOSHotListClock.currentEpochMs() - rawDashboard.lastUpdatedAt >= gapMs
     }
 
-    private func filteredDashboard(
-        _ rawDashboard: IOSHotListDashboard,
+    private struct Projection: Equatable, Sendable {
+        let enabledIds: Set<String>
+        let translate: Bool
+        let keywords: [String]
+        let filterMode: String
+        let limit: Int
+
+        init(setting: TodayBoardSetting, limit: Int) {
+            enabledIds = IOSHotlistProviders.effectiveEnabledProviderIds(setting: setting)
+            translate = setting.hotListTranslateToChinese
+            keywords = setting.hotListFocusKeywords
+            filterMode = setting.hotListFilterMode.wireName
+            self.limit = limit
+        }
+    }
+
+    private struct BuildResult: Sendable {
+        let raw: IOSHotListDashboard
+        let visible: IOSHotListDashboard
+        let rawTopicsLimit: Int?
+    }
+
+    /// Aggregation, projection and disk work share one background step. Only
+    /// the completed value crosses back to the observable main-actor store.
+    private func rebuild(
+        raw: IOSHotListDashboard,
         setting: TodayBoardSetting,
-        limit: Int = 20
+        limit: Int,
+        rebuildRawTopics: Bool,
+        persistRaw: Bool
+    ) async -> BuildResult? {
+        let projection = Projection(setting: setting, limit: limit)
+        let rawTopicsLimit = rebuildRawTopics ? limit : self.rawTopicsLimit
+        let directory = directory
+        let fileURL = fileURL
+        let build = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            var raw = raw
+            if rebuildRawTopics {
+                raw.topics = IOSHotListAggregator.aggregate(providerSnapshots: raw.providers, limit: limit)
+            }
+            let visible = Self.filteredDashboard(raw, projection: projection, rawTopicsLimit: rawTopicsLimit)
+            try Task.checkCancellation()
+            if persistRaw {
+                do {
+                    let data = try JSONEncoder().encode(raw)
+                    try Task.checkCancellation()
+                    try FileManager().createDirectory(at: directory, withIntermediateDirectories: true)
+                    try data.write(to: fileURL, options: [.atomic])
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    print("[IOSHotListDashboardStore] persist failed: \(error.localizedDescription)")
+                }
+            }
+            return BuildResult(raw: raw, visible: visible, rawTopicsLimit: rawTopicsLimit)
+        }
+        return try? await withTaskCancellationHandler {
+            try await build.value
+        } onCancel: {
+            build.cancel()
+        }
+    }
+
+    private func publish(_ result: BuildResult, setting: TodayBoardSetting, limit: Int) {
+        rawDashboard = result.raw
+        dashboard = result.visible
+        rawTopicsLimit = result.rawTopicsLimit
+        projection = Projection(setting: setting, limit: limit)
+    }
+
+    private nonisolated static func filteredDashboard(
+        _ raw: IOSHotListDashboard,
+        projection: Projection,
+        rawTopicsLimit: Int?
     ) -> IOSHotListDashboard {
-        let enabledIds = IOSHotlistProviders.effectiveEnabledProviderIds(setting: setting)
-        let providers = rawDashboard.providers
-            .filter { enabledIds.contains($0.providerId) }
+        let providers = raw.providers
+            .filter { projection.enabledIds.contains($0.providerId) }
             .map { provider in
-                guard !setting.hotListTranslateToChinese else { return provider }
+                guard !projection.translate else { return provider }
                 var projected = provider
                 projected.items = projected.items.map { item in
                     var item = item
@@ -256,27 +336,21 @@ final class IOSHotListDashboardStore {
                 }
                 return projected
             }
+        // The common all-sources projection already has exactly these topics.
+        let topics = providers == raw.providers && rawTopicsLimit == projection.limit
+            ? raw.topics
+            : IOSHotListAggregator.aggregate(providerSnapshots: providers, limit: projection.limit)
         let visible = IOSHotListDashboard(
-            topics: IOSHotListAggregator.aggregate(providerSnapshots: providers, limit: limit),
+            topics: topics,
             providers: providers,
-            lastUpdatedAt: rawDashboard.lastUpdatedAt,
-            enabledSourceCount: enabledIds.count
+            lastUpdatedAt: raw.lastUpdatedAt,
+            enabledSourceCount: projection.enabledIds.count
         )
         return IOSHotListAggregator.applyInterestFilter(
             dashboard: visible,
-            keywords: setting.hotListFocusKeywords,
-            modeWireName: setting.hotListFilterMode.wireName
+            keywords: projection.keywords,
+            modeWireName: projection.filterMode
         )
-    }
-
-    private func persist() {
-        do {
-            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
-            let data = try encoder.encode(rawDashboard)
-            try data.write(to: fileURL, options: [.atomic])
-        } catch {
-            print("[IOSHotListDashboardStore] persist failed: \(error.localizedDescription)")
-        }
     }
 
     private static func load(from url: URL, decoder: JSONDecoder, fileManager: FileManager) -> IOSHotListDashboard? {
@@ -285,4 +359,3 @@ final class IOSHotListDashboardStore {
         return try? decoder.decode(IOSHotListDashboard.self, from: data)
     }
 }
-

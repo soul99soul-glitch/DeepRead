@@ -1,6 +1,5 @@
 import Foundation
 import Observation
-@preconcurrency import Shared
 
 struct IOSDeepReadTemplate: Codable, Equatable, Identifiable, Sendable {
     var id: String
@@ -343,7 +342,7 @@ enum IOSDeepReadTemplateDraftGenerator {
         brief: String,
         providerSetting: ProviderSetting,
         modelId: String,
-        provider: IOSAgentTextProvider = OpenAIKmpProviderAdapter()
+        provider: IOSAgentTextProvider = DeepReadAIProviderAdapter()
     ) async throws -> IOSDeepReadCustomTemplate {
         let safeModel = modelId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !safeModel.isEmpty else { throw DraftError.missingModel }
@@ -355,15 +354,14 @@ enum IOSDeepReadTemplateDraftGenerator {
         用户要求：\(brief)
         """
         let messages = [
-            UIMessage.companion.system(prompt: "你只输出 JSON，不输出 Markdown 代码围栏。"),
-            UIMessage.companion.user(prompt: prompt)
+            UIMessage.system(prompt: "你只输出 JSON，不输出 Markdown 代码围栏。"),
+            UIMessage.user(prompt: prompt)
         ]
         let params = TextGenerationParams(
-            model: Model(modelId: safeModel, displayName: safeModel, id: KotlinUuid.companion.random(), type: ModelType.chat, customHeaders: [], customBodies: [], inputModalities: [], outputModalities: [], abilities: [], tools: Set<BuiltInTools>(), contextWindowTokens: nil, providerOverwrite: nil),
+            model: Model(modelId: safeModel, displayName: safeModel, id: UUID(), type: ModelType.chat, customHeaders: [], customBodies: [], inputModalities: [], outputModalities: [], abilities: [], tools: Set<BuiltInTools>(), contextWindowTokens: nil, providerOverwrite: nil),
             temperature: nil,
             topP: nil,
-            maxTokens: KotlinInt(value: 2_800),
-            tools: [],
+            maxTokens: 2_800,
             reasoningLevel: .off,
             customHeaders: [],
             customBody: []

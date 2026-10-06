@@ -1,5 +1,4 @@
 import SwiftUI
-@preconcurrency import Shared
 @preconcurrency import Network
 
 struct DeepReadDiscoveryView: View {
@@ -7,8 +6,9 @@ struct DeepReadDiscoveryView: View {
     let runtime: DeepReadRuntime
     @State private var dashboard = IOSHotListDashboardStore.shared
     @State private var preferences = DeepReadDiscoveryPreferences.shared
-    @State private var presentingCreate = false
-    @State private var selectedTaskId: String?
+    @Binding var presentingCreate: Bool
+    @Binding var presentingSourceSettings: Bool
+    @Binding var selectedTaskId: String?
     @State private var zoomSource: String?
     @State private var error: String?
     @State private var listShown = false
@@ -18,6 +18,7 @@ struct DeepReadDiscoveryView: View {
     @State private var visible = false
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.deepReadTabActive) private var tabActive
     @Namespace private var zoom
 
     private struct LuckyPick: Identifiable, Equatable {
@@ -31,14 +32,16 @@ struct DeepReadDiscoveryView: View {
 
     var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 10) {
+            LazyVStack(alignment: .leading, spacing: 0) {
                 DeepReadMasthead(issue: runtime.store.tasks.count + 1)
+                    .padding(.bottom, 10)
 
                 if let error {
                     Label(error, systemImage: "exclamationmark.triangle")
                         .font(.footnote).foregroundStyle(DeepReadPalette.danger).textSelection(.enabled)
                         .padding(14).frame(maxWidth: .infinity, alignment: .leading).deepReadCard()
                         .transition(.move(edge: .top).combined(with: .opacity))
+                        .padding(.bottom, 10)
                 }
                 content
             }
@@ -48,27 +51,16 @@ struct DeepReadDiscoveryView: View {
             .frame(maxWidth: .infinity)
             .animation(.snappy, value: error)
         }
-        .modifier(DeepReadTabVisibility())
         .background { DeepReadPaperBackground(night: DeepReadMoment.isNight(.now)) }
         .navigationTitle("深度阅读")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                NavigationLink { DeepReadDiscoverySettingsView() } label: { Image(systemName: "line.3.horizontal.decrease") }
-                    .accessibilityLabel("热点来源设置")
-            }
-            ToolbarItem(placement: .topBarTrailing) {
-                Button("创建阅读", systemImage: "square.and.pencil") { presentingCreate = true }
-                    .accessibilityIdentifier("deepread.discovery.create")
-            }
-        }
         .safeAreaInset(edge: .bottom) {
             if let lucky { luckyBanner(lucky).transition(.move(edge: .bottom).combined(with: .opacity)) }
         }
         .sensoryFeedback(.success, trigger: lucky) { _, new in new != nil }
         .onAppear { visible = true }
         .onDisappear { visible = false }
-        .onReceive(NotificationCenter.default.publisher(for: .deepReadDeviceShaken)) { _ in if visible && !presentingCreate { shuffle() } }
+        .onReceive(NotificationCenter.default.publisher(for: .deepReadDeviceShaken)) { _ in if visible && tabActive && !presentingCreate { shuffle() } }
         .task(id: lucky?.id) {
             guard lucky != nil else { return }
             // A newer pick cancels this task; don't clear it.
@@ -94,13 +86,14 @@ struct DeepReadDiscoveryView: View {
         }
         .navigationDestination(item: $selectedTaskId) { id in
             DeepReadDetailView(taskId: id, settings: settings, runtime: runtime)
-                .navigationTransition(.zoom(sourceID: zoomSource ?? id, in: zoom))
+                .navigationTransition(.automatic)
         }
+        .navigationDestination(isPresented: $presentingSourceSettings) { DeepReadDiscoverySettingsView().deepReadDockClearance() }
     }
 
     @ViewBuilder private var content: some View {
-        if dashboard.isRefreshing && !dashboard.dashboard.hasContent {
-            ForEach(0..<3, id: \.self) { _ in placeholderCard }
+        if !dashboard.dashboard.hasContent && dashboard.isRefreshing {
+            ForEach(0..<3, id: \.self) { _ in placeholderCard.padding(.bottom, 10) }
         } else if !dashboard.dashboard.hasContent {
             ContentUnavailableView("暂无热点", systemImage: "newspaper",
                 description: Text(preferences.configuration.enabledSources.isEmpty ? "在热点来源中启用榜单，或直接创建阅读。" : "下拉刷新，或从自己的主题开始阅读。"))
@@ -110,6 +103,7 @@ struct DeepReadDiscoveryView: View {
         if !dashboard.dashboard.topics.isEmpty {
             DeepReadSectionHeader(title: "多来源热点", detail: "多个榜单都在讨论")
                 .deepReadEntrance(0, shown: listShown)
+                .padding(.bottom, 10)
             ForEach(Array(dashboard.dashboard.topics.enumerated()), id: \.element.id) { index, topic in
                 let sources = { try IOSDeepReadSourceNormalizer.hotTopicSources(topic: topic) }
                 Button {
@@ -120,12 +114,11 @@ struct DeepReadDiscoveryView: View {
                 .matchedTransitionSource(id: topic.id, in: zoom)
                 .deepReadEntrance(index + 1, shown: listShown)
                 .modifier(Scatter(index: index, seed: scatter, active: scattered))
+                .padding(.bottom, 10)
             }
         }
         ForEach(Array(dashboard.dashboard.providers.enumerated()), id: \.element.id) { index, provider in
-            providerBlock(provider)
-                .deepReadEntrance(dashboard.dashboard.topics.count + index + 1, shown: listShown)
-                .modifier(Scatter(index: index + 40, seed: scatter, active: scattered))
+            providerSection(provider, index: index)
         }
     }
 
@@ -151,7 +144,7 @@ struct DeepReadDiscoveryView: View {
         .deepReadCard()
     }
 
-    private func providerBlock(_ provider: IOSHotListProviderSnapshot) -> some View {
+    private func providerHeader(_ provider: IOSHotListProviderSnapshot) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .firstTextBaseline) {
                 Text(provider.providerName).font(.system(.headline, design: .serif)).foregroundStyle(DeepReadPalette.ink)
@@ -169,34 +162,59 @@ struct DeepReadDiscoveryView: View {
                 Text("暂时无法更新，显示上次取得的内容。")
                     .font(.caption).foregroundStyle(DeepReadPalette.muted).padding(.bottom, 6)
             }
-            ForEach(Array(provider.items.enumerated()), id: \.offset) { offset, item in
-                if offset > 0 { Rectangle().fill(DeepReadPalette.rule).frame(height: 0.6) }
-                let zoomID = "\(provider.id)|\(item.rank)"
-                let sources = { [itemSource(item, provider: provider)] }
-                Button {
-                    start(item.presentationTitle, zoomID: zoomID, sources: sources)
-                } label: {
-                    HStack(alignment: .firstTextBaseline, spacing: 10) {
-                        Text(String(item.rank))
-                            .font(.system(.callout, design: .serif).weight(item.rank <= 3 ? .bold : .regular))
-                            .monospacedDigit()
-                            .foregroundStyle(item.rank <= 3 ? DeepReadPalette.accent : DeepReadPalette.muted)
-                            .lineLimit(1).minimumScaleFactor(0.7)
-                            .frame(minWidth: 26)
-                        Text(item.presentationTitle).foregroundStyle(DeepReadPalette.ink)
-                            .multilineTextAlignment(.leading)
-                        Spacer(minLength: 0)
-                    }
-                    .padding(.vertical, 12)
-                    .contentShape(.rect)
-                }
-                .buttonStyle(DeepReadPressableStyle())
-                .contextMenu { modeMenu(item.presentationTitle, zoomID: zoomID, sources: sources) }
-                .matchedTransitionSource(id: zoomID, in: zoom)
-            }
         }
-        .padding(14)
-        .deepReadCard()
+        .padding(.horizontal, 14)
+        .padding(.top, 14)
+        .padding(.bottom, provider.items.isEmpty ? 14 : 0)
+    }
+
+    /// A section exposes each headline to the outer lazy stack. A single tall
+    /// provider card forced it to measure and build every headline at once.
+    private func providerSection(_ provider: IOSHotListProviderSnapshot, index: Int) -> some View {
+        Section {
+            ForEach(Array(provider.items.enumerated()), id: \.element.discoveryIdentity) { offset, item in
+                let last = offset == provider.items.count - 1
+                providerItem(item, provider: provider, offset: offset)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, last ? 14 : 0)
+                    .background { ProviderCardFragment(top: false, bottom: last) }
+                    .modifier(Scatter(index: index + 40, seed: scatter, active: scattered, rotates: false))
+                    .padding(.bottom, last ? 10 : 0)
+            }
+        } header: {
+            providerHeader(provider)
+                .background { ProviderCardFragment(top: true, bottom: provider.items.isEmpty) }
+                .modifier(Scatter(index: index + 40, seed: scatter, active: scattered, rotates: false))
+                .padding(.bottom, provider.items.isEmpty ? 10 : 0)
+        }
+    }
+
+    private func providerItem(_ item: IOSHotlistItem, provider: IOSHotListProviderSnapshot, offset: Int) -> some View {
+        let zoomID = "\(provider.id)|\(item.discoveryIdentity)"
+        let sources = { [itemSource(item, provider: provider)] }
+        return VStack(spacing: 0) {
+            if offset > 0 { Rectangle().fill(DeepReadPalette.rule).frame(height: 0.6) }
+            Button {
+                start(item.presentationTitle, zoomID: zoomID, sources: sources)
+            } label: {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Text(String(item.rank))
+                        .font(.system(.callout, design: .serif).weight(item.rank <= 3 ? .bold : .regular))
+                        .monospacedDigit()
+                        .foregroundStyle(item.rank <= 3 ? DeepReadPalette.accent : DeepReadPalette.muted)
+                        .lineLimit(1).minimumScaleFactor(0.7)
+                        .frame(minWidth: 26)
+                    Text(item.presentationTitle).foregroundStyle(DeepReadPalette.ink)
+                        .multilineTextAlignment(.leading)
+                    Spacer(minLength: 0)
+                }
+                .padding(.vertical, 12)
+                .contentShape(.rect)
+            }
+            .buttonStyle(DeepReadPressableStyle())
+            .contextMenu { modeMenu(item.presentationTitle, zoomID: zoomID, sources: sources) }
+            .matchedTransitionSource(id: zoomID, in: zoom)
+        }
     }
 
     private var placeholderCard: some View {
@@ -235,13 +253,31 @@ struct DeepReadDiscoveryView: View {
 
     // MARK: Actions
 
-    private enum StartMode { case auto, closeReading, originalOnly, synthesis }
+    private enum StartMode {
+        case auto, closeReading, originalOnly, synthesis
+
+        var cacheMode: DeepReadDiscoveryCache.Mode? {
+            switch self {
+            case .auto: nil
+            case .closeReading: .closeReading
+            case .originalOnly: .originalOnly
+            case .synthesis: .synthesis
+            }
+        }
+    }
 
     /// Article-like entries open as a close reading of their best-ranked article (with the
     /// topic's other sources as other reports); discussions (Zhihu, Weibo, Bilibili) stay a synthesis.
-    private func start(_ title: String, zoomID: String, mode: StartMode = .auto, sources: () throws -> [IOSDeepReadSource]) {
+    private func start(_ title: String, zoomID: String, mode: StartMode = .auto, regenerate: Bool = false,
+                       sources: () throws -> [IOSDeepReadSource]) {
         do {
             let list = try sources()
+            // An entry read before opens that reading (or its failure page with retry) instead of generating again.
+            if !regenerate, let cached = DeepReadDiscoveryCache.taskId(for: list, mode: mode.cacheMode, in: runtime.store.tasks) {
+                zoomSource = zoomID
+                selectedTaskId = cached
+                return
+            }
             let primary = mode == .synthesis ? nil : DeepReadCloseReader.primaryIndex(in: list)
             let id = try runtime.create(title: title, sources: list, primaryIndex: primary, originalOnly: mode == .originalOnly)
             zoomSource = zoomID
@@ -256,6 +292,7 @@ struct DeepReadDiscoveryView: View {
             Button("只读原文", systemImage: "doc.plaintext") { start(title, zoomID: zoomID, mode: .originalOnly, sources: sources) }
         }
         Button("多源综述", systemImage: "square.stack.3d.up") { start(title, zoomID: zoomID, mode: .synthesis, sources: sources) }
+        Button("重新生成", systemImage: "arrow.clockwise") { start(title, zoomID: zoomID, regenerate: true, sources: sources) }
     }
 
     private func itemSource(_ item: IOSHotlistItem, provider: IOSHotListProviderSnapshot) -> IOSDeepReadSource {
@@ -275,7 +312,7 @@ struct DeepReadDiscoveryView: View {
         for provider in board.providers {
             for item in provider.items {
                 picks.append(LuckyPick(title: item.presentationTitle, detail: "\(provider.providerName) 第 \(item.rank)",
-                    zoomID: "\(provider.id)|\(item.rank)") { [itemSource(item, provider: provider)] })
+                    zoomID: "\(provider.id)|\(item.discoveryIdentity)") { [itemSource(item, provider: provider)] })
             }
         }
         guard let pick = picks.randomElement(), !scattered else { return }
@@ -334,6 +371,7 @@ private struct Scatter: ViewModifier {
     let index: Int
     let seed: Int
     let active: Bool
+    var rotates = true
 
     func body(content: Content) -> some View {
         var hasher = Hasher()
@@ -343,7 +381,59 @@ private struct Scatter: ViewModifier {
         func unit(_ shift: UInt64) -> Double { Double((bits >> shift) & 0xFF) / 127.5 - 1 }
         return content
             .offset(x: active ? unit(0) * 70 : 0, y: active ? unit(8) * 36 - 18 : 0)
-            .rotationEffect(.degrees(active ? unit(16) * 9 : 0))
+            .rotationEffect(.degrees(active && rotates ? unit(16) * 9 : 0))
+    }
+}
+
+private extension IOSHotlistItem {
+    // Rank is presentation state. Refreshes and translations keep the article's
+    // identity so SwiftUI can move an existing row instead of replacing its text.
+    var discoveryIdentity: String { "\(title)|\(url ?? "")" }
+}
+
+/// Continuous card edges across independently loaded rows. Only the section's
+/// ends are rounded, so long boards no longer require one tall composited card.
+private struct ProviderCardFragment: View {
+    let top: Bool
+    let bottom: Bool
+
+    var body: some View {
+        UnevenRoundedRectangle(topLeadingRadius: top ? 18 : 0,
+                               bottomLeadingRadius: bottom ? 18 : 0,
+                               bottomTrailingRadius: bottom ? 18 : 0,
+                               topTrailingRadius: top ? 18 : 0)
+            .fill(DeepReadPalette.card)
+            .overlay { ProviderCardBorder(top: top, bottom: bottom).stroke(DeepReadPalette.rule, lineWidth: 0.6) }
+    }
+}
+
+private struct ProviderCardBorder: Shape {
+    let top: Bool
+    let bottom: Bool
+
+    func path(in rect: CGRect) -> Path {
+        let radius: CGFloat = 18
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.maxY - (bottom ? radius : 0)))
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.minY + (top ? radius : 0)))
+        if top {
+            path.addArc(center: CGPoint(x: rect.minX + radius, y: rect.minY + radius), radius: radius,
+                        startAngle: .degrees(180), endAngle: .degrees(270), clockwise: false)
+            path.addLine(to: CGPoint(x: rect.maxX - radius, y: rect.minY))
+            path.addArc(center: CGPoint(x: rect.maxX - radius, y: rect.minY + radius), radius: radius,
+                        startAngle: .degrees(270), endAngle: .degrees(0), clockwise: false)
+        } else {
+            path.move(to: CGPoint(x: rect.maxX, y: rect.minY))
+        }
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - (bottom ? radius : 0)))
+        if bottom {
+            path.addArc(center: CGPoint(x: rect.maxX - radius, y: rect.maxY - radius), radius: radius,
+                        startAngle: .degrees(0), endAngle: .degrees(90), clockwise: false)
+            path.addLine(to: CGPoint(x: rect.minX + radius, y: rect.maxY))
+            path.addArc(center: CGPoint(x: rect.minX + radius, y: rect.maxY - radius), radius: radius,
+                        startAngle: .degrees(90), endAngle: .degrees(180), clockwise: false)
+        }
+        return path
     }
 }
 

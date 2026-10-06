@@ -1,6 +1,5 @@
 import Foundation
 import Darwin
-@preconcurrency import Shared
 
 struct IOSSearchRequest: Equatable {
     let query: String
@@ -1472,8 +1471,8 @@ struct IOSSearchExecutor {
         min(max(value, 1_000), 40_000)
     }
 
-    private static func uuidString(_ uuid: KotlinUuid) -> String {
-        uuid.description()
+    private static func uuidString(_ uuid: UUID) -> String {
+        uuid.uuidString
     }
 }
 

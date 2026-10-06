@@ -14,46 +14,59 @@ enum IOSDeepReadStructuredRenderer {
         return #"<div class="summary markdown-body">"# + body + "</div>"
     }
 
-    /// Key people/organizations as a tag row under the summary.
-    static func entitiesHTML(_ entities: [String]) -> String {
-        let items = entities.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }.prefix(8)
-        guard !items.isEmpty else { return "" }
-        return #"<div class="entities">"# + items.map { "<span>" + esc($0) + "</span>" }.joined() + "</div>"
+    /// The one-sentence conclusion that opens the headline.
+    static func bottomLineHTML(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        return #"<p class="bottom-line">"# + mdInline(trimmed) + "</p>"
     }
 
+    /// Sections answer one reader question each: judgments (what), timeline + diagram (how it
+    /// got here), analysis (who disputes what), outlook (what next), uncertainties (what to
+    /// trust), references (where to check).
     enum Section {
-        case takeaways, timeline, corePoints, diagram, analysis, uncertainties, extendedReading, references
-        /// Android's order, with the takeaways list leading and open questions after the analysis.
-        static let standard: [Section] = [.takeaways, .timeline, .corePoints, .diagram, .analysis, .uncertainties, .extendedReading, .references]
+        case timeline, corePoints, diagram, analysis, outlook, uncertainties, extendedReading, references
+        static let standard = order(topicType: "event")
+
+        /// Judgments always lead; the topic type decides which question is unfolded next.
+        static func order(topicType: String) -> [Section] {
+            switch topicType {
+            case "opinion": [.corePoints, .analysis, .outlook, .uncertainties, .timeline, .diagram, .extendedReading, .references]
+            case "product": [.corePoints, .diagram, .analysis, .outlook, .uncertainties, .timeline, .extendedReading, .references]
+            case "person": [.corePoints, .timeline, .analysis, .uncertainties, .outlook, .diagram, .extendedReading, .references]
+            default: [.corePoints, .timeline, .diagram, .analysis, .uncertainties, .outlook, .extendedReading, .references]
+            }
+        }
     }
 
     /// All rich sections after the headline, in the given order.
     static func sectionsHTML(_ output: IOSDeepReadOutput, order: [Section] = Section.standard) -> String {
-        order.map { section in
+        let cite = Citer(count: output.sources.count)
+        return order.map { section in
             switch section {
-            case .takeaways: takeawaysSection(output.corePoints)
             case .timeline: timelineSection(output.timeline)
-            case .corePoints: corePointsSection(output.corePoints)
+            case .corePoints: corePointsSection(output.corePoints, cite: cite)
             case .diagram: output.diagram.map(diagramSection) ?? ""
-            case .analysis: analysisSection(output.analysis)
+            case .analysis: analysisSection(output.analysis, cite: cite)
+            case .outlook: outlookSection(output)
             case .uncertainties: uncertaintiesSection(output.uncertainties)
             case .extendedReading: extendedReadingSection(output.extendedReading)
-            case .references: referencesSection(output.references)
+            case .references: output.sources.isEmpty ? referencesSection(output.references) : sourcesSection(output)
             }
         }.joined()
     }
 
-    // MARK: - Sections
-
-    /// The first core points as a one-glance list; the full points with support follow later.
-    private static func takeawaysSection(_ points: [IOSDeepReadCorePoint]) -> String {
-        let items = points.filter { !$0.point.isEmpty }.prefix(3)
-        guard items.count >= 3 else { return "" }
-        return #"<section class="takeaways"><p class="section">要点速览</p><ol>"#
-            // One span per item: the li is a grid, and bare inline markup would split into extra cells.
-            + items.map { "<li><span>" + mdInline($0.point) + "</span></li>" }.joined()
-            + "</ol></section>"
+    /// Source numbers as a trailing superscript, dropping ids outside the numbered list.
+    private struct Citer {
+        let count: Int
+        func callAsFunction(_ ids: [Int]) -> String {
+            let valid = ids.filter { (1...max(count, 1)).contains($0) && count > 0 }
+            guard !valid.isEmpty else { return "" }
+            return #"<sup class="cite">"# + valid.map { "[\($0)]" }.joined() + "</sup>"
+        }
     }
+
+    // MARK: - Sections
 
     private static func timelineSection(_ events: [IOSDeepReadTimelineEvent]) -> String {
         let items = events.filter { !$0.event.isEmpty || !$0.date.isEmpty }
@@ -63,18 +76,21 @@ enum IOSDeepReadStructuredRenderer {
             b += #"<div class="timeline-item"# + (event.isHighlight ? " highlight" : "") + #""><div class="timeline-marker"></div><div class="timeline-body">"#
             if !event.date.isEmpty { b += #"<p class="timeline-date">"# + esc(event.date) + "</p>" }
             b += #"<div class="timeline-copy markdown-body">"# + md(event.event) + "</div>"
+            if event.isHighlight, let why = event.why, !why.isEmpty {
+                b += #"<p class="timeline-why">转折："# + mdInline(why) + "</p>"
+            }
             b += figure(event.imageUrl, event.imageCaption)
             b += "</div></div>"
         }
         return b + "</section>"
     }
 
-    private static func corePointsSection(_ points: [IOSDeepReadCorePoint]) -> String {
+    private static func corePointsSection(_ points: [IOSDeepReadCorePoint], cite: Citer) -> String {
         let items = points.filter { !$0.point.isEmpty }
         guard !items.isEmpty else { return "" }
-        var b = #"<section><p class="section">关键脉络</p>"#
+        var b = #"<section class="judgments"><p class="section">关键判断</p>"#
         for point in items {
-            b += #"<div class="core-point"><h2>"# + mdInline(point.point) + "</h2>"
+            b += #"<div class="core-point"><h2>"# + mdInline(point.point) + cite(point.sources) + "</h2>"
             if let supporting = point.supporting, !supporting.isEmpty {
                 b += #"<div class="core-support markdown-body">"# + md(supporting) + "</div>"
             }
@@ -167,34 +183,69 @@ enum IOSDeepReadStructuredRenderer {
         return b + "</ul>"
     }
 
-    private static func analysisSection(_ analysis: IOSDeepReadAnalysis) -> String {
-        guard analysis.hasContent else { return "" }
-        var b = #"<section><p class="section">深度分析</p>"#
+    private static func analysisSection(_ analysis: IOSDeepReadAnalysis, cite: Citer) -> String {
+        let perspectives = analysis.perspectives.prefix(6).filter { !$0.viewpoint.isEmpty }
+        let quotes = analysis.quotes.prefix(6).filter { !$0.text.isEmpty }
+        guard !(analysis.coreDispute ?? "").isEmpty || !perspectives.isEmpty || !quotes.isEmpty else { return "" }
+        var b = #"<section><p class="section">各方立场</p>"#
         if let dispute = analysis.coreDispute, !dispute.isEmpty {
             b += #"<blockquote class="markdown-body">"# + md(dispute) + "</blockquote>"
         }
-        for perspective in analysis.perspectives.prefix(6) where !perspective.viewpoint.isEmpty {
+        for perspective in perspectives {
             b += #"<div class="perspective"><p class="holder">"# + esc(perspective.holder ?? "") + "</p>"
-            b += #"<div class="markdown-body">"# + md(perspective.viewpoint) + "</div></div>"
-        }
-        for quote in analysis.quotes.prefix(6) where !quote.text.isEmpty {
-            b += #"<div class="quote"><p class="quote-text">"# + esc(quote.text) + "</p>"
-            if let attribution = quote.attribution, !attribution.isEmpty {
-                b += #"<span class="quote-attribution">—— "# + esc(attribution) + "</span>"
+            if let interest = perspective.interest, !interest.isEmpty {
+                b += #"<p class="interest">诉求："# + mdInline(interest) + "</p>"
+            }
+            b += #"<div class="markdown-body">"# + md(perspective.viewpoint) + "</div>" + cite(perspective.sources)
+            if let quote = perspective.quote, !quote.isEmpty {
+                b += quoteHTML(quote, attribution: perspective.quoteBy)
             }
             b += "</div>"
         }
-        if let implications = analysis.implications, !implications.isEmpty {
-            b += #"<div class="markdown-body">"# + md(implications) + "</div>"
+        // Older articles kept quotes apart from the perspectives.
+        for quote in quotes { b += quoteHTML(quote.text, attribution: quote.attribution) }
+        return b + "</section>"
+    }
+
+    private static func quoteHTML(_ text: String, attribution: String?) -> String {
+        var b = #"<div class="quote"><p class="quote-text">"# + esc(text) + "</p>"
+        if let attribution, !attribution.isEmpty {
+            b += #"<span class="quote-attribution">—— "# + esc(attribution) + "</span>"
+        }
+        return b + "</div>"
+    }
+
+    private static func outlookSection(_ output: IOSDeepReadOutput) -> String {
+        let impacts = output.impacts.filter { !$0.effect.isEmpty }
+        let watch = output.watch.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        let implications = output.analysis.implications ?? ""
+        guard !impacts.isEmpty || !watch.isEmpty || !implications.isEmpty else { return "" }
+        var b = #"<section class="outlook"><p class="section">影响与走向</p>"#
+        if !impacts.isEmpty {
+            b += #"<ul class="impacts">"#
+            for impact in impacts {
+                b += #"<li><p class="impact-target">"# + esc(impact.target)
+                if !impact.horizonLabel.isEmpty { b += "<small>" + impact.horizonLabel + "</small>" }
+                b += "</p><p>" + mdInline(impact.effect) + "</p></li>"
+            }
+            b += "</ul>"
+        }
+        if !implications.isEmpty { b += #"<div class="markdown-body">"# + md(implications) + "</div>" }
+        if !watch.isEmpty {
+            b += #"<div class="watch"><p class="holder">接下来关注</p><ul>"#
+                + watch.map { "<li>" + mdInline($0) + "</li>" }.joined() + "</ul></div>"
         }
         return b + "</section>"
     }
 
-    private static func uncertaintiesSection(_ items: [String]) -> String {
-        let claims = items.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+    private static func uncertaintiesSection(_ items: [IOSDeepReadUncertainty]) -> String {
+        let claims = items.filter { !$0.claim.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         guard !claims.isEmpty else { return "" }
         return #"<section class="uncertain"><p class="section">待核实</p><ul>"#
-            + claims.map { "<li>" + mdInline($0) + "</li>" }.joined()
+            + claims.map { item in
+                "<li>" + (item.statusLabel.isEmpty ? "" : #"<span class="claim-status">"# + item.statusLabel + "</span>")
+                    + mdInline(item.claim.trimmingCharacters(in: .whitespacesAndNewlines)) + "</li>"
+            }.joined()
             + "</ul></section>"
     }
 
@@ -217,6 +268,21 @@ enum IOSDeepReadStructuredRenderer {
         for link in items {
             b += #"<a class="reading-link" href=""# + esc(link.url) + #"">"#
             b += "<p>" + esc(link.title) + "</p><small>" + esc(link.source ?? link.url) + "</small></a>"
+        }
+        return b + "</section>"
+    }
+
+    /// The numbered generation sources, in citation order; cited ones are marked.
+    private static func sourcesSection(_ output: IOSDeepReadOutput) -> String {
+        let cited = Set(output.corePoints.flatMap(\.sources) + output.analysis.perspectives.flatMap(\.sources))
+        var b = #"<section class="sources"><p class="section">来源</p>"#
+        for (index, link) in output.sources.enumerated() where !link.title.isEmpty {
+            let number = index + 1
+            let inner = #"<p><span class="src-no">["# + String(number) + "]</span>" + esc(link.title) + "</p><small>"
+                + esc(link.source ?? "") + (cited.contains(number) ? " · 本文引用" : "") + "</small>"
+            b += link.url.isEmpty
+                ? #"<div class="reading-link">"# + inner + "</div>"
+                : #"<a class="reading-link" href=""# + esc(link.url) + #"">"# + inner + "</a>"
         }
         return b + "</section>"
     }

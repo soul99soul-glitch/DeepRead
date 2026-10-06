@@ -20,7 +20,8 @@ enum DeepReadArticleRenderer {
         }
         if let article = DeepReadTemplateArticle.decode(task.structuredJSON) {
             return DeepReadTemplateArticleRenderer.html(article, palette: palette, fontMode: settings.fontMode,
-                                                        styleCSS: style.css, scale: scale)
+                                                        styleCSS: style.css, scale: scale,
+                                                        galaxyEntry: !forPrint && DeepReadGalaxyEgg.appears(for: task.id))
         }
         if let template = IOSDeepReadTemplateStore.shared.template(id: task.templateId) {
             return try IOSDeepReadHTMLTemplateRenderer.render(task: task, template: template, fontScale: Float(settings.fontScale), fontModeWireName: settings.fontMode)
@@ -41,7 +42,7 @@ enum DeepReadArticleRenderer {
             sources: links,
             dark: dark,
             structured: structured,
-            sectionOrder: layout.order,
+            sectionOrder: layout.order(topicType: structured?.topicType ?? ""),
             accentHex: palette.accent,
             fontMode: settings.fontMode,
             bgHex: palette.bg,

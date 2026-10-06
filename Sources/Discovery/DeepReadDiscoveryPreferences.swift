@@ -1,6 +1,5 @@
 import Foundation
 import Observation
-@preconcurrency import Shared
 
 @Observable @MainActor
 final class DeepReadDiscoveryPreferences {
@@ -30,22 +29,17 @@ final class DeepReadDiscoveryPreferences {
             .flatMap { try? JSONDecoder().decode(Configuration.self, from: $0) } ?? Configuration()
     }
 
+    /// Kotlin 版经 IosSettingsDefaults 取种子再回填；DeepRead 只消费 6 个
+    /// 热榜字段，直接用本地 `TodayBoardSetting` 切片构造（默认值内建）。
     var boardSetting: TodayBoardSetting {
-        let base = IosSettingsDefaults.shared.defaultSeededSettings().agentRuntime.todayBoard
-        return TodayBoardSetting(
-            enabled: true, boardModelId: nil, enabledSources: base.enabledSources,
-            triggerHours: base.triggerHours, incrementalSignalThreshold: base.incrementalSignalThreshold,
-            hotListRefreshIntervalMinutes: Int32(configuration.refreshMinutes),
+        TodayBoardSetting(
+            hotListRefreshIntervalMinutes: configuration.refreshMinutes,
             hotListWifiOnly: configuration.wifiOnly,
             hotListEnabledSources: configuration.enabledSources,
             hotListFocusKeywords: configuration.keywords.components(separatedBy: CharacterSet(charactersIn: "、,，\n"))
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty },
-            hotListFilterMode: TodayBoardHotListFilterMode.companion.fromWireName(raw: configuration.filterMode),
-            hotListTranslateToChinese: configuration.translateToChinese,
-            deepReadFirstUseConfirmed: true, boardReadingFontMode: base.boardReadingFontMode,
-            boardReadingFontPackId: nil, deepReadFontScale: 1, deepReadTemplateId: IOSDeepReadTemplate.defaultId,
-            density: base.density, backgroundStrategy: base.backgroundStrategy,
-            foregroundCompensationGapMs: base.foregroundCompensationGapMs
+            hotListFilterMode: TodayBoardHotListFilterMode(fromWireName: configuration.filterMode),
+            hotListTranslateToChinese: configuration.translateToChinese
         )
     }
 }

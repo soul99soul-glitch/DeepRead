@@ -1,5 +1,4 @@
 import Foundation
-@preconcurrency import Shared
 
 enum IOSHotlistProviders {
     struct Descriptor: Identifiable, Codable, Equatable, Sendable {

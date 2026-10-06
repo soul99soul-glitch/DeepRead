@@ -1,5 +1,4 @@
 import XCTest
-@preconcurrency import Shared
 @testable import AmberDeepRead
 
 @MainActor
@@ -80,7 +79,7 @@ final class DeepReadSynthesisTemplateTests: XCTestCase {
         return DeepReadRuntime(settings: settings, store: store, provider: provider,
             searchSources: { _, _ in [] },
             enrichSources: { sources, _, _ in sources },
-            beginBackgroundTask: { _, _ in .invalid }, endBackgroundTask: { _ in })
+            continuedProcessing: nil, beginBackgroundTask: { _, _ in .invalid }, endBackgroundTask: { _ in })
     }
 
     private func run(_ runtime: DeepReadRuntime, _ store: IOSDeepReadStore) async throws -> IOSDeepReadTask {
@@ -113,12 +112,11 @@ final class DeepReadSynthesisTemplateTests: XCTestCase {
             #"{"overview_angle":"角度","narrative_slots":["背景"],"analysis_questions":["影响"],"stakeholders":["读者"],"risk_or_uncertainty":[],"required_source_ids":[1]}"#,
             #"{"summary":"这是一个根据多份材料生成的完整概览摘要，保留事实边界。","key_entities":["甲"]}"#,
             #"{"timeline":[{"date":"今天","event":"发生"}],"core_points":[{"point":"关键"}]}"#,
-            #"{"analysis":{"core_dispute":"分歧","perspectives":[{"holder":"读者","viewpoint":"观点"}],"implications":"影响"}}"#,
-            #"{"references":[{"title":"来源","url":"https://www.a.com/1","source":"甲"}]}"#,
+            #"{"analysis":{"core_dispute":"分歧","perspectives":[{"holder":"读者","viewpoint":"观点"}]}}"#,
         ])
         let task = try await run(runtime(store, provider: provider, templateId: DeepReadSynthesisTemplate.auto.id), store)
         XCTAssertEqual(task.status, .succeeded, task.failureMessage ?? "")
-        XCTAssertEqual(provider.callCount, 6, "the pick plus the five-call magazine pipeline")
+        XCTAssertEqual(provider.callCount, 5, "the pick plus the four-call magazine pipeline")
         XCTAssertNil(DeepReadTemplateArticle.decode(task.structuredJSON))
         XCTAssertNotNil(task.structuredJSON)
     }

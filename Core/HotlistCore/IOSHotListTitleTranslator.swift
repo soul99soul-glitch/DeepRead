@@ -1,5 +1,4 @@
 import Foundation
-@preconcurrency import Shared
 
 /// A batched title-translation step the dashboard store can run on fetch. Takes
 /// the raw titles, returns a `[originalTitle: chineseTitle]` map for those it
@@ -36,7 +35,7 @@ enum IOSHotListTitleTranslator {
         titles: [String],
         providerSetting: ProviderSetting,
         modelId: String,
-        provider: IOSAgentTextProvider = OpenAIKmpProviderAdapter()
+        provider: IOSAgentTextProvider = DeepReadAIProviderAdapter()
     ) async -> [String: String] {
         let pending = Array(Set(titles.filter(needsTranslation))).prefix(60).map { $0 }
 #if DEBUG
@@ -54,15 +53,14 @@ enum IOSHotListTitleTranslator {
         \(numbered)
         """
         let messages = [
-            UIMessage.companion.system(prompt: system),
-            UIMessage.companion.user(prompt: userPrompt)
+            UIMessage.system(prompt: system),
+            UIMessage.user(prompt: userPrompt)
         ]
         let params = TextGenerationParams(
-            model: Model(modelId: modelId, displayName: modelId, id: KotlinUuid.companion.random(), type: ModelType.chat, customHeaders: [], customBodies: [], inputModalities: [], outputModalities: [], abilities: [], tools: Set<BuiltInTools>(), contextWindowTokens: nil, providerOverwrite: nil),
+            model: Model(modelId: modelId, displayName: modelId, id: UUID(), type: ModelType.chat, customHeaders: [], customBodies: [], inputModalities: [], outputModalities: [], abilities: [], tools: Set<BuiltInTools>(), contextWindowTokens: nil, providerOverwrite: nil),
             temperature: nil,
             topP: nil,
-            maxTokens: KotlinInt(value: 4_000),
-            tools: [],
+            maxTokens: 4_000,
             reasoningLevel: .off,
             customHeaders: [],
             customBody: []

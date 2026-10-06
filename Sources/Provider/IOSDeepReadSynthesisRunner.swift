@@ -1,5 +1,4 @@
 import Foundation
-@preconcurrency import Shared
 
 enum IOSDeepReadSynthesisRunner {
     struct Result: @unchecked Sendable {
@@ -29,7 +28,7 @@ enum IOSDeepReadSynthesisRunner {
                 return Result(messages: messages, providerFailureMessage: "模型没有返回文章内容。")
             }
             let finish = choice?.finishReason?.lowercased() ?? ""
-            let outputLimit = finish == "length" || finish == "max_tokens"
+            let outputLimit = finish == "length" || finish == "max_tokens" || finish == "max_output_tokens"
             let pendingTools = response.parts.contains { ($0 as? UIMessagePart.Tool)?.output.isEmpty == true }
             return Result(
                 messages: messages + [response],

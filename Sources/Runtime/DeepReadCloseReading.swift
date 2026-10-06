@@ -1,5 +1,4 @@
 import Foundation
-@preconcurrency import Shared
 
 /// Close reading: one primary text is the article body, with a guide, type-specific modules
 /// (review / news / opinion / general) and notes anchored to paragraph ids. Stored in `structuredJSON` under the

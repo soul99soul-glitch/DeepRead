@@ -181,44 +181,76 @@ struct DeepReadStampSlam: ViewModifier {
 extension EnvironmentValues {
     /// Whether the enclosing main tab is the selected one.
     @Entry var deepReadTabActive = true
-    /// Direction of the last tab switch: 1 toward a later tab, -1 toward an earlier one, 0 before any switch.
-    @Entry var deepReadTabDirection: CGFloat = 0
+    /// Height the floating Dock covers above the bottom safe area.
+    @Entry var deepReadDockClearance: CGFloat = 0
 }
 
-/// Hides a tab's content the moment it is deselected (its paper stays), so the system's
-/// tab cross-fade dissolves into the new page instead of overlapping two pages of text.
-/// The arriving content slides in from the side the tab bar moved toward, then stays put:
-/// a bounce-free spring, no scale or vertical drift (both read as the page re-laying out).
-struct DeepReadTabVisibility: ViewModifier {
-    @Environment(\.deepReadTabActive) private var active
-    @Environment(\.deepReadTabDirection) private var direction
+extension View {
+    /// Keeps a page's bottom content clear of the floating Dock. Apply to every page shown with the Dock:
+    /// NavigationStack does not pass outer safe-area insets to its pages, so each page reserves the space itself.
+    func deepReadDockClearance() -> some View { modifier(DeepReadDockClearance()) }
+}
+
+private struct DeepReadDockClearance: ViewModifier {
+    @Environment(\.deepReadDockClearance) private var clearance
+    func body(content: Content) -> some View { content.safeAreaPadding(.bottom, clearance) }
+}
+
+enum DeepReadTabTransition {
+    /// Whole-page slide between main tabs, retargeting smoothly when tabs are tapped mid-flight.
+    static let animation = Animation.smooth(duration: 0.38)
+    /// Glass surfaces (Dock highlight, top actions) move like physical objects.
+    static let glass = Animation.spring(duration: 0.42, bounce: 0.22)
+}
+
+/// Briefly requests ProMotion's full rate. Left to itself the system ran tab-switch animations at
+/// 60 Hz (~80% of frames on device); holding a 120 Hz display link through the transition lifts that to ~90%.
+@MainActor final class DeepReadFrameRateBoost: NSObject {
+    static let shared = DeepReadFrameRateBoost()
+    private var link: CADisplayLink?
+    private var until: CFTimeInterval = 0
+
+    /// Covers the page slide plus the Dock and glass springs settling.
+    func request(seconds: CFTimeInterval = 1.1) {
+        until = max(until, CACurrentMediaTime() + seconds)
+        guard link == nil else { return }
+        let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: 80, maximum: 120, preferred: 120)
+        link.add(to: .main, forMode: .common)
+        self.link = link
+    }
+
+    @objc private func tick(_ link: CADisplayLink) {
+        guard CACurrentMediaTime() > until else { return }
+        link.invalidate()
+        self.link = nil
+    }
+}
+
+/// Slides retained navigation stacks as whole pages in Dock order, so text never drifts within the page.
+/// Pages left of the selected tab rest one width to the left, pages to the right one width to the right.
+struct DeepReadTabPage: ViewModifier {
+    let index: Int
+    let tab: Int
+    let previousTab: Int
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var arrivals = 0
-    @State private var appeared = false
+
+    private var active: Bool { index == tab }
+    /// The page lying between the two tabs of a 0↔2 switch.
+    private var skipped: Bool { index > min(tab, previousTab) && index < max(tab, previousTab) }
+    private var side: CGFloat { reduceMotion ? 0 : CGFloat((index - tab).signum()) }
 
     func body(content: Content) -> some View {
         content
-            .opacity(active ? 1 : 0)
-            .transaction { $0.animation = nil }
-            .keyframeAnimator(initialValue: 0.0, trigger: arrivals) { content, x in
-                content.offset(x: x)
-            } keyframes: { _ in
-                MoveKeyframe(30 * direction)
-                SpringKeyframe(0, duration: 0.3, spring: .smooth(duration: 0.26))
-            }
-            // A tab's first visit builds it already selected, so it arrives on appear; later appears
-            // (back from an article) are not arrivals. Launch (direction 0) does not slide.
-            .onAppear {
-                guard !appeared else { return }
-                appeared = true
-                arrive()
-            }
-            .onChange(of: active) { _, isActive in if isActive { arrive() } }
-    }
-
-    private func arrive() {
-        guard active, direction != 0, !reduceMotion else { return }
-        arrivals += 1
+            // Render-layer offset: moves the whole page without re-laying out the NavigationStack.
+            .visualEffect { [side] page, proxy in page.offset(x: side * proxy.size.width) }
+            .opacity(reduceMotion ? (active ? 1 : 0) : 1)
+            // A skipped page jumps to its new side unanimated, so it never sweeps across the screen.
+            .animation(skipped ? nil : reduceMotion ? .easeOut(duration: 0.16) : DeepReadTabTransition.animation, value: tab)
+            .opacity(skipped && !reduceMotion ? 0 : 1)
+            .zIndex(active ? 1 : 0)
+            .allowsHitTesting(active)
+            .accessibilityHidden(!active)
     }
 }
 
@@ -241,9 +273,13 @@ struct DeepReadPressableStyle: ButtonStyle {
 
 extension View {
     func deepReadCard() -> some View {
-        background(DeepReadPalette.card, in: .rect(cornerRadius: 18))
-            .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(DeepReadPalette.rule, lineWidth: 0.6))
-            .shadow(color: DeepReadPalette.ink.opacity(0.06), radius: 10, y: 4)
+        // Shadow the opaque card shape only: same look, but a shape shadow skips the per-card
+        // offscreen pass that shadowing the whole composited card (text included) requires.
+        background {
+            RoundedRectangle(cornerRadius: 18).fill(DeepReadPalette.card)
+                .shadow(color: DeepReadPalette.ink.opacity(0.06), radius: 10, y: 4)
+        }
+        .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(DeepReadPalette.rule, lineWidth: 0.6))
     }
 
     /// Entrance: rises from below with a stagger. Only the first rows wait, so long lists stay instant.

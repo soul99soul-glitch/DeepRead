@@ -15,6 +15,10 @@ struct DeepReadDetailView: View {
     /// Decoded once per task change; the body and toolbar read it many times per update.
     @State private var closeReading: DeepReadCloseReading?
     @State private var isTemplateArticle = false
+    @State private var galaxyArticle: DeepReadTemplateArticle?
+    @State private var viewingImage: DeepReadImageViewing?
+    @State private var tapStreak = DeepReadTapStreak()
+    @State private var ringPoint: CGPoint = .zero
     private let templates = IOSDeepReadTemplateStore.shared
     @Bindable private var appearance = DeepReadAppearance.shared
 
@@ -46,7 +50,44 @@ struct DeepReadDetailView: View {
                 }
                 if !html.isEmpty {
                     DeepReadArticleWebView(html: html, error: $error,
-                        allowsRemoteImages: closeReading != nil || templates.template(id: task.templateId) == nil)
+                        allowsRemoteImages: closeReading != nil || templates.template(id: task.templateId) == nil,
+                        hidesBottomEdgeEffect: true,
+                        readingPositionID: "\(taskId).\(showsOriginal ? "original" : "reading")",
+                        onGalaxy: {
+                            if let article = DeepReadTemplateArticle.decode(task.structuredJSON), article.debate != nil { galaxyArticle = article }
+                        },
+                        onImage: { viewing in withoutAnimation { viewingImage = viewing } },
+                        onTap: { point in
+                            ringPoint = point
+                            withAnimation(.snappy) { tapStreak.tap(at: CACurrentMediaTime()) }
+                        })
+                        .overlay {
+                            GeometryReader { geo in
+                                if let progress = tapStreak.progress {
+                                    // Above the finger, kept on screen.
+                                    DeepReadTapRing(progress: progress)
+                                        .position(x: min(max(ringPoint.x, 56), geo.size.width - 56), y: max(ringPoint.y - 84, 120))
+                                        .transition(.scale(scale: 0.4).combined(with: .opacity))
+                                }
+                            }
+                        }
+                        .sensoryFeedback(trigger: tapStreak) { _, new in
+                            guard new.progress != nil else { return nil }
+                            return new.completed ? .success : .impact(weight: .light, intensity: 0.4 + 0.6 * (new.progress ?? 0))
+                        }
+                        .task(id: tapStreak) {
+                            guard tapStreak.count > 0 else { return }
+                            if tapStreak.completed {
+                                guard (try? await Task.sleep(for: .milliseconds(450))) != nil else { return }
+                                withAnimation(.easeOut(duration: 0.25)) { tapStreak.reset() }
+                                revealEasterEgg()
+                            } else {
+                                // A pause ends the streak and lets the ring fade.
+                                guard (try? await Task.sleep(for: .seconds(DeepReadTapStreak.gap))) != nil else { return }
+                                withAnimation(.easeOut(duration: 0.3)) { tapStreak.reset() }
+                            }
+                        }
+                        .ignoresSafeArea(.container, edges: [.top, .bottom])
                         .accessibilityIdentifier("deepread.reader.article")
                         .transition(.opacity.combined(with: .offset(y: 24)))
                 } else if task.status == .running || task.status == .queued {
@@ -71,7 +112,7 @@ struct DeepReadDetailView: View {
         .task(id: press) {
             guard let press else { return }
             // A replaced or dismissed seal cancels this task; don't clear its successor.
-            guard (try? await Task.sleep(for: .seconds(press.inscription == "付印" ? 1.4 : 2.6))) != nil else { return }
+            guard (try? await Task.sleep(for: .seconds(press.inscription == "付印" ? 1.4 : press.inscription == "知音" ? 4 : 2.6))) != nil else { return }
             withAnimation(.easeOut(duration: 0.4)) { self.press = nil }
         }
         .onChange(of: task) { old, new in
@@ -85,6 +126,8 @@ struct DeepReadDetailView: View {
         }
         .navigationTitle("深度阅读")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.hidden, for: .tabBar)
+        .scrollEdgeEffectHidden(true, for: .bottom)
         .toolbar {
             // Only a reading with AI content has two views to switch between.
             if let reading = closeReading, reading.hasGuide {
@@ -132,6 +175,14 @@ struct DeepReadDetailView: View {
                     if exporting { ProgressView() } else { Label("分享", systemImage: "square.and.arrow.up") }
                 }.disabled(exporting || task?.resultMarkdown.isEmpty != false)
             }
+        }
+        // The viewer animates the image out of the page itself, so the cover must not slide up.
+        .fullScreenCover(item: $viewingImage) { viewing in
+            DeepReadImageViewer(viewing: viewing) { withoutAnimation { viewingImage = nil } }
+                .presentationBackground(.clear)
+        }
+        .fullScreenCover(isPresented: Binding(get: { galaxyArticle != nil }, set: { if !$0 { galaxyArticle = nil } })) {
+            if let galaxyArticle { DeepReadGalaxyView(article: galaxyArticle) }
         }
         .sheet(item: $sheet) { destination in
             switch destination {
@@ -200,6 +251,26 @@ struct DeepReadDetailView: View {
             .padding(.top, 6)
             .transition(.move(edge: .top).combined(with: .opacity))
         }
+    }
+
+    /// Reward for ten rapid taps: a debate opens its hidden Jupiter whatever the draw said;
+    /// any other reading gets a seal with its vital statistics.
+    private func revealEasterEgg() {
+        guard let task else { return }
+        if let article = DeepReadTemplateArticle.decode(task.structuredJSON), article.debate != nil {
+            galaxyArticle = article
+            return
+        }
+        let characters = task.resultMarkdown.unicodeScalars.filter { CharacterSet.letters.union(.decimalDigits).contains($0) }.count
+        let minutes = max(1, Int((Double(characters) / 450).rounded()))
+        let caption = "全文约 \(characters.formatted()) 字 · 读完约 \(minutes) 分钟 · \(task.sources.count) 个来源"
+        withAnimation(.easeIn(duration: 0.2)) { press = PressMoment(inscription: "知音", caption: caption) }
+    }
+
+    private func withoutAnimation(_ change: () -> Void) {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction, change)
     }
 
     private func render() {

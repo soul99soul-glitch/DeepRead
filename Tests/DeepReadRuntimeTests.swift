@@ -1,6 +1,5 @@
 import XCTest
 import UIKit
-@preconcurrency import Shared
 @testable import AmberDeepRead
 
 @MainActor
@@ -60,7 +59,7 @@ final class DeepReadRuntimeTests: XCTestCase {
                     #"{"content":"真实采集到的网页正文"}"#
                 }, onSourceProgress: progress)
                 return result
-            }, beginBackgroundTask: { _, _ in .invalid }, endBackgroundTask: { _ in })
+            }, continuedProcessing: nil, beginBackgroundTask: { _, _ in .invalid }, endBackgroundTask: { _ in })
         let id = try runtime.create(title: "阅读主题", sources: inputs)
         await waitForFinish(runtime)
         let task = try XCTUnwrap(storage.task(id: id))
@@ -70,7 +69,7 @@ final class DeepReadRuntimeTests: XCTestCase {
         XCTAssertEqual(task.sources.count, 13)
         XCTAssertTrue(task.sources.contains { $0.id == searched.id && $0.metadata["scrape_status"] == "ok" })
         XCTAssertTrue(task.sources.contains { $0.id == failedSearch.id && !$0.hasUsableGenerationContent })
-        XCTAssertEqual(provider.callCount, 5)
+        XCTAssertEqual(provider.callCount, 4)
         XCTAssertFalse(provider.userPrompts.contains { $0.contains("用户材料正文11") })
         XCTAssertFalse(provider.userPrompts.contains { $0.contains("搜索鉴权失败") })
         XCTAssertFalse(task.resultMarkdown.isEmpty)
@@ -87,8 +86,7 @@ final class DeepReadRuntimeTests: XCTestCase {
             #"{"overview_angle":"来源事实解读","narrative_slots":["背景","进展"],"analysis_questions":["影响"],"stakeholders":["读者"],"risk_or_uncertainty":["待确认"],"required_source_ids":[1,2]}"#,
             #"{"summary":"这是一个根据用户提供的多份原始材料生成的完整概览摘要，保留事实边界。","key_entities":["材料"]}"#,
             #"{"timeline":[{"date":"今天","event":"材料收集完成"}],"core_points":[{"point":"关键事实"}]}"#,
-            #"{"analysis":{"core_dispute":"材料之间的观点分歧","perspectives":[{"holder":"读者","viewpoint":"需要核对"}],"implications":"继续观察"}}"#,
-            #"{"extended_reading":[{"title":"参考链接","url":"https://example.org","source":"来源"}],"references":[{"title":"来源","url":"https://example.org","source":"网页"}]}"#
+            #"{"analysis":{"core_dispute":"材料之间的观点分歧","perspectives":[{"holder":"读者","viewpoint":"需要核对"}]},"impacts":[{"target":"读者","horizon":"short","effect":"继续观察"}]}"#
         ])
     }
 
@@ -104,7 +102,7 @@ final class DeepReadRuntimeTests: XCTestCase {
                     XCTFail("Topic seed and failed search must not scrape a webpage")
                     return "{}"
                 }, onSourceProgress: progress)
-            }, beginBackgroundTask: { _, _ in .invalid }, endBackgroundTask: { _ in })
+            }, continuedProcessing: nil, beginBackgroundTask: { _, _ in .invalid }, endBackgroundTask: { _ in })
         let id = try runtime.create(title: "阅读主题", sources: [])
         await waitForFinish(runtime)
         let task = try XCTUnwrap(storage.task(id: id))
@@ -132,7 +130,7 @@ final class DeepReadRuntimeTests: XCTestCase {
                 await DeepReadSourceCollector.enrich(sources, settings: nil, scrape: { _, _ in
                     #"{"content":"新网页正文"}"#
                 }, onSourceProgress: progress)
-            }, beginBackgroundTask: { _, _ in .invalid }, endBackgroundTask: { _ in })
+            }, continuedProcessing: nil, beginBackgroundTask: { _, _ in .invalid }, endBackgroundTask: { _ in })
         try runtime.retry(taskId: original.id)
         await waitForFinish(runtime)
         let updated = try XCTUnwrap(storage.task(id: original.id))
@@ -141,7 +139,7 @@ final class DeepReadRuntimeTests: XCTestCase {
         XCTAssertEqual(updated.sources.first?.content, manual.content)
         XCTAssertEqual(updated.sources[1], failedWebpage)
         XCTAssertFalse(updated.sources.contains { $0.id == warning.id })
-        XCTAssertEqual(provider.callCount, 5)
+        XCTAssertEqual(provider.callCount, 4)
         XCTAssertFalse(provider.userPrompts.contains { $0.contains("上一轮搜索鉴权失败") })
     }
 
@@ -149,7 +147,7 @@ final class DeepReadRuntimeTests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let storage = IOSDeepReadStore(baseDirectory: directory)
         let runtime = DeepReadRuntime(settings: settings(), store: storage,
-                                      beginBackgroundTask: { _, _ in .invalid }, endBackgroundTask: { _ in })
+                                      continuedProcessing: nil, beginBackgroundTask: { _, _ in .invalid }, endBackgroundTask: { _ in })
         let id = try runtime.create(title: "读书", sources: [])
         await waitForFinish(runtime)
         XCTAssertEqual(storage.task(id: id)?.status, .failed)
@@ -165,7 +163,7 @@ final class DeepReadRuntimeTests: XCTestCase {
         var terminalAtEnd: IOSDeepReadTaskStatus?
         var id: String?
         let runtime = DeepReadRuntime(settings: settings(), store: storage,
-            beginBackgroundTask: { _, _ in UIBackgroundTaskIdentifier(rawValue: 41) },
+            continuedProcessing: nil, beginBackgroundTask: { _, _ in UIBackgroundTaskIdentifier(rawValue: 41) },
             endBackgroundTask: { _ in terminalAtEnd = id.flatMap { storage.task(id: $0)?.status } })
         id = try runtime.create(title: "主题", sources: [])
         runtime.cancel(taskId: try XCTUnwrap(id))
@@ -180,7 +178,7 @@ final class DeepReadRuntimeTests: XCTestCase {
         XCTAssertTrue(storage.complete(id: task.id, markdown: "已完成的旧文章", structuredJSON: "{}", missingSections: ["分析"]))
         var completedBeforeRelease = false
         let runtime = DeepReadRuntime(settings: settings(), store: storage,
-            beginBackgroundTask: { _, expiration in
+            continuedProcessing: nil, beginBackgroundTask: { _, expiration in
                 expiration()
                 return UIBackgroundTaskIdentifier(rawValue: 42)
             }, endBackgroundTask: { _ in
@@ -194,12 +192,97 @@ final class DeepReadRuntimeTests: XCTestCase {
         XCTAssertTrue(runtime.lastError?.contains("中断") == true)
     }
 
+    func testShortAllowanceExpirationDoesNotCancelContinuingGeneration() async throws {
+        let storage = store()
+        var expiration: (@Sendable () -> Void)?
+        let background = DeepReadBackgroundExecution(scheduler: .init(
+            register: { _, _ in true }, submit: { _, _ in }, cancel: { _ in }))
+        let runtime = DeepReadRuntime(settings: configuredSettings(), store: storage,
+            provider: successfulProvider(),
+            searchSources: { _, _ in
+                try? await Task.sleep(for: .milliseconds(200))
+                return []
+            }, enrichSources: { sources, _, _ in sources },
+            continuedProcessing: background, beginBackgroundTask: { _, handler in
+                expiration = handler
+                return UIBackgroundTaskIdentifier(rawValue: 51)
+            }, endBackgroundTask: { _ in })
+        let id = try runtime.create(title: "后台阅读", sources: [
+            .init(kind: .manualText, title: "资料", content: "真实来源正文")
+        ])
+        try XCTUnwrap(expiration)()
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertTrue(runtime.activeTaskIds.contains(id))
+        XCTAssertEqual(storage.task(id: id)?.status, .running)
+        await waitForFinish(runtime)
+        XCTAssertEqual(storage.task(id: id)?.status, .succeeded)
+    }
+
+    func testContinuedTaskAdoptsThenCompletesAfterShortAllowanceIsReleased() async throws {
+        let storage = store()
+        var launch: (@Sendable (DeepReadBackgroundExecution.SystemTask) -> Void)?
+        var shortExpiration: (@Sendable () -> Void)?
+        var ended = 0
+        var completion: [Bool] = []
+        var progress: [Int64] = []
+        let system = DeepReadBackgroundExecution.SystemTask(setExpiration: { _ in },
+            update: { _, _, completed, _ in progress.append(completed) },
+            completion: { completion.append($0) })
+        let background = DeepReadBackgroundExecution(scheduler: .init(
+            register: { _, callback in launch = callback; return true },
+            submit: { _, _ in }, cancel: { _ in }))
+        let runtime = DeepReadRuntime(settings: configuredSettings(), store: storage, provider: successfulProvider(),
+            searchSources: { _, _ in try? await Task.sleep(for: .milliseconds(200)); return [] },
+            enrichSources: { sources, _, _ in sources }, continuedProcessing: background,
+            beginBackgroundTask: { _, callback in shortExpiration = callback; return .init(rawValue: 52) },
+            endBackgroundTask: { _ in ended += 1 })
+        let id = try runtime.create(title: "后台阅读", sources: [.init(kind: .manualText, title: "资料", content: "来源正文")])
+        try XCTUnwrap(launch)(system)
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(ended, 1)
+        try XCTUnwrap(shortExpiration)()
+        await waitForFinish(runtime)
+        XCTAssertEqual(storage.task(id: id)?.status, .succeeded)
+        XCTAssertEqual(ended, 1)
+        XCTAssertEqual(completion, [true])
+        XCTAssertTrue(progress.contains(10_000))
+        XCTAssertTrue(progress.contains(20_000))
+        XCTAssertEqual(progress.last, 60_000)
+    }
+
+    func testSystemCancellationPersistsFailureAndRejectsLateProviderResults() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let storage = IOSDeepReadStore(baseDirectory: directory)
+        var launch: (@Sendable (DeepReadBackgroundExecution.SystemTask) -> Void)?
+        var expiration: (@Sendable () -> Void)?
+        var completion: [Bool] = []
+        let system = DeepReadBackgroundExecution.SystemTask(setExpiration: { expiration = $0 },
+            update: { _, _, _, _ in }, completion: { completion.append($0) })
+        let background = DeepReadBackgroundExecution(scheduler: .init(
+            register: { _, callback in launch = callback; return true },
+            submit: { _, _ in }, cancel: { _ in }))
+        let runtime = DeepReadRuntime(settings: configuredSettings(), store: storage, provider: successfulProvider(),
+            searchSources: { _, _ in try? await Task.sleep(for: .milliseconds(200)); return [] },
+            enrichSources: { sources, _, _ in sources }, continuedProcessing: background,
+            beginBackgroundTask: { _, _ in .init(rawValue: 53) }, endBackgroundTask: { _ in })
+        let id = try runtime.create(title: "后台阅读", sources: [.init(kind: .manualText, title: "资料", content: "来源正文")])
+        try XCTUnwrap(launch)(system)
+        try await Task.sleep(for: .milliseconds(30))
+        try XCTUnwrap(expiration)()
+        XCTAssertEqual(completion, [false], "system expiration completes synchronously")
+        await waitForFinish(runtime)
+        XCTAssertEqual(storage.task(id: id)?.status, .failed)
+        XCTAssertEqual(IOSDeepReadStore(baseDirectory: directory).task(id: id)?.status, .failed)
+        XCTAssertTrue(storage.task(id: id)?.resultMarkdown.isEmpty == true)
+        XCTAssertEqual(completion, [false])
+    }
+
     func testFailedRetryKeepsExistingArticle() async throws {
         let storage = store()
         let task = try storage.createTask(title: "已有文章", sources: [.init(kind: .manualText, title: "资料", content: "正文")])
         XCTAssertTrue(storage.complete(id: task.id, markdown: "文章正文", structuredJSON: "{}", missingSections: ["时间轴"]))
         let runtime = DeepReadRuntime(settings: settings(), store: storage,
-                                      beginBackgroundTask: { _, _ in .invalid }, endBackgroundTask: { _ in })
+                                      continuedProcessing: nil, beginBackgroundTask: { _, _ in .invalid }, endBackgroundTask: { _ in })
         try runtime.retry(taskId: task.id)
         await waitForFinish(runtime)
         XCTAssertEqual(storage.task(id: task.id)?.status, .succeeded)
@@ -216,7 +299,7 @@ final class DeepReadRuntimeTests: XCTestCase {
         XCTAssertTrue(storage.complete(id: previous.id, markdown: "旧内容"))
         XCTAssertTrue(storage.prepareRetry(id: previous.id, preservingResult: true))
         let runtime = DeepReadRuntime(settings: settings(), store: storage,
-                                      beginBackgroundTask: { _, _ in .invalid }, endBackgroundTask: { _ in })
+                                      continuedProcessing: nil, beginBackgroundTask: { _, _ in .invalid }, endBackgroundTask: { _ in })
         runtime.recoverInterruptedRuns()
         XCTAssertEqual(storage.task(id: fresh.id)?.status, .failed)
         XCTAssertEqual(storage.task(id: previous.id)?.status, .succeeded)
@@ -236,7 +319,7 @@ final class DeepReadRuntimeTests: XCTestCase {
         // The new run stays in flight (suspended in search) while the old run's expiration fires.
         let runtime = DeepReadRuntime(settings: configured, store: storage,
             searchSources: { _, _ in try? await Task.sleep(nanoseconds: 300_000_000); return [] },
-            beginBackgroundTask: { _, expiration in
+            continuedProcessing: nil, beginBackgroundTask: { _, expiration in
                 expirations.append(expiration)
                 return UIBackgroundTaskIdentifier(rawValue: expirations.count)
             }, endBackgroundTask: { _ in endedCount += 1 })

@@ -1,5 +1,4 @@
 import Foundation
-@preconcurrency import Shared
 
 enum IOSDeepReadDraftGenerator {
     /// Resolves the provider setting the Deep Read pipeline should use, by
@@ -29,7 +28,7 @@ enum IOSDeepReadDraftGenerator {
         switch selected {
         case let openAI as ProviderSetting.OpenAI:
             return ProviderSetting.OpenAI(
-                id: KotlinUuid.companion.random(),
+                id: UUID(),
                 enabled: openAI.enabled,
                 name: openAI.name,
                 models: openAI.models,
@@ -46,7 +45,7 @@ enum IOSDeepReadDraftGenerator {
             )
         case let claude as ProviderSetting.Claude:
             return ProviderSetting.Claude(
-                id: KotlinUuid.companion.random(),
+                id: UUID(),
                 enabled: claude.enabled,
                 name: claude.name,
                 models: claude.models,
@@ -170,7 +169,7 @@ enum IOSDeepReadDraftGenerator {
         task: IOSDeepReadTask,
         providerSetting: ProviderSetting,
         model: Model,
-        provider: IOSAgentTextProvider = OpenAIKmpProviderAdapter(),
+        provider: IOSAgentTextProvider = DeepReadAIProviderAdapter(),
         now: Date = Date()
     ) async -> String {
         await generateViaLLMResult(
@@ -233,7 +232,7 @@ enum IOSDeepReadDraftGenerator {
         task: IOSDeepReadTask,
         providerSetting: ProviderSetting,
         model: Model,
-        provider: IOSAgentTextProvider = OpenAIKmpProviderAdapter(),
+        provider: IOSAgentTextProvider = DeepReadAIProviderAdapter(),
         now: Date = Date(),
         onStageProgress: (@MainActor (_ label: String, _ index: Int, _ total: Int) -> Void)? = nil,
         initialOutput: IOSDeepReadOutput? = nil,
@@ -267,46 +266,40 @@ enum IOSDeepReadDraftGenerator {
             provider: provider,
             timeoutSeconds: stageTimeouts?["结构规划"] ?? planTimeoutSeconds
         )
-        await onStageProgress?("结构规划", 0, 4)
+        await onStageProgress?("结构规划", 0, 3)
 #if DEBUG
         NSLog("[AmberDeepRead] plan angle=\(plan.overviewAngle.prefix(60)) stakeholders=\(plan.stakeholders.count) requiredIds=\(plan.requiredSourceIds)")
 #endif
 
-        // 4 JSON stages merged into one IOSDeepReadOutput (Android DeepReadAgentRunManager parity):
-        // overview -> narrative -> analysis -> extended-reading. Each stage outputs ONLY its
+        // 3 JSON stages merged into one IOSDeepReadOutput: overview (+hero image) ->
+        // narrative (judgments, timeline, optional diagram) -> analysis (stakeholders,
+        // impacts, watch, uncertainties). The numbered source list is filled locally
+        // afterwards, so no stage spends tokens re-listing links. Each stage outputs ONLY its
         // new fields (the accumulator merges prior stages) — re-emitting the whole merged
         // JSON is exactly what blows past maxTokens mid-stage and yields truncated,
         // unparseable output, which is the "only the overview survived" failure mode.
         // A stage that throws / returns unparseable JSON / omits its own fields gets ONE
         // retry with a corrective note before being dropped; dropped stages are reported
         // in `missingSections` instead of silently thinning the article.
-        // sourceLimit/excerptLimit/timeout mirror Android (6/1000/90s, 9/1400/110s,
-        // 8/1400/150s, 12/700/90s).
         let stages: [(label: String, instruction: String, schema: String, retryNote: String, fieldsPresent: (IOSDeepReadOutput) -> Bool, sourceLimit: Int, excerptLimit: Int, timeoutSeconds: Double)] = [
             ("概览",
-             "只完成 topic_type、summary、key_entities。summary 像杂志导语，约 120-250 字、完整句子优先、说明为什么值得读，按 Article Plan 的 angle 组织。key_entities 只列 3-8 个最核心的人物、机构或地点，每个不超过 12 字。本阶段不要输出 timeline / core_points / analysis / extended_reading。不要编造来源之外的事实。",
-             #"{"topic_type":"event|opinion|product|person","summary":"约120-250字中文杂志导语","key_entities":["关键实体"]}"#,
+             "只完成 topic_type、bottom_line、summary 与 hero_image_url。bottom_line 是一句话结论，不超过 40 字，讲清发生了什么以及最重要的意义。summary 像杂志导语，约 120-250 字、完整句子优先、说明为什么值得读，按 Article Plan 的 angle 组织，不要重复 bottom_line。hero_image_url 只能从来源 images 列表中选择，没有可靠图片时留空字符串。本阶段不要输出 timeline / core_points / analysis。不要编造来源之外的事实。",
+             #"{"topic_type":"event|opinion|product|person","bottom_line":"不超过40字的一句话结论","summary":"约120-250字中文杂志导语","hero_image_url":"只能用来源 images 中的 URL，可为空","hero_caption":"图片说明，可为空"}"#,
              "上一次输出没有包含 summary 字段或太短。请直接输出包含 summary（约120-250字中文导语）的 JSON 对象。",
              { $0.summary.trimmingCharacters(in: .whitespacesAndNewlines).count >= Self.overviewSummaryMinChars },
-             6, 1_000, 90),
+             8, 1_000, 90),
             ("时间轴叙事",
-             "在已有概览基础上补齐 timeline 和 core_points。timeline 用 4-7 条讲清「早期背景 → 直接导火索 → 当前事件 → 后续影响」，并覆盖 Article Plan 的 narrative_slots；date 只写日期或时间（如「2026年10月2日」「10月初」），不要写阶段名、括号说明或「背景」之类的标签；只收录与本话题直接相关的事件，仅作类比的历史素材不要放进时间轴；is_highlight 只标 1-3 个最关键的节点。core_points 给 3-5 条，是你消化来源后的中文关键脉络（不是来源清单），每条讲一个独立判断并解释为什么重要；不要复述时间轴，不要写关于来源或写作方法的说明。",
-             #"{"timeline":[{"date":"日期或时间","event":"连贯叙事事件","is_highlight":true}],"core_points":[{"point":"关键脉络","supporting":"为什么重要"}]}"#,
+             "在已有概览基础上补齐 core_points、timeline，可选 diagram。core_points 给 3-5 条关键判断，是你消化来源后的结论（不是来源清单）：point 一句话判断，supporting 解释依据和为什么重要，sources 填依据的来源编号（即来源列表中的 [n]）；不要复述时间轴，不要写关于来源或写作方法的说明。timeline 用 4-7 条讲清「早期背景 → 直接导火索 → 当前事件 → 后续影响」，并覆盖 Article Plan 的 narrative_slots；date 只写日期或时间（如「2026年10月2日」「10月初」），不要写阶段名、括号说明或「背景」之类的标签；只收录与本话题直接相关的事件，仅作类比的历史素材不要放进时间轴；is_highlight 只标 1-3 个转折点，并用 why 说明它为什么改变了走向（不超过 60 字），其他事件 why 留空。diagram 只在当事方关系、系统结构或多方对比无法用时间轴讲清时输出（3-6 个节点，type 取 stakeholder_map|system_structure|comparison_matrix，节点 label 约 30 字内，edges 只保留关键关系）；线性的因果和流程已由时间轴承担，不需要就省略整个 diagram 字段。",
+             #"{"core_points":[{"point":"关键判断","supporting":"依据与为什么重要","sources":[1,2]}],"timeline":[{"date":"日期或时间","event":"连贯叙事事件","is_highlight":true,"why":"为什么是转折点"}],"diagram":{"type":"stakeholder_map","title":"图题","nodes":[{"id":"a","label":"节点","note":"说明","group":"分组"}],"edges":[{"from":"a","to":"b","label":"关系"}],"caption":"说明"}}"#,
              "上一次输出没有包含 timeline 或 core_points 字段。请基于来源给出至少一条 timeline 事件或一个 core_point 的 JSON 对象。",
              { !$0.timeline.isEmpty || !$0.corePoints.isEmpty },
-             9, 1_400, 110),
+             10, 1_400, 130),
             ("深度分析",
-             "在已有概览和叙事基础上补齐 analysis。core_dispute 用 1-2 句回答各方到底在争什么，不要与关键脉络重复。perspectives 按 Article Plan 的 stakeholders 与 analysis_questions 展开，给出 3-5 个不同当事方/利益方的立场（如监管/政府、涉事企业、消费者/用户、竞争对手、专家/媒体），每条用 viewpoint+holder 表达，避免只有两个立场；holder 只写当事方名称，不超过 12 字，不要包含文章标题或出处。quotes 最多 3 条，必须是来源中具名人物或机构说过的原话，文章标题、报道摘要和网友评论都不算；attribution 写「姓名或机构，身份」，不超过 20 字；没有可靠原话就留空数组。implications 写对行业/公众/政策的短期和长期影响。uncertainties 列出 0-4 条仍未确认的说法（参考 Article Plan 的 risk_or_uncertainty）：只有单一来源、来源之间互相矛盾或尚待官方确认的事实，每条写清哪一点待确认、为什么，不超过 60 字；都已确认就留空数组。",
-             #"{"analysis":{"core_dispute":"核心分歧，可为空","perspectives":[{"viewpoint":"观点","holder":"持有方"}],"implications":"影响分析，可为空","quotes":[{"text":"原话或关键表态","attribution":"出处"}]},"uncertainties":["待核实的说法及原因"]}"#,
-             "上一次输出没有包含 analysis 字段。请输出包含 core_dispute、perspectives（至少 3 个立场）和 implications 的 analysis JSON 对象。",
+             "在已有概览和叙事基础上补齐 analysis、impacts、watch 与 uncertainties。core_dispute 用一个问句点明各方到底在争什么，不要与关键判断重复。perspectives 按 Article Plan 的 stakeholders 与 analysis_questions 展开，给出 3-5 个不同当事方/利益方（如监管/政府、涉事企业、消费者/用户、竞争对手、专家/媒体），避免只有两个立场：holder 只写当事方名称，不超过 12 字，不要包含文章标题或出处；interest 写这一方的诉求或利害，不超过 30 字；viewpoint 写其立场与理由；quote 必须是来源中这一方具名人物或机构说过的原话（文章标题、报道摘要和网友评论都不算），quote_by 写「姓名或机构，身份」，不超过 20 字，没有可靠原话就都留空字符串；sources 填依据的来源编号。impacts 给 2-4 条影响：target 写受影响的对象（如行业、公众、政策、某类用户），horizon 取 short（短期）或 long（长期），effect 不超过 80 字。watch 给 1-3 个接下来值得关注的节点或指标，每条不超过 50 字，写清看什么、为什么。uncertainties 列出 0-4 条仍未确认的说法（参考 Article Plan 的 risk_or_uncertainty）：claim 写清哪一点待确认，不超过 60 字；status 取 single_source（只有单一来源）、conflicting（来源互相矛盾）或 pending_official（尚待官方确认）；都已确认就留空数组。",
+             #"{"analysis":{"core_dispute":"核心分歧（问句），可为空","perspectives":[{"holder":"当事方","interest":"诉求或利害","viewpoint":"立场与理由","quote":"原话，可为空","quote_by":"出处，可为空","sources":[1]}]},"impacts":[{"target":"受影响对象","horizon":"short","effect":"影响"}],"watch":["接下来关注什么、为什么"],"uncertainties":[{"claim":"待确认的说法","status":"single_source"}]}"#,
+             "上一次输出没有包含 analysis 字段。请输出包含 core_dispute 和 perspectives（至少 3 个立场）的 analysis JSON 对象。",
              { $0.analysis.hasContent },
              8, 1_400, 150),
-            ("扩展阅读",
-             "做最后整理：补齐 extended_reading、references 与 hero_image_url。两者都只使用来源里的 title/url/source：references 列出本文实际依据的 4-8 条来源（优先 Article Plan 的 required_source_ids）；extended_reading 只放不在 references 里、能帮助延伸理解的背景或原始资料链接（0-5 条），没有就留空数组。与话题无关、仅作类比的来源不要放入任何一处。hero_image_url 只能从来源 images 列表中选择，没有可靠图片时留空字符串。可选：如果因果链/流程图能帮助理解，补充 diagram（3-6 个节点，type 取 causal_chain|process_flow|stakeholder_map|system_structure|comparison_matrix，节点 label 约 30 字内，edges 只保留关键关系），不需要就省略整个 diagram 字段。",
-             #"{"extended_reading":[{"title":"中文标题","url":"URL","source":"来源"}],"references":[{"title":"中文标题","url":"URL","source":"来源"}],"hero_image_url":"只能用来源 images 中的 URL，可为空","hero_caption":"图片说明，可为空"}"#,
-             "上一次输出没有包含 references 字段。请从来源中挑选 4-8 条真实 title/url 链接作为 references 输出 JSON 对象。",
-             { !$0.references.isEmpty || !$0.extendedReading.isEmpty || ($0.heroImageUrl?.isEmpty == false) || ($0.diagram?.nodes.count ?? 0) >= 2 },
-             12, 700, 90),
         ]
 
         var merged = initialOutput ?? IOSDeepReadOutput()
@@ -397,6 +390,14 @@ enum IOSDeepReadDraftGenerator {
         }
 #endif
 
+        if merged.hasStructuredBody {
+            // Same 1-based numbering as the stage source blocks, so cited ids resolve.
+            merged.sources = usable.map { source in
+                IOSDeepReadLink(title: source.title, url: source.url ?? "",
+                                source: DeepReadCloseReader.siteName(source.url) ?? source.kind.title)
+            }
+        }
+
         let date = IOSDeepReadDateFormatters.detail.string(from: now)
         // Honest failure only when nothing usable came back at all.
         let didFail = !merged.hasStructuredBody
@@ -477,8 +478,8 @@ enum IOSDeepReadDraftGenerator {
     static func synthesizeJSON(prompt: String, providerSetting: ProviderSetting, model: Model, provider: IOSAgentTextProvider, timeoutSeconds: Double = 150) async -> (text: String, error: String?) {
         let system = "你是 AmberAgent 的深度阅读结构化写作助手。只基于提供的来源写作，不编造，只输出合法 JSON 对象。"
         let messages = [
-            UIMessage.companion.system(prompt: system),
-            UIMessage.companion.user(prompt: prompt)
+            UIMessage.system(prompt: system),
+            UIMessage.user(prompt: prompt)
         ]
         // 不固定温度：GPT-5 系列、Kimi 等只接受默认温度，传 0.3 会被 400 拒绝；与聊天一致交给服务商默认。
         let params = TextGenerationParams(
@@ -486,7 +487,6 @@ enum IOSDeepReadDraftGenerator {
             temperature: nil,
             topP: nil,
             maxTokens: nil,
-            tools: [],
             reasoningLevel: .off,
             customHeaders: IOSDeepReadSynthesisRunner.requestHeaders(for: providerSetting, model: model.customHeaders),
             customBody: model.customBodies
@@ -749,32 +749,60 @@ enum IOSDeepReadDraftGenerator {
     }
 
     static func markdownFromStructured(_ o: IOSDeepReadOutput, title: String, date: String) -> String {
+        func refs(_ ids: [Int]) -> String { ids.isEmpty ? "" : " " + ids.map { "[\($0)]" }.joined() }
         var b = "# \(title)\n\n\(date)\n"
+        if !o.bottomLine.isEmpty { b += "\n**\(o.bottomLine)**\n" }
         if !o.summary.isEmpty { b += "\n## 摘要\n\(o.summary)\n" }
+        if !o.corePoints.isEmpty {
+            b += "\n## 关键判断\n"
+            for p in o.corePoints { b += "- **\(p.point)**" + (p.supporting.map { "：\($0)" } ?? "") + refs(p.sources) + "\n" }
+        }
         if !o.timeline.isEmpty {
             b += "\n## 时间轴\n"
-            for e in o.timeline { b += "- **\(e.date)** \(e.event)\n" }
-        }
-        if !o.corePoints.isEmpty {
-            b += "\n## 关键脉络\n"
-            for p in o.corePoints { b += "- **\(p.point)**" + (p.supporting.map { "：\($0)" } ?? "") + "\n" }
+            for e in o.timeline {
+                b += "- **\(e.date)** \(e.event)"
+                if let why = e.why, !why.isEmpty { b += "（转折：\(why)）" }
+                b += "\n"
+            }
         }
         if o.analysis.hasContent {
-            b += "\n## 深度分析\n"
+            b += "\n## 各方立场\n"
             if let d = o.analysis.coreDispute, !d.isEmpty { b += "> \(d)\n\n" }
             for p in o.analysis.perspectives where !p.viewpoint.isEmpty {
-                b += "- **\(p.holder ?? "")**：\(p.viewpoint)\n"
+                b += "- **\(p.holder ?? "")**"
+                if let interest = p.interest, !interest.isEmpty { b += "（诉求：\(interest)）" }
+                b += "：\(p.viewpoint)\(refs(p.sources))\n"
+                if let quote = p.quote, !quote.isEmpty {
+                    b += "  > “\(quote)”" + ((p.quoteBy ?? "").isEmpty ? "" : " —— \(p.quoteBy!)") + "\n"
+                }
             }
             for q in o.analysis.quotes where !q.text.isEmpty {
                 b += "> “\(q.text)”"
                 if let attribution = q.attribution, !attribution.isEmpty { b += " —— \(attribution)" }
                 b += "\n\n"
             }
-            if let imp = o.analysis.implications, !imp.isEmpty { b += "\n\(imp)\n" }
+        }
+        let implications = o.analysis.implications ?? ""
+        if !o.impacts.isEmpty || !o.watch.isEmpty || !implications.isEmpty {
+            b += "\n## 影响与走向\n"
+            for i in o.impacts where !i.effect.isEmpty {
+                b += "- **\(i.target)**" + (i.horizonLabel.isEmpty ? "" : "（\(i.horizonLabel)）") + "：\(i.effect)\n"
+            }
+            if !implications.isEmpty { b += "\n\(implications)\n" }
+            if !o.watch.isEmpty {
+                b += "\n接下来关注：\n"
+                for item in o.watch { b += "- \(item)\n" }
+            }
         }
         if !o.uncertainties.isEmpty {
             b += "\n## 待核实\n"
-            for item in o.uncertainties { b += "- \(item)\n" }
+            for item in o.uncertainties { b += "- " + (item.statusLabel.isEmpty ? "" : "【\(item.statusLabel)】") + "\(item.claim)\n" }
+        }
+        if !o.sources.isEmpty {
+            b += "\n## 来源\n"
+            for (index, l) in o.sources.enumerated() {
+                b += "- [\(index + 1)] " + (l.url.isEmpty ? l.title : "[\(l.title)](\(l.url))") + "\n"
+            }
         }
         if !o.extendedReading.isEmpty {
             b += "\n## 扩展阅读\n"
@@ -800,7 +828,7 @@ enum IOSDeepReadDraftGenerator {
         resolvedProvider: ProviderSetting,
         model: Model,
         task: IOSDeepReadTask,
-        provider: IOSAgentTextProvider = OpenAIKmpProviderAdapter(),
+        provider: IOSAgentTextProvider = DeepReadAIProviderAdapter(),
         now: Date = Date()
     ) async -> DeepReadOutcome {
         let result = await generateViaLLMResult(

@@ -8,7 +8,7 @@ enum DeepReadNewsroomStage: Int, CaseIterable {
         guard let label else { return .interview }
         if label.contains("抓取") { return .collate }
         // Stage callbacks fire after a chapter is written, so the last chapter's label means the draft is done.
-        if label.hasSuffix("扩展阅读") { return .press }
+        if label.hasSuffix("深度分析") { return .press }
         if label.hasPrefix("正在生成") { return .write }
         return .interview
     }

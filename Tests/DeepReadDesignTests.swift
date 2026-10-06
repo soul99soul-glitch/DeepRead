@@ -19,7 +19,7 @@ final class DeepReadDesignTests: XCTestCase {
         XCTAssertEqual(DeepReadNewsroomStage.from(label: "正在生成深度阅读"), .write)
         XCTAssertEqual(DeepReadNewsroomStage.from(label: "正在生成背景"), .write)
         // The last chapter's callback arrives after it is written: the draft is ready for press.
-        XCTAssertEqual(DeepReadNewsroomStage.from(label: "正在生成扩展阅读"), .press)
+        XCTAssertEqual(DeepReadNewsroomStage.from(label: "正在生成深度分析"), .press)
     }
 
     func testNightReadingWindow() {

@@ -1,5 +1,5 @@
 import Foundation
-import Shared
+import Markdown
 
 /// Renders a Deep Read article as a self-contained HTML "editorial" magazine
 /// page for the WKWebView reader — a Swift port of the Android
@@ -8,7 +8,8 @@ import Shared
 ///
 /// Shell-first scope: a magazine headline (with an OPTIONAL diagonal hero image —
 /// the `.hero-cut` clip-path slant) over a magazine-typeset Markdown body, plus a
-/// sources list. The Markdown is parsed by the SAME `MarkdownBridge` the SwiftUI
+/// sources list. The Markdown is parsed with swift-markdown (apple/swift-markdown)
+/// and walked to HTML here.
 /// `MarkdownView` uses, then walked to HTML here (no second parser, no drift).
 /// The structured timeline / core-points / diagram cards Android renders from a
 /// typed `DeepReadOutput` are a later increment (their CSS is already included).
@@ -35,7 +36,7 @@ enum IOSDeepReadEditorialRenderer {
         /// renders the rich editorial cards (timeline / core-points / diagram /
         /// analysis / reading-links); otherwise it falls back to the flat Markdown body.
         var structured: IOSDeepReadOutput? = nil
-        /// Order of the structured sections; the default is the Android order led by the takeaways list.
+        /// Order of the structured sections; the default leads with the key judgments.
         var sectionOrder: [IOSDeepReadStructuredRenderer.Section] = IOSDeepReadStructuredRenderer.Section.standard
         /// When false, the body renders WITHOUT the kicker + `<h1>` headline (the native
         /// SwiftUI masthead owns those); the summary/lead is kept as the body's opener.
@@ -68,18 +69,18 @@ enum IOSDeepReadEditorialRenderer {
         let hasHero = !(hero ?? "").isEmpty
         let structured = input.structured.flatMap { $0.hasStructuredBody ? $0 : nil }
 
-        var b = "<!doctype html><html><head>"
-        b += #"<meta name="viewport" content="width=device-width, initial-scale=1"/>"#
-        b += "<style>\n"
-        b += defaultFontCSS + "\n" + baseCSS + "\n" + runtimeCSS + "\n"
+        var html = "<!doctype html><html><head>"
+        html += #"<meta name="viewport" content="width=device-width, initial-scale=1"/>"#
+        html += "<style>\n"
+        html += defaultFontCSS + "\n" + baseCSS + "\n" + runtimeCSS + "\n"
         // After the base/runtime CSS so the :root + code overrides win the cascade.
-        b += bundledFontCSS + "\n"
+        html += bundledFontCSS + "\n"
         // User accent + canvas palette drive every var(--deep-read-*) in the CSS, injected
         // last so they win. The palette is already resolved for the current appearance by
         // the caller, so the reader follows the chosen background theme (paper or immersive,
         // light or dark) with no baked light/dark stylesheet. "system" font mode swaps the
         // serif body stack for the platform sans.
-        b += ":root{"
+        html += ":root{"
             + "--deep-read-accent:" + input.accentHex + ";"
             + "--deep-read-bg:" + input.bgHex + ";"
             + "--deep-read-fg:" + input.fgHex + ";"
@@ -88,84 +89,77 @@ enum IOSDeepReadEditorialRenderer {
             + "--deep-read-border:" + input.borderHex + ";"
             + "}\n"
         if input.transparentCanvas {
-            b += "html,body{background:transparent;}\n"
+            html += "html,body{background:transparent;}\n"
         }
         if input.fontMode == "system" {
-            b += #":root{--deep-read-serif:"PingFang SC","Source Han Sans SC","Noto Sans SC",system-ui,sans-serif;}"# + "\n"
+            html += #":root{--deep-read-serif:"PingFang SC","Source Han Sans SC","Noto Sans SC",system-ui,sans-serif;}"# + "\n"
         }
-        b += emptyImageFallbackCSS + "\n</style></head><body><article>"
+        html += emptyImageFallbackCSS + "\n</style></head><body><article>"
 
         if hasHero, let hero {
-            b += #"<figure class="hero"><img src=""# + esc(hero) + #""/><div class="hero-cut"><div>"#
-            b += #"<span class="hero-type">"# + esc(input.kicker) + "</span>"
-            if let sl = input.sourceLabel, !sl.isEmpty {
-                b += #"<span class="hero-source">"# + esc(sl) + "</span>"
+            html += #"<figure class="hero"><img src=""# + esc(hero) + #""/><div class="hero-cut"><div>"#
+            html += #"<span class="hero-type">"# + esc(input.kicker) + "</span>"
+            if let sourceLabel = input.sourceLabel, !sourceLabel.isEmpty {
+                html += #"<span class="hero-source">"# + esc(sourceLabel) + "</span>"
             }
-            b += "</div>"
-            if let cap = input.heroCaption, !cap.isEmpty {
-                b += "<figcaption>" + esc(cap) + "</figcaption>"
+            html += "</div>"
+            if let caption = input.heroCaption, !caption.isEmpty {
+                html += "<figcaption>" + esc(caption) + "</figcaption>"
             }
-            b += "</div></figure>"
+            html += "</div></figure>"
         }
 
         if input.showHeadline {
-            b += #"<section class="headline">"#
+            html += #"<section class="headline">"#
             if !hasHero {
-                b += #"<p class="kicker">"# + esc(input.kicker) + "</p>"
+                html += #"<p class="kicker">"# + esc(input.kicker) + "</p>"
             }
-            b += "<h1>" + esc(input.title) + "</h1>"
-            // Android puts the summary inside the headline section.
-            if let s = structured, !s.summary.isEmpty {
-                b += IOSDeepReadStructuredRenderer.summaryHTML(s.summary)
+            html += "<h1>" + esc(input.title) + "</h1>"
+            if let structured {
+                html += IOSDeepReadStructuredRenderer.bottomLineHTML(structured.bottomLine)
+                html += IOSDeepReadStructuredRenderer.summaryHTML(structured.summary)
             }
-            if let s = structured { b += IOSDeepReadStructuredRenderer.entitiesHTML(s.keyEntities) }
-            b += "</section>"
-        } else if let s = structured, !s.summary.isEmpty {
-            // Body-only: native masthead owns kicker + h1; keep the summary as the lead.
-            b += #"<section class="headline">"# + IOSDeepReadStructuredRenderer.summaryHTML(s.summary) + "</section>"
+            html += "</section>"
+        } else if let structured, !structured.summary.isEmpty || !structured.bottomLine.isEmpty {
+            // Body-only: native masthead owns kicker + h1; keep the conclusion and summary as the lead.
+            html += #"<section class="headline">"# + IOSDeepReadStructuredRenderer.bottomLineHTML(structured.bottomLine)
+                + IOSDeepReadStructuredRenderer.summaryHTML(structured.summary) + "</section>"
         }
 
-        if let s = structured {
+        if let structured {
             // Rich editorial sections from the typed output (timeline / core-points /
             // diagram / analysis / extended-reading) — Android parity.
-            b += IOSDeepReadStructuredRenderer.sectionsHTML(s, order: input.sectionOrder)
+            html += IOSDeepReadStructuredRenderer.sectionsHTML(structured, order: input.sectionOrder)
         } else {
             // Fallback: magazine-typeset flat Markdown body + the raw sources list.
-            b += #"<section><div class="markdown-body">"# + markdownToHTML(stripLeadingH1(input.markdown)) + "</div></section>"
+            html += #"<section><div class="markdown-body">"# + markdownToHTML(stripLeadingH1(input.markdown)) + "</div></section>"
             if !input.sources.isEmpty {
-                b += #"<section><p class="section">来源</p>"#
-                for s in input.sources where !s.url.isEmpty {
-                    b += #"<a class="reading-link" href=""# + esc(s.url) + #"">"#
-                    b += "<p>" + esc(s.title) + "</p>"
-                    if let src = s.source, !src.isEmpty {
-                        b += "<small>" + esc(src) + "</small>"
+                html += #"<section><p class="section">来源</p>"#
+                for source in input.sources where !source.url.isEmpty {
+                    html += #"<a class="reading-link" href=""# + esc(source.url) + #"">"#
+                    html += "<p>" + esc(source.title) + "</p>"
+                    if let src = source.source, !src.isEmpty {
+                        html += "<small>" + esc(src) + "</small>"
                     }
-                    b += "</a>"
+                    html += "</a>"
                 }
-                b += "</section>"
+                html += "</section>"
             }
         }
 
-        b += "</article></body></html>"
-        return b
+        html += "</article></body></html>"
+        return html
     }
 
-    // MARK: - Markdown -> HTML (same parser as MarkdownView)
+    // MARK: - Markdown -> HTML (swift-markdown AST)
 
     /// Block Markdown → HTML — internal so IOSDeepReadStructuredRenderer reuses it.
+    /// `Document(parsing:)` 总能产出语法树（解析器自恢复），无需失败回退。
     static func markdownToHTML(_ md: String) -> String {
         let source = md.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !source.isEmpty else { return "" }
-        guard let data = MarkdownBridge.parse(source),
-              let reader = PackedAstReader(data: data),
-              let root = reader.root() else {
-            // Parser unavailable → degrade to escaped paragraphs split on blank lines.
-            return source
-                .components(separatedBy: "\n\n")
-                .map { "<p>" + esc($0.trimmingCharacters(in: .whitespacesAndNewlines)) + "</p>" }
-                .joined()
-        }
-        return root.children.map { blockHTML($0, source: source) }.joined()
+        let document = Document(parsing: source)
+        return document.children.map { blockHTML($0) }.joined()
     }
 
     /// Inline Markdown → HTML: strip a single surrounding `<p>…</p>` so the result can
@@ -183,52 +177,49 @@ enum IOSDeepReadEditorialRenderer {
         return html
     }
 
-    private static func blockHTML(_ node: PackedAstNode, source: String) -> String {
-        switch node.type {
-        case .paragraph:
-            return "<p>" + inlineHTML(node.children, source: source) + "</p>"
-        case .heading:
-            let level = min(max(node.headingLevel() ?? 2, 1), 6)
-            return "<h\(level)>" + inlineHTML(node.children, source: source) + "</h\(level)>"
-        case .blockquote:
-            return "<blockquote>" + node.children.map { blockHTML($0, source: source) }.joined() + "</blockquote>"
-        case .listUnordered:
-            return "<ul>" + node.children.map { "<li>" + listItemHTML($0, source: source) + "</li>" }.joined() + "</ul>"
-        case .listOrdered:
-            return "<ol>" + node.children.map { "<li>" + listItemHTML($0, source: source) + "</li>" }.joined() + "</ol>"
-        case .listItem:
-            return "<li>" + listItemHTML(node, source: source) + "</li>"
-        case .codeBlock:
-            return "<pre><code>" + esc(codeBlockBody(node, source: source)) + "</code></pre>"
-        case .horizontalRule:
+    private static func blockHTML(_ node: some Markup) -> String {
+        switch node {
+        case let paragraph as Paragraph:
+            return "<p>" + inlineHTML(Array(paragraph.children)) + "</p>"
+        case let heading as Heading:
+            let level = min(max(heading.level, 1), 6)
+            return "<h\(level)>" + inlineHTML(Array(heading.children)) + "</h\(level)>"
+        case let quote as BlockQuote:
+            return "<blockquote>" + quote.children.map { blockHTML($0) }.joined() + "</blockquote>"
+        case let list as UnorderedList:
+            return "<ul>" + list.children.map { "<li>" + listItemHTML($0) + "</li>" }.joined() + "</ul>"
+        case let list as OrderedList:
+            return "<ol>" + list.children.map { "<li>" + listItemHTML($0) + "</li>" }.joined() + "</ol>"
+        case let code as CodeBlock:
+            return "<pre><code>" + esc(code.code) + "</code></pre>"
+        case is ThematicBreak:
             return "<hr/>"
-        case .table:
-            return tableHTML(node, source: source)
+        case let table as Table:
+            return tableHTML(table)
+        case let html as HTMLBlock:
+            return "<p>" + esc(html.rawHTML) + "</p>"
         default:
-            if !node.children.isEmpty {
-                return inlineHTML(node.children, source: source)
-            }
-            let raw = sliceSource(source, start: node.startOffset, end: node.endOffset)
-            return raw.isEmpty ? "" : "<p>" + esc(resolveBackslashEscapes(raw)) + "</p>"
+            return inlineHTML(Array(node.children))
         }
     }
 
     /// A list item is usually a loose paragraph or a tight run of inline nodes;
     /// coalesce inline runs and keep genuine block children (nested lists, code).
-    private static func listItemHTML(_ node: PackedAstNode, source: String) -> String {
-        let children = node.children.filter { $0.type != .taskListMarker }
-        if !children.isEmpty, children.allSatisfy({ $0.type == .paragraph }) {
-            return children.map { inlineHTML($0.children, source: source) }.joined(separator: "<br/>")
+    private static func listItemHTML(_ node: some Markup) -> String {
+        let children = Array(node.children)
+        if !children.isEmpty, children.allSatisfy({ $0 is Paragraph }) {
+            return children.compactMap { $0 as? Paragraph }
+                .map { inlineHTML(Array($0.children)) }.joined(separator: "<br/>")
         }
         var out = ""
-        var inlineRun: [PackedAstNode] = []
+        var inlineRun: [Markup] = []
         func flush() {
-            if !inlineRun.isEmpty { out += inlineHTML(inlineRun, source: source); inlineRun.removeAll() }
+            if !inlineRun.isEmpty { out += inlineHTML(inlineRun); inlineRun.removeAll() }
         }
         for child in children {
-            if child.type.isBlockLevelForHTML {
+            if isBlockLevelForHTML(child) {
                 flush()
-                out += blockHTML(child, source: source)
+                out += blockHTML(child)
             } else {
                 inlineRun.append(child)
             }
@@ -237,63 +228,78 @@ enum IOSDeepReadEditorialRenderer {
         return out
     }
 
-    private static func tableHTML(_ node: PackedAstNode, source: String) -> String {
+    private static func tableHTML(_ table: Table) -> String {
         var head = ""
         var body = ""
-        for child in node.children {
-            switch child.type {
-            case .tableHead:
-                let cells = child.children.flatMap { $0.type == .tableRow ? $0.children : [$0] }
-                head += "<tr>" + cells.map { "<th>" + inlineHTML($0.children, source: source) + "</th>" }.joined() + "</tr>"
-            case .tableRow:
-                body += "<tr>" + child.children.map { "<td>" + inlineHTML($0.children, source: source) + "</td>" }.joined() + "</tr>"
+        for child in table.children {
+            switch child {
+            case let headRow as Table.Head:
+                let cells = headRow.children.compactMap { $0 as? Table.Cell }
+                head += "<tr>" + cells.map { "<th>" + inlineHTML(Array($0.children)) + "</th>" }.joined() + "</tr>"
+            case let bodySection as Table.Body:
+                for row in bodySection.children.compactMap({ $0 as? Table.Row }) {
+                    let cells = row.children.compactMap { $0 as? Table.Cell }
+                    body += "<tr>" + cells.map { "<td>" + inlineHTML(Array($0.children)) + "</td>" }.joined() + "</tr>"
+                }
             default:
                 break
             }
         }
-        var t = "<table>"
-        if !head.isEmpty { t += "<thead>" + head + "</thead>" }
-        if !body.isEmpty { t += "<tbody>" + body + "</tbody>" }
-        return t + "</table>"
+        // Wide tables scroll sideways instead of squeezing every column to a sliver.
+        let columns = table.maxColumnCount
+        var html = columns >= 4 ? #"<p class="table-hint">左右滑动查看 ›</p>"# : ""
+        html += #"<div class="table-wrap"><table>"#
+        if !head.isEmpty { html += "<thead>" + head + "</thead>" }
+        if !body.isEmpty { html += "<tbody>" + body + "</tbody>" }
+        return html + "</table></div>"
     }
 
-    private static func inlineHTML(_ nodes: [PackedAstNode], source: String) -> String {
+    private static func inlineHTML(_ nodes: [Markup]) -> String {
         var out = ""
         for node in nodes {
-            switch node.type {
-            case .softBreak:
+            switch node {
+            case _ as SoftBreak:
                 // CommonMark soft break = space; but no space between CJK characters.
                 if let last = out.last, !last.isWhitespace, !isCJK(last) { out += " " }
-            case .hardBreak:
+            case _ as LineBreak:
                 out += "<br/>"
-            case .text:
-                out += esc(resolveBackslashEscapes(sliceSource(source, start: node.startOffset, end: node.endOffset)))
-            case .emphasis:
-                out += "<em>" + inlineHTML(node.children, source: source) + "</em>"
-            case .strong:
-                out += "<strong>" + inlineHTML(node.children, source: source) + "</strong>"
-            case .strikethrough:
-                out += "<s>" + inlineHTML(node.children, source: source) + "</s>"
-            case .inlineCode:
-                out += "<code>" + esc(stripInlineCodeFence(sliceSource(source, start: node.startOffset, end: node.endOffset))) + "</code>"
-            case .link:
-                let inner = inlineHTML(node.children, source: source)
-                if let href = node.linkHref(), href.hasPrefix("http") {
-                    out += #"<a href=""# + esc(href) + #"">"# + inner + "</a>"
+            case let text as Text:
+                out += esc(text.plainText)
+            case let emphasis as Emphasis:
+                out += "<em>" + inlineHTML(Array(emphasis.children)) + "</em>"
+            case let strong as Strong:
+                out += "<strong>" + inlineHTML(Array(strong.children)) + "</strong>"
+            case let strike as Strikethrough:
+                out += "<s>" + inlineHTML(Array(strike.children)) + "</s>"
+            case let code as InlineCode:
+                out += "<code>" + esc(code.code) + "</code>"
+            case let link as Link:
+                let inner = inlineHTML(Array(link.children))
+                if let destination = link.destination, destination.hasPrefix("http") {
+                    out += #"<a href=""# + esc(destination) + #"">"# + inner + "</a>"
                 } else {
                     out += inner
                 }
-            case .image:
+            case is Image:
                 break // hero / inline images are handled out-of-band; skip in body text
             default:
-                if !node.children.isEmpty {
-                    out += inlineHTML(node.children, source: source)
-                } else {
-                    out += esc(sliceSource(source, start: node.startOffset, end: node.endOffset))
-                }
+                out += inlineHTML(Array(node.children))
             }
         }
         return out
+    }
+
+    /// Block-level nodes get their own HTML element; everything else is inline
+    /// content coalesced into a flowing run (see `listItemHTML`).
+    private static func isBlockLevelForHTML(_ node: some Markup) -> Bool {
+        switch node {
+        case is Paragraph, is Heading, is BlockQuote, is CodeBlock,
+             is UnorderedList, is OrderedList, is ListItem,
+             is Table, is ThematicBreak, is HTMLBlock:
+            return true
+        default:
+            return false
+        }
     }
 
     // MARK: - Helpers
@@ -311,78 +317,25 @@ enum IOSDeepReadEditorialRenderer {
         return lines.joined(separator: "\n")
     }
 
-    static func esc(_ s: String) -> String {
-        var r = ""
-        r.reserveCapacity(s.count)
+    static func esc(_ text: String) -> String {
+        var result = ""
+        result.reserveCapacity(text.count)
         // Scalars, not Characters: a quote followed by a combining mark is one Character and would slip through.
-        for c in s.unicodeScalars {
-            switch c {
-            case "&": r += "&amp;"
-            case "<": r += "&lt;"
-            case ">": r += "&gt;"
-            case "\"": r += "&quot;"
-            case "'": r += "&#39;"
-            default: r.unicodeScalars.append(c)
+        for scalar in text.unicodeScalars {
+            switch scalar {
+            case "&": result += "&amp;"
+            case "<": result += "&lt;"
+            case ">": result += "&gt;"
+            case "\"": result += "&quot;"
+            case "'": result += "&#39;"
+            default: result.unicodeScalars.append(scalar)
             }
         }
-        return r
+        return result
     }
 
-    /// Strip the backtick delimiters (and one optional surrounding space) from an
-    /// inline-code slice — the AST range includes them. Mirrors Android's `trim('`')`.
-    private static func stripInlineCodeFence(_ s: String) -> String {
-        var t = Substring(s)
-        while t.first == "`" { t = t.dropFirst() }
-        while t.last == "`" { t = t.dropLast() }
-        // CommonMark strips one space on each side iff the content isn't all spaces.
-        if t.count >= 2, t.first == " ", t.last == " ", t.contains(where: { $0 != " " }) {
-            t = t.dropFirst().dropLast()
-        }
-        return String(t)
-    }
-
-    /// The code body of a fenced/indented block. The AST range covers the ``` fences +
-    /// info string, but the block's child text node carries just the body — prefer it.
-    private static func codeBlockBody(_ node: PackedAstNode, source: String) -> String {
-        let body = node.children
-            .map { sliceSource(source, start: $0.startOffset, end: $0.endOffset) }
-            .joined()
-        return body.isEmpty ? sliceSource(source, start: node.startOffset, end: node.endOffset) : body
-    }
-
-    /// Resolve CommonMark backslash escapes (`\*` → `*`) in a text slice — the AST text
-    /// range can keep the backslash. Only a backslash before ASCII punctuation is an
-    /// escape. NOT applied to code slices (where backslashes are literal).
-    private static func resolveBackslashEscapes(_ s: String) -> String {
-        guard s.contains("\\") else { return s }
-        var out = ""
-        out.reserveCapacity(s.count)
-        let chars = Array(s)
-        var i = 0
-        while i < chars.count {
-            if chars[i] == "\\", i + 1 < chars.count, chars[i + 1].isDeepReadASCIIPunctuation {
-                out.append(chars[i + 1])
-                i += 2
-            } else {
-                out.append(chars[i])
-                i += 1
-            }
-        }
-        return out
-    }
-
-    /// Slice the source using UTF-8 byte offsets from the AST (same as MarkdownView).
-    private static func sliceSource(_ source: String, start: Int, end: Int) -> String {
-        guard start < end else { return "" }
-        guard let s = source.utf8.index(source.utf8.startIndex, offsetBy: start, limitedBy: source.utf8.endIndex),
-              let e = source.utf8.index(source.utf8.startIndex, offsetBy: end, limitedBy: source.utf8.endIndex) else {
-            return ""
-        }
-        return String(source[s..<e])
-    }
-
-    private static func isCJK(_ c: Character) -> Bool {
-        for scalar in c.unicodeScalars {
+    private static func isCJK(_ char: Character) -> Bool {
+        for scalar in char.unicodeScalars {
             switch scalar.value {
             case 0x3000...0x303F, 0x3040...0x30FF, 0x3400...0x4DBF,
                  0x4E00...0x9FFF, 0xF900...0xFAFF, 0xFF00...0xFFEF:
@@ -484,23 +437,38 @@ enum IOSDeepReadEditorialRenderer {
     .markdown-body pre{overflow:auto;background:var(--deep-read-surface);padding:10px 12px;border-radius:10px;margin:0 0 13px;}
     .markdown-body pre code{background:transparent;padding:0;border-radius:0;}
     .markdown-body a{color:var(--deep-read-accent);text-decoration:none;border-bottom:1px solid currentColor;}
+    .markdown-body .table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;background:linear-gradient(to right,var(--deep-read-bg) 30%,transparent) left/28px 100% no-repeat local,linear-gradient(to left,var(--deep-read-bg) 30%,transparent) right/28px 100% no-repeat local,radial-gradient(farthest-side at 0 50%,rgba(0,0,0,.16),transparent) left/12px 100% no-repeat scroll,radial-gradient(farthest-side at 100% 50%,rgba(0,0,0,.16),transparent) right/12px 100% no-repeat scroll;}
+    .markdown-body .table-wrap table{width:max-content;min-width:100%;}
+    .markdown-body .table-wrap td,.markdown-body .table-wrap th{min-width:7.5em;max-width:15em;}
+    .markdown-body .table-wrap td:first-child,.markdown-body .table-wrap th:first-child{min-width:4.5em;max-width:7em;}
+    .markdown-body .table-hint{font-family:var(--deep-read-sans);font-size:11px;color:var(--deep-read-muted);margin:0 0 6px;text-align:right;}
     .markdown-body table{width:100%;border-collapse:collapse;font-family:var(--deep-read-sans);font-size:12px;line-height:1.5;margin:0 0 13px;}
     .markdown-body th,.markdown-body td{border-top:1px solid var(--deep-read-border);padding:7px 6px;text-align:left;vertical-align:top;}
     .markdown-body blockquote{margin:0 0 13px;padding-left:10px;border-left:2px solid var(--deep-read-accent);font-size:15px;line-height:1.68;}
     blockquote.markdown-body p{font-size:18px;line-height:1.48;}
     .diagram-note.markdown-body p{font-family:var(--deep-read-sans);font-size:12px;line-height:1.58;color:var(--deep-read-muted);margin:0;}
     .diagram-step .diagram-next{font-family:var(--deep-read-sans);font-size:11px;line-height:1.5;color:var(--deep-read-accent);margin:6px 0 0;}
-    .entities{display:flex;flex-wrap:wrap;gap:6px;margin:14px 0 0;}
-    .entities span{font-family:var(--deep-read-sans);font-size:11px;line-height:1.4;padding:3px 9px;border-radius:999px;border:1px solid var(--deep-read-border);color:var(--deep-read-muted);}
-    .takeaways ol{list-style:none;margin:0;padding:0;counter-reset:takeaway;}
-    .takeaways li{counter-increment:takeaway;display:grid;grid-template-columns:28px minmax(0,1fr);gap:8px;padding:10px 0;border-top:1px solid var(--deep-read-border);font-size:15px;line-height:1.55;}
-    .takeaways li::before{content:counter(takeaway);font-family:var(--deep-read-sans);font-weight:700;font-size:13px;color:var(--deep-read-accent);padding-top:2px;}
+    .bottom-line{font-size:18px;line-height:1.5;font-weight:650;margin:0 0 14px;}
+    .cite{font-family:var(--deep-read-sans);font-size:10px;font-weight:500;color:var(--deep-read-accent);margin-left:3px;vertical-align:super;line-height:0;}
+    .timeline-why{font-family:var(--deep-read-sans);font-size:12px;line-height:1.55;color:var(--deep-read-accent);margin:6px 0 0;}
+    .perspective .interest{font-family:var(--deep-read-sans);font-size:12px;line-height:1.55;color:var(--deep-read-muted);margin:-6px 0 8px;}
+    .perspective .quote{margin:12px 0 0;}
+    .impacts{list-style:none;margin:0 0 16px;padding:0;}
+    .impacts li{padding:10px 0;border-top:1px solid var(--deep-read-border);}
+    .impacts p{margin:0;}
+    .impacts .impact-target{font-weight:650;margin-bottom:3px;}
+    .impacts small{margin-left:8px;color:var(--deep-read-accent);}
+    .watch ul{margin:8px 0 0 1.25em;padding:0;}
+    .watch li{font-size:15px;line-height:1.6;margin:0 0 6px;}
+    .claim-status{font-family:var(--deep-read-sans);font-size:10px;letter-spacing:.06em;color:var(--deep-read-accent);border:1px solid var(--deep-read-accent);border-radius:4px;padding:0 5px;margin-right:6px;white-space:nowrap;}
+    .src-no{font-family:var(--deep-read-sans);color:var(--deep-read-accent);margin-right:6px;}
     .timeline-item.highlight .timeline-marker{background:var(--deep-read-accent);}
     .timeline-item.highlight .timeline-date{font-weight:700;}
     .uncertain ul{list-style:none;margin:0;padding:12px 14px;border:1px dashed var(--deep-read-border);border-radius:12px;background:var(--deep-read-surface);}
     .uncertain li{position:relative;padding-left:22px;font-size:14px;line-height:1.6;margin:0 0 8px;}
     .uncertain li:last-child{margin-bottom:0;}
-    .uncertain li::before{content:"?";position:absolute;left:0;top:2px;width:15px;height:15px;border-radius:50%;border:1px solid var(--deep-read-accent);color:var(--deep-read-accent);font-family:var(--deep-read-sans);font-size:10px;font-weight:700;line-height:15px;text-align:center;}
+    .uncertain li::before{content:"?";position:absolute;left:0;top:2px;width:15px;height:15px;border-radius:50%;
+    border:1px solid var(--deep-read-accent);color:var(--deep-read-accent);font-family:var(--deep-read-sans);font-size:10px;font-weight:700;line-height:15px;text-align:center;}
     """
 
     /// App-bundled fonts served via the `amberfont://` scheme handler
@@ -521,31 +489,4 @@ enum IOSDeepReadEditorialRenderer {
     img:not([src]),img[src=""]{display:none!important;}
     figure:has(> img:not([src])),figure:has(> img[src=""]){display:none!important;}
     """
-}
-
-private extension Character {
-    /// ASCII punctuation per CommonMark — the only characters a backslash escapes.
-    var isDeepReadASCIIPunctuation: Bool {
-        guard let a = asciiValue else { return false }
-        switch a {
-        case 0x21...0x2F, 0x3A...0x40, 0x5B...0x60, 0x7B...0x7E: return true
-        default: return false
-        }
-    }
-}
-
-private extension NodeType {
-    /// Block-level nodes get their own HTML element; everything else is inline
-    /// content coalesced into a flowing run (see `listItemHTML`).
-    var isBlockLevelForHTML: Bool {
-        switch self {
-        case .paragraph, .heading, .blockquote, .codeBlock,
-             .listOrdered, .listUnordered, .listItem,
-             .table, .tableHead, .tableRow, .tableCell,
-             .horizontalRule, .htmlBlock, .mathBlock:
-            return true
-        default:
-            return false
-        }
-    }
 }

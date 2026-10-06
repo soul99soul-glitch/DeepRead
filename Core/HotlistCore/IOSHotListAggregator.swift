@@ -4,6 +4,7 @@ import CryptoKit
 enum IOSHotListAggregator {
     static func aggregate(providerSnapshots: [IOSHotListProviderSnapshot], limit: Int = 20) -> [IOSHotTopic] {
         var clusters: [[(source: IOSHotTopicSource, key: MatchKey)]] = []
+        var candidates = CandidateIndex()
         for snapshot in providerSnapshots {
             for item in snapshot.items {
                 let source = IOSHotTopicSource(
@@ -18,13 +19,15 @@ enum IOSHotListAggregator {
                 )
                 // Normalize each title once; pairwise matching would otherwise rerun the regexes O(n²) times.
                 let key = MatchKey(normalizedTitle(source.presentationTitle))
-                if let index = clusters.firstIndex(where: { cluster in
-                    cluster.contains { matches(key, $0.key) }
-                }) {
-                    clusters[index].append((source, key))
-                } else {
+                let index = candidates.clusterIndices(matching: key).first { index in
+                    clusters[index].contains { matches(key, $0.key) }
+                } ?? clusters.count
+                if index == clusters.count {
                     clusters.append([(source, key)])
+                } else {
+                    clusters[index].append((source, key))
                 }
+                candidates.insert(key, clusterIndex: index)
             }
         }
 
@@ -135,14 +138,54 @@ enum IOSHotListAggregator {
         }
     }
 
+    /// A match must share a title, at least two entities, or a bigram. These postings
+    /// only prune impossible clusters; the original matcher still makes the decision.
+    private struct CandidateIndex {
+        private var titles: [String: Set<Int>] = [:]
+        private var entities: [String: Set<Int>] = [:]
+        private var bigrams: [String: Set<Int>] = [:]
+
+        mutating func insert(_ key: MatchKey, clusterIndex: Int) {
+            guard !key.title.isEmpty else { return }
+            titles[key.title, default: []].insert(clusterIndex)
+            for entity in key.entities {
+                entities[entity, default: []].insert(clusterIndex)
+            }
+            if key.length >= 6 {
+                for bigram in key.bigrams {
+                    bigrams[bigram, default: []].insert(clusterIndex)
+                }
+            }
+        }
+
+        func clusterIndices(matching key: MatchKey) -> [Int] {
+            guard !key.title.isEmpty else { return [] }
+            var indices = titles[key.title] ?? []
+            var sharedEntityCounts: [Int: Int] = [:]
+            for entity in key.entities {
+                for index in entities[entity] ?? [] {
+                    sharedEntityCounts[index, default: 0] += 1
+                    if sharedEntityCounts[index] == 2 { indices.insert(index) }
+                }
+            }
+            if key.length >= 6 {
+                for bigram in key.bigrams {
+                    indices.formUnion(bigrams[bigram] ?? [])
+                }
+            }
+            // Greedy clustering must keep choosing the first compatible cluster.
+            return indices.sorted()
+        }
+    }
+
     private static func matches(_ left: MatchKey, _ right: MatchKey) -> Bool {
         guard !left.title.isEmpty, !right.title.isEmpty else { return false }
         if left.title == right.title { return true }
 
-        let sharedEntities = left.entities.intersection(right.entities)
-        if sharedEntities.count >= 2 { return true }
+        let sharedEntityCount = intersectionCount(left.entities, right.entities)
+        if sharedEntityCount >= 2 { return true }
         // DEAD-CODE(marked, not removed): equal titles already returned true above.
-        if sharedEntities.count == 1 && left.title == right.title { return true }
+        if sharedEntityCount == 1 && left.title == right.title { return true }
         guard left.cjk == right.cjk else { return false }
         let minLength = min(left.length, right.length)
         return minLength >= 6 && bigramJaccard(left.bigrams, right.bigrams) >= 0.4
@@ -218,9 +261,15 @@ enum IOSHotListAggregator {
 
     private static func bigramJaccard(_ leftSet: Set<String>, _ rightSet: Set<String>) -> Double {
         guard !leftSet.isEmpty, !rightSet.isEmpty else { return 0 }
-        let intersection = leftSet.intersection(rightSet).count
-        let union = leftSet.union(rightSet).count
+        let intersection = intersectionCount(leftSet, rightSet)
+        let union = leftSet.count + rightSet.count - intersection
         return union == 0 ? 0 : Double(intersection) / Double(union)
+    }
+
+    private static func intersectionCount(_ left: Set<String>, _ right: Set<String>) -> Int {
+        let smaller = left.count <= right.count ? left : right
+        let larger = left.count <= right.count ? right : left
+        return smaller.reduce(0) { $0 + (larger.contains($1) ? 1 : 0) }
     }
 
     private static func bigrams(_ value: String) -> Set<String> {

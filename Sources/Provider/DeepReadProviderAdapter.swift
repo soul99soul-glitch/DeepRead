@@ -1,22 +1,15 @@
 import Foundation
-@preconcurrency import Shared
 
-public protocol IOSAgentTextProvider: Sendable {
-    func generateText(providerSetting: ProviderSetting, messages: [UIMessage],
-                      params: TextGenerationParams) async throws -> MessageChunk
-}
+/// 纯 Swift 双协议适配器（原 OpenAIKmpProviderAdapter 委托 Shared 的 KMP
+/// Provider；纯 Swift 化后直接分发给 DeepReadOpenAIProvider /
+/// DeepReadClaudeProvider，认证门控行为不变）。
+public struct DeepReadAIProviderAdapter: IOSAgentTextProvider {
+    private let openAI: DeepReadOpenAIProvider
+    private let claude: DeepReadClaudeProvider
 
-enum DeepReadSharedProviders {
-    nonisolated(unsafe) static let openAI = OpenAIKmpProvider()
-    nonisolated(unsafe) static let claude = ClaudeKmpProvider()
-}
-
-public struct OpenAIKmpProviderAdapter: IOSAgentTextProvider {
-    private let openAI: OpenAIKmpProvider
-    private let claude: ClaudeKmpProvider
-    public init() {
-        openAI = DeepReadSharedProviders.openAI
-        claude = DeepReadSharedProviders.claude
+    public init(onProgress: (@Sendable (Int) async -> Void)? = nil) {
+        openAI = DeepReadOpenAIProvider(onProgress: onProgress)
+        claude = DeepReadClaudeProvider(onProgress: onProgress)
     }
 
     public func generateText(providerSetting: ProviderSetting, messages: [UIMessage],

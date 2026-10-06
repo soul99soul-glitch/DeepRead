@@ -167,7 +167,7 @@ enum DeepReadReaderStyle: String, CaseIterable, Identifiable {
             .kicker,p.section{text-transform:none;letter-spacing:.06em;font-weight:600;font-size:12px;color:var(--deep-read-fg);}
             .headline .summary{color:var(--deep-read-muted);}
             section,.diagram-block{margin-top:40px;}
-            .timeline-item,.core-point,.reading-link,.takeaways li{border-top:0;}
+            .timeline-item,.core-point,.reading-link,.impacts li{border-top:0;}
             .timeline-marker{width:6px;height:6px;border:0;background:var(--deep-read-muted);margin:8px 0 0 6px;}
             .timeline-item.highlight .timeline-marker{background:var(--deep-read-accent);}
             .diagram-frame{border:0;border-radius:14px;}
@@ -226,8 +226,8 @@ enum DeepReadReaderLayout: String, CaseIterable, Identifiable {
 
     var detail: String {
         switch self {
-        case .classic: "要点速览、时间轴、脉络、分析依次展开。"
-        case .brief: "先看关键脉络和争议，时间轴放到后面。"
+        case .classic: "按话题类型安排：事件先看时间轴，争议先看各方立场。"
+        case .brief: "先看关键判断和各方立场，时间轴放到后面。"
         case .timeline: "以时间轴为主线，事件串成一条竖线。"
         case .debate: "各方立场做成卡片，核心争议放大。"
         }
@@ -242,12 +242,12 @@ enum DeepReadReaderLayout: String, CaseIterable, Identifiable {
         }
     }
 
-    var order: [IOSDeepReadStructuredRenderer.Section] {
+    func order(topicType: String) -> [IOSDeepReadStructuredRenderer.Section] {
         switch self {
-        case .classic: IOSDeepReadStructuredRenderer.Section.standard
-        case .brief: [.corePoints, .analysis, .uncertainties, .diagram, .timeline, .extendedReading, .references]
-        case .timeline: [.timeline, .diagram, .corePoints, .analysis, .uncertainties, .extendedReading, .references]
-        case .debate: [.analysis, .uncertainties, .corePoints, .timeline, .diagram, .extendedReading, .references]
+        case .classic: IOSDeepReadStructuredRenderer.Section.order(topicType: topicType)
+        case .brief: [.corePoints, .analysis, .uncertainties, .outlook, .diagram, .timeline, .extendedReading, .references]
+        case .timeline: [.timeline, .diagram, .corePoints, .analysis, .uncertainties, .outlook, .extendedReading, .references]
+        case .debate: [.analysis, .uncertainties, .outlook, .corePoints, .timeline, .diagram, .extendedReading, .references]
         }
     }
 

@@ -1,5 +1,4 @@
 import XCTest
-@preconcurrency import Shared
 @testable import AmberDeepRead
 
 @MainActor

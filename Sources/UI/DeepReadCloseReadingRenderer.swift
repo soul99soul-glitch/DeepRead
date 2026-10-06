@@ -20,7 +20,7 @@ enum DeepReadCloseReadingRenderer {
 
         // The original's own images sit inline; a separate hero would repeat the first one.
         if let hero = reading.heroImageURL, !hero.isEmpty, !reading.bodyParagraphs.contains(where: { $0.kind == .image }) {
-            b += #"<figure class="hero"><img src=""# + esc(hero) + #""/></figure>"#
+            b += #"<figure class="hero">"# + imageHTML(hero) + "</figure>"
         }
         let kicker = originalOnly ? "原文" : "精读 · " + DeepReadCloseReading.genreLabel(reading.genre)
         b += #"<section class="headline"><p class="kicker">"# + esc(kicker) + "</p>"
@@ -36,7 +36,7 @@ enum DeepReadCloseReadingRenderer {
             for paragraph in reading.bodyParagraphs {
                 switch paragraph.kind {
                 case .heading: b += "<h2>" + itemText(paragraph.text) + "</h2>"
-                case .image: b += #"<figure><img src=""# + esc(paragraph.text) + #""/></figure>"#
+                case .image: b += "<figure>" + imageHTML(paragraph.text) + "</figure>"
                 case .text: b += "<p>" + itemText(paragraph.text) + "</p>"
                 }
             }
@@ -64,7 +64,9 @@ enum DeepReadCloseReadingRenderer {
 
         if let rows = reading.comparison?.rows, !rows.isEmpty {
             let ids = (reading.others ?? []).map(\.id).filter { id in rows.contains { $0.cells[String(id)] != nil } }
-            b += #"<section class="compare"><p class="section">多家对照</p><div class="table-wrap"><table><tr><th></th><th>本文</th>"#
+            b += #"<section class="compare"><p class="section">多家对照</p>"#
+            if !ids.isEmpty { b += #"<p class="table-hint">左右滑动查看各家 ›</p>"# }
+            b += #"<div class="table-wrap"><table><tr><th></th><th>本文</th>"#
             b += ids.map { "<th>" + esc(reports[$0]?.site ?? "") + "</th>" }.joined() + "</tr>"
             for row in rows {
                 let mark = row.conflict ? #" class="mark""# : ""
@@ -88,7 +90,7 @@ enum DeepReadCloseReadingRenderer {
             b += #"<div class="para"# + (paragraph.kind == .heading ? " h" : "") + #""><span class="n">"# + (paragraph.kind == .image ? "" : String(paragraph.id)) + #"</span><div class="text">"#
             switch paragraph.kind {
             case .heading: b += "<h2>" + itemText(paragraph.text) + marks + "</h2>"
-            case .image: b += #"<figure><img src=""# + esc(paragraph.text) + #""/></figure>"# + marks
+            case .image: b += "<figure>" + imageHTML(paragraph.text) + "</figure>" + marks
             case .text: b += "<p>" + itemText(paragraph.text) + marks + "</p>"
             }
             b += "</div>"
@@ -205,6 +207,14 @@ enum DeepReadCloseReadingRenderer {
         return b
     }
 
+    private static func imageHTML(_ url: String) -> String {
+        // SSPai's CDN returns 403 for requests without Referer. Override the page's
+        // no-referrer policy only for that host, sending the synthetic reader origin.
+        let policy = URL(string: url)?.host?.lowercased() == "cdnfile.sspai.com"
+            ? #" referrerpolicy="origin""# : ""
+        return #"<img src=""# + esc(url) + #"""# + policy + "/>"
+    }
+
     private static func esc(_ s: String) -> String { IOSDeepReadEditorialRenderer.esc(s) }
     private static func inline(_ s: String) -> String { IOSDeepReadEditorialRenderer.markdownToInlineHTML(s) }
 
@@ -289,11 +299,15 @@ enum DeepReadCloseReadingRenderer {
     .stance{font-family:var(--deep-read-sans);font-size:12px;font-weight:600;white-space:nowrap;padding-top:2px;}
     .s-add,.s-agree{color:var(--note-add);}
     .s-differ{color:var(--note-differ);}
-    .table-wrap{overflow-x:auto;}
+    .table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;background:linear-gradient(to right,var(--deep-read-bg) 30%,transparent) left/28px 100% no-repeat local,linear-gradient(to left,var(--deep-read-bg) 30%,transparent) right/28px 100% no-repeat local,radial-gradient(farthest-side at 0 50%,rgba(0,0,0,.16),transparent) left/12px 100% no-repeat scroll,radial-gradient(farthest-side at 100% 50%,rgba(0,0,0,.16),transparent) right/12px 100% no-repeat scroll;}
+    .table-wrap table{width:max-content;min-width:100%;}
+    .table-wrap td,.table-wrap th{min-width:7.5em;max-width:15em;}
+    .table-wrap td:first-child,.table-wrap th:first-child{min-width:4.5em;max-width:7em;position:sticky;left:0;z-index:1;background:var(--deep-read-bg);box-shadow:6px 0 6px -6px rgba(0,0,0,.18);}
+    .table-hint{font-family:var(--deep-read-sans);font-size:11px;color:var(--deep-read-muted);margin:0 0 6px;text-align:right;}
     table{width:100%;border-collapse:collapse;font-family:var(--deep-read-sans);font-size:12px;line-height:1.5;}
     th{font-weight:600;text-align:left;color:var(--deep-read-muted);font-size:11px;padding:8px 6px;border-bottom:1.5px solid var(--deep-read-fg);white-space:nowrap;}
     td{padding:9px 6px;border-bottom:1px solid var(--deep-read-border);vertical-align:top;}
-    td:first-child{font-weight:600;white-space:nowrap;}
+    td:first-child{font-weight:600;}
     td.mark{background:color-mix(in srgb,var(--note-differ) 10%,transparent);}
     td.mark::after{content:" ≠";color:var(--note-differ);font-weight:700;}
     .table-note{font-family:var(--deep-read-sans);font-size:11px;color:var(--deep-read-muted);margin-top:8px;}

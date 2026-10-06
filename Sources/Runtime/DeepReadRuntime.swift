@@ -1,7 +1,6 @@
 import Foundation
 import Observation
 import UIKit
-@preconcurrency import Shared
 
 enum DeepReadRuntimeError: LocalizedError {
     case missingTask
@@ -18,7 +17,7 @@ enum DeepReadRuntimeError: LocalizedError {
 }
 
 /// App-level owner: leaving a page never cancels generation. The background
-/// allowance is best effort; expiration saves a terminal state before releasing it.
+/// allowance bridges scheduling until iOS continued processing takes over.
 @Observable
 @MainActor
 final class DeepReadRuntime {
@@ -37,6 +36,7 @@ final class DeepReadRuntime {
         let prior: PriorCompletion?
         var operation: Task<Void, Never>?
         var backgroundID: UIBackgroundTaskIdentifier = .invalid
+        var continuedRequested = false
     }
 
     let store: IOSDeepReadStore
@@ -52,11 +52,12 @@ final class DeepReadRuntime {
     @ObservationIgnored private let searchReports: SourceSearch
     @ObservationIgnored private let beginBackgroundTask: BackgroundTaskStarter
     @ObservationIgnored private let endBackgroundTask: @MainActor (UIBackgroundTaskIdentifier) -> Void
+    @ObservationIgnored private let continuedProcessing: DeepReadBackgroundExecution?
 
     init(
         settings: DeepReadSettingsStore,
         store: IOSDeepReadStore = .shared,
-        provider: any IOSAgentTextProvider = OpenAIKmpProviderAdapter(),
+        provider: any IOSAgentTextProvider = DeepReadAIProviderAdapter(),
         searchSources: @escaping SourceSearch = { title, settings in
             await DeepReadSourceCollector.search(title: title, settings: settings)
         },
@@ -69,6 +70,7 @@ final class DeepReadRuntime {
         searchReports: @escaping SourceSearch = { title, settings in
             await DeepReadSourceCollector.search(title: title, settings: settings, queries: [title])
         },
+        continuedProcessing: DeepReadBackgroundExecution? = .shared,
         beginBackgroundTask: @escaping BackgroundTaskStarter = { name, expiration in
             UIApplication.shared.beginBackgroundTask(withName: name, expirationHandler: expiration)
         },
@@ -83,6 +85,7 @@ final class DeepReadRuntime {
         self.searchReports = searchReports
         self.beginBackgroundTask = beginBackgroundTask
         self.endBackgroundTask = endBackgroundTask
+        self.continuedProcessing = continuedProcessing
     }
 
     /// `primaryIndex` names the source read in full as the article body; the other sources
@@ -169,21 +172,36 @@ final class DeepReadRuntime {
         activeTaskIds.insert(taskId)
         let backgroundID = beginBackgroundTask("DeepRead:\(taskId)") { [weak self] in
             Task { @MainActor in
-                self?.interrupt(taskId: taskId, runId: runId, message: "后台生成被系统中断，可稍后重试。")
+                self?.shortAllowanceExpired(taskId: taskId, runId: runId)
             }
         }
         runs[taskId]?.backgroundID = backgroundID
+        runs[taskId]?.continuedRequested = continuedProcessing?.begin(
+            id: runId, title: store.task(id: taskId)?.title ?? "深度阅读",
+            onReady: { [weak self] in self?.releaseShortAllowance(taskId: taskId, runId: runId) },
+            onExpiration: { [weak self] in
+                self?.interrupt(taskId: taskId, runId: runId, message: "后台生成被系统中断或取消，可稍后重试。")
+            }) ?? false
         let operation = Task { @MainActor [weak self] in
             guard let self, self.isCurrent(taskId: taskId, runId: runId) else { return }
+            let runProvider: any IOSAgentTextProvider
+            if self.provider is DeepReadAIProviderAdapter {
+                runProvider = DeepReadAIProviderAdapter(onProgress: { [weak self] characters in
+                    await self?.receiveGeneratedOutput(characters, taskId: taskId, runId: runId)
+                })
+            } else {
+                runProvider = self.provider
+            }
             await self.generate(taskId: taskId, runId: runId,
-                                initialOutput: initialOutput, targetStages: targetStages)
+                                initialOutput: initialOutput, targetStages: targetStages, provider: runProvider)
             self.finish(taskId: taskId, runId: runId)
         }
         runs[taskId]?.operation = operation
     }
 
     private func generate(taskId: String, runId: UUID,
-                          initialOutput: IOSDeepReadOutput?, targetStages: Set<String>?) async {
+                          initialOutput: IOSDeepReadOutput?, targetStages: Set<String>?,
+                          provider: any IOSAgentTextProvider) async {
         guard var task = store.task(id: taskId) else { return }
         let primary = task.sources.firstIndex(where: DeepReadCloseReader.isPrimary)
         // Reading only the original never calls a model, so it needs none configured.
@@ -195,14 +213,14 @@ final class DeepReadRuntime {
         }
         guard store.markRunning(id: taskId) else { reportPersistenceFailure(taskId: taskId); return }
         if let primary {
-            await generateCloseReading(task: task, primaryIndex: primary, resolved: resolved, runId: runId)
+            await generateCloseReading(task: task, primaryIndex: primary, resolved: resolved, runId: runId, provider: provider)
             return
         }
         guard let resolved else { return }
         // Capture the complete settings once so editing settings cannot mix credentials
         // between the different search angles in an active run.
         let searchSettings = settings.searchSettings
-        setProgress("正在搜索补充来源", taskId: taskId)
+        setProgress("正在搜索补充来源", taskId: taskId, completed: 0, total: 6)
         let searched = await searchSources(task.title, searchSettings)
         guard isCurrent(taskId: taskId, runId: runId) else { return }
         // Search warnings belong to this collection attempt; user inputs and
@@ -211,7 +229,7 @@ final class DeepReadRuntime {
             !($0.metadata["search_query"] != nil && $0.metadata["scrape_status"] == "failed")
         }
         let merged = DeepReadSourceCollector.dedupe(retained + searched)
-        setProgress("正在抓取网页正文", taskId: taskId)
+        setProgress("正在抓取网页正文", taskId: taskId, completed: 1, total: 6)
         let enriched = await enrichSources(merged, searchSettings, { index, total in
             guard self.isCurrent(taskId: taskId, runId: runId) else { return }
             self.setProgress("正在抓取网页正文 \(index)/\(total)", taskId: taskId)
@@ -232,7 +250,7 @@ final class DeepReadRuntime {
             if template == .auto, initialOutput?.hasStructuredBody == true {
                 chosen = nil
             } else if template == .auto {
-                setProgress("正在生成写作框架", taskId: taskId)
+                setProgress("正在生成写作框架", taskId: taskId, completed: 2, total: 7)
                 let (pick, _) = await IOSDeepReadDraftGenerator.synthesizeJSON(
                     prompt: DeepReadTemplateWriter.pickPrompt(topic: task.title, numbered: numbered),
                     providerSetting: resolved.provider, model: resolved.model, provider: provider, timeoutSeconds: 60)
@@ -241,7 +259,8 @@ final class DeepReadRuntime {
                 chosen = DeepReadTemplateWriter.parsePick(pick)
             }
             if let chosen {
-                setProgress("正在生成\(chosen.name)", taskId: taskId)
+                setProgress("正在生成\(chosen.name)", taskId: taskId,
+                            completed: template == .auto ? 3 : 2, total: template == .auto ? 4 : 3)
                 let (text, error) = await IOSDeepReadDraftGenerator.synthesizeJSON(
                     prompt: DeepReadTemplateWriter.prompt(chosen, topic: task.title, numbered: numbered),
                     providerSetting: resolved.provider, model: resolved.model, provider: provider)
@@ -256,12 +275,15 @@ final class DeepReadRuntime {
                 return
             }
         }
-        setProgress("正在生成深度阅读", taskId: taskId)
+        let collectedUnits = task.templateId == DeepReadSynthesisTemplate.auto.rawValue ? 3 : 2
+        setProgress("正在生成深度阅读", taskId: taskId, completed: collectedUnits, total: collectedUnits + 4)
         let result = await IOSDeepReadDraftGenerator.generateViaLLMResult(
             task: task, providerSetting: resolved.provider, model: resolved.model, provider: provider,
-            onStageProgress: { label, _, _ in
+            onStageProgress: { label, index, total in
                 guard self.isCurrent(taskId: taskId, runId: runId) else { return }
-                self.setProgress("正在生成\(label)", taskId: taskId)
+                self.setProgress("正在生成\(label)", taskId: taskId,
+                                 completed: collectedUnits + (index == 0 ? 0 : 1 + index),
+                                 total: collectedUnits + 1 + total)
             }, initialOutput: initialOutput, targetStages: targetStages
         )
         guard isCurrent(taskId: taskId, runId: runId), store.task(id: taskId)?.status == .running else { return }
@@ -279,7 +301,8 @@ final class DeepReadRuntime {
     /// Close reading: the primary text is read in full, numbered and annotated, then compared
     /// with other reports on the same story (the topic's other sources plus a title search).
     private func generateCloseReading(task: IOSDeepReadTask, primaryIndex: Int,
-                                      resolved: (model: Model, provider: ProviderSetting)?, runId: UUID) async {
+                                      resolved: (model: Model, provider: ProviderSetting)?, runId: UUID,
+                                      provider: any IOSAgentTextProvider) async {
         let taskId = task.id
         let searchSettings = settings.searchSettings
         var primary = task.sources[primaryIndex]
@@ -326,7 +349,7 @@ final class DeepReadRuntime {
         }
 
         // Other reports: the topic's remaining sources plus a search on the article's title.
-        setProgress("正在抓取其他报道", taskId: taskId)
+        setProgress("正在抓取其他报道", taskId: taskId, completed: 1, total: 5)
         let searchTitle = store.task(id: taskId)?.title ?? task.title
         let searched = await searchReports(searchTitle, searchSettings)
         guard isCurrent(taskId: taskId, runId: runId) else { return }
@@ -336,6 +359,7 @@ final class DeepReadRuntime {
         let candidates = Array(DeepReadSourceCollector.dedupe(inputs + searched)
             .filter { $0.url != nil && !DeepReadCloseReader.sameArticle($0.url, primaryURL) && $0.metadata["scrape_status"] != "failed" }
             .prefix(DeepReadCloseReader.maxOtherReports))
+        setProgress("正在抓取其他报道", taskId: taskId, completed: 2, total: 5)
         let enriched = await enrichSources(candidates, searchSettings, { index, total in
             guard self.isCurrent(taskId: taskId, runId: runId) else { return }
             self.setProgress("正在抓取其他报道 \(index)/\(total)", taskId: taskId)
@@ -348,7 +372,7 @@ final class DeepReadRuntime {
             .filter { !($0.metadata["search_query"] != nil && $0.metadata["scrape_status"] == "failed") }
         guard store.replaceSources(id: taskId, sources: kept) else { reportPersistenceFailure(taskId: taskId); return }
 
-        setProgress("正在生成导读与批注", taskId: taskId)
+        setProgress("正在生成导读与批注", taskId: taskId, completed: 3, total: 5)
         let (guideText, _) = await IOSDeepReadDraftGenerator.synthesizeJSON(
             prompt: DeepReadCloseReader.prompt(title: page.title, site: site, paragraphs: paragraphs),
             providerSetting: resolved.provider, model: resolved.model, provider: provider)
@@ -362,7 +386,7 @@ final class DeepReadRuntime {
             .map { DeepReadCloseReader.OtherInput(id: $0.offset + 1, source: $0.element) }
         // Comparison notes hang on a guided reading; without a guide the page only shows the original.
         if annotated != nil, !others.isEmpty {
-            setProgress("正在生成别家说法", taskId: taskId)
+            setProgress("正在生成别家说法", taskId: taskId, completed: 4, total: 5)
             let (compareText, _) = await IOSDeepReadDraftGenerator.synthesizeJSON(
                 prompt: DeepReadCloseReader.comparePrompt(reading: reading, others: others),
                 providerSetting: resolved.provider, model: resolved.model, provider: provider)
@@ -380,8 +404,16 @@ final class DeepReadRuntime {
         }
     }
 
-    private func setProgress(_ label: String, taskId: String) {
+    private func setProgress(_ label: String, taskId: String, completed: Int? = nil, total: Int? = nil) {
         if store.progressLabel(for: taskId) != label { store.setProgressLabel(id: taskId, label) }
+        if let run = runs[taskId] {
+            continuedProcessing?.update(id: run.id, label: label, completed: completed, total: total)
+        }
+    }
+
+    private func receiveGeneratedOutput(_ characters: Int, taskId: String, runId: UUID) {
+        guard isCurrent(taskId: taskId, runId: runId) else { return }
+        continuedProcessing?.receive(id: runId, characters: characters)
     }
 
     private func isCurrent(taskId: String, runId: UUID) -> Bool {
@@ -414,11 +446,29 @@ final class DeepReadRuntime {
         // Durable terminal first; cancellation then prevents late callbacks writing results.
         fail(taskId: taskId, message: message)
         run.operation?.cancel()
-        finish(taskId: taskId, runId: runId)
+        finish(taskId: taskId, runId: runId, success: false)
     }
 
-    private func finish(taskId: String, runId: UUID) {
+    private func shortAllowanceExpired(taskId: String, runId: UUID) {
+        guard let run = runs[taskId], run.id == runId, run.backgroundID != .invalid else { return }
+        if run.continuedRequested {
+            // Queued is not adopted: iOS may suspend us until the launch handler runs.
+            releaseShortAllowance(taskId: taskId, runId: runId)
+        } else {
+            interrupt(taskId: taskId, runId: runId, message: "后台生成被系统中断：持续执行未获允许，可返回前台重试。")
+        }
+    }
+
+    private func releaseShortAllowance(taskId: String, runId: UUID) {
+        guard let run = runs[taskId], run.id == runId, run.backgroundID != .invalid else { return }
+        runs[taskId]?.backgroundID = .invalid
+        endBackgroundTask(run.backgroundID)
+    }
+
+    private func finish(taskId: String, runId: UUID, success: Bool? = nil) {
         guard let run = runs[taskId], run.id == runId else { return }
+        let succeeded = success ?? (store.task(id: taskId)?.status == .succeeded && errorsByTaskId[taskId] == nil)
+        continuedProcessing?.finish(id: runId, success: succeeded)
         runs.removeValue(forKey: taskId)
         activeTaskIds.remove(taskId)
         store.clearProgressLabel(id: taskId)

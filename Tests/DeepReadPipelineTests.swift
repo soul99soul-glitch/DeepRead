@@ -1,13 +1,65 @@
 import XCTest
-@preconcurrency import Shared
 @testable import AmberDeepRead
 
 /// Exercises the standalone provider bridge through the shared synthesis pipeline.
 @MainActor
 final class DeepReadPipelineTests: XCTestCase {
+    func testProviderJSONDecodesEscapesAndUnicode() throws {
+        let cases = [
+            (#"{"content":"{\"title\":\"hello\"}"}"#, #"{"title":"hello"}"#),
+            (#"{"content":"a\nb\t\r\b\f\\\/"}"#, "a\nb\t\r\u{08}\u{0C}\\/"),
+            (#"{"content":"\u4e2d"}"#, "中"),
+            (#"{"content":"\uD83D\uDE00"}"#, "😀")
+        ]
+        for (input, expected) in cases {
+            let decoded = try XCTUnwrap(JSONValue.parse(input), input)
+            XCTAssertEqual(decoded["content"]?.stringValue, expected, input)
+        }
+    }
+
+    func testProviderJSONPreservesValueTypesAndRejectsInvalidInput() {
+        let value = JSONValue.array([.null, .bool(true), .bool(false), .number(1), .number(0),
+                                    .number(-2.5), .string("正文\n\"引用\""), .object(["items": .array([])])])
+        XCTAssertEqual(JSONValue.parse(value.jsonString), value)
+        for invalid in [#"{"content":"unfinished}"#, "{} trailing", "[1 2]", #"{"a":1 "b":2}"#] {
+            XCTAssertNil(JSONValue.parse(invalid), invalid)
+        }
+    }
+
+    func testAllProviderResponseParsersPreserveStructuredText() throws {
+        let expected = #"{"title":"中文😀"}"# + "\n下一行"
+        let chat = try XCTUnwrap(JSONValue.parse(
+            #"{"choices":[{"message":{"role":"assistant","content":"{\"title\":\"中文\uD83D\uDE00\"}\n下一行"},"finish_reason":"stop"}]}"#
+        ))
+        let responses = try XCTUnwrap(JSONValue.parse(
+            #"{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"{\"title\":\"中文\uD83D\uDE00\"}\n下一行"}]}]}"#
+        ))
+        let claude = try XCTUnwrap(JSONValue.parse(
+            #"{"content":[{"type":"text","text":"{\"title\":\"中文\uD83D\uDE00\"}\n下一行"}]}"#
+        ))
+        let openAI = DeepReadOpenAIProvider()
+        XCTAssertEqual(try openAI.parseChatCompletionChunk(chat).choices.first?.message?.toText(), expected)
+        XCTAssertEqual(openAI.parseResponseOutput(responses).choices.first?.message?.toText(), expected)
+        XCTAssertEqual(DeepReadClaudeProvider().parseMessage(try XCTUnwrap(claude["content"]?.arrayValue)).toText(), expected)
+    }
+
+    func testSynthesisRunnerRecognizesOutputLimitReasonsAndKeepsPartialText() async {
+        for reason in ["length", "max_tokens", "max_output_tokens", "stop"] {
+            let result = await IOSDeepReadSynthesisRunner.run(
+                provider: StageProvider(["已有正文"], finishReasons: [1: reason]),
+                providerSetting: makeProviderSetting(),
+                messages: [.user(prompt: "生成文章")],
+                params: TextGenerationParams(model: makeDeepReadModel())
+            )
+            XCTAssertEqual(result.hitOutputLimit, reason != "stop", reason)
+            XCTAssertEqual(result.providerFailureMessage, reason == "stop" ? nil : "模型输出达到长度上限。", reason)
+            XCTAssertEqual(result.messages.last?.toText(), "已有正文", reason)
+        }
+    }
+
     private func makeDeepReadModel(_ modelId: String = "test-model") -> Model {
         Model(
-            modelId: modelId, displayName: modelId, id: KotlinUuid.companion.random(),
+            modelId: modelId, displayName: modelId, id: UUID(),
             type: .chat, customHeaders: [], customBodies: [], inputModalities: [],
             outputModalities: [], abilities: [], tools: Set<BuiltInTools>(),
             contextWindowTokens: nil, providerOverwrite: nil
@@ -16,7 +68,7 @@ final class DeepReadPipelineTests: XCTestCase {
 
     private func makeProviderSetting(model: Model? = nil) -> ProviderSetting.OpenAI {
         ProviderSetting.OpenAI(
-            id: KotlinUuid.companion.random(),
+            id: UUID(),
             enabled: true,
             name: "deepread-test",
             models: model.map { [$0] } ?? [],
@@ -37,7 +89,7 @@ final class DeepReadPipelineTests: XCTestCase {
     private let planReply = #"{"overview_angle":"从产品与生态角度解读","narrative_slots":["背景与触发","关键进展","后续观察"],"analysis_questions":["核心矛盾是什么","影响哪些群体"],"stakeholders":["用户","开发者","监管机构"],"risk_or_uncertainty":["未印证的事实需降格表达"],"required_source_ids":[1,2]}"#
 
     /// A gate-passing (≥24 chars) overview summary.
-    private let goodSummaryReply = #"{"topic_type":"product","summary":"两个来源共同描述了一个支持聊天、工具与深度阅读的 iOS 应用产品。","key_entities":["AmberAgent"]}"#
+    private let goodSummaryReply = #"{"topic_type":"product","bottom_line":"AmberAgent 把聊天、工具与深度阅读放进一个应用。","summary":"两个来源共同描述了一个支持聊天、工具与深度阅读的 iOS 应用产品。"}"#
 
     private func makeTask() -> IOSDeepReadTask {
         makeTask(sources: [
@@ -63,7 +115,7 @@ final class DeepReadPipelineTests: XCTestCase {
     }
 
     /// A scripted provider that returns one canned reply per call and records
-    /// every call so we can assert the stage loop ran 1 plan + 4 stage calls.
+    /// every call so we can assert the stage loop ran 1 plan + 3 stage calls.
     /// `throwAtCalls` makes the given 1-based call indexes throw (transient-
     /// failure simulation for the in-stage retry).
     final class StageProvider: IOSAgentTextProvider, @unchecked Sendable {
@@ -96,15 +148,9 @@ final class DeepReadPipelineTests: XCTestCase {
             }
             let reply = replies[(callCount - 1) % replies.count]
             let message = UIMessage(
-                id: KotlinUuid.companion.random(),
+                id: UUID(),
                 role: MessageRole.assistant,
-                parts: [UIMessagePart.Text(text: reply, metadata: nil)],
-                annotations: [],
-                createdAt: Kotlinx_datetimeLocalDateTime(year: 2026, month: 6, day: 20, hour: 0, minute: 0, second: 0, nanosecond: 0),
-                finishedAt: nil,
-                modelId: nil,
-                usage: nil,
-                translation: nil
+                parts: [UIMessagePart.Text(text: reply)]
             )
             return MessageChunk(
                 id: "chunk-\(callCount)",
@@ -116,24 +162,25 @@ final class DeepReadPipelineTests: XCTestCase {
     }
 
 
-    private let timelineReply = #"{"timeline":[{"date":"今天","event":"事件发生并逐步展开。"}],"core_points":[{"point":"能力分层"}]}"#
-    private let analysisReply = #"{"analysis":{"core_dispute":"是否已到产品化拐点","perspectives":[{"viewpoint":"还早","holder":"观察者"}],"implications":"需要更多验证","quotes":[{"text":"这只是开始。","attribution":"观察者"}]}}"#
-    private let extendedReply = #"{"extended_reading":[{"title":"发布时间线","url":"https://example.com","source":"Amber"}],"references":[{"title":"参考来源","url":"https://example.org","source":"Amber"}],"hero_image_url":"","hero_caption":""}"#
+    private let timelineReply = #"{"timeline":[{"date":"今天","event":"事件发生并逐步展开。","is_highlight":true,"why":"首次公开"}],"core_points":[{"point":"能力分层","sources":[2,9]}]}"#
+    private let analysisReply = #"{"analysis":{"core_dispute":"是否已到产品化拐点？","perspectives":[{"viewpoint":"还早","holder":"观察者","# +
+        #""interest":"看到真实用例","quote":"这只是开始。","quote_by":"观察者","sources":[1]}]},"# +
+        #""impacts":[{"target":"开发者","horizon":"short","effect":"需要更多验证"}],"watch":["下一版是否开放插件"],"# +
+        #""uncertainties":[{"claim":"上线时间未定","status":"pending_official"},"旧式字符串"]}"#
 
-    func testPipelineRunsPlanAndFourJSONStagesAndAssemblesStructured() async throws {
+    func testPipelineRunsPlanAndThreeJSONStagesAndAssemblesStructured() async throws {
         let provider = StageProvider([
             planReply,
             goodSummaryReply,
             timelineReply,
-            analysisReply,
-            extendedReply
+            analysisReply
         ])
         let model = Model(
-            modelId: "configured-model", displayName: "Configured", id: KotlinUuid.companion.random(),
+            modelId: "configured-model", displayName: "Configured", id: UUID(),
             type: .chat, customHeaders: [CustomHeader(name: "X-Model", value: "deep-read")],
-            customBodies: [CustomBody(key: "reasoning_effort", value: Kotlinx_serialization_jsonJson.companion.parseToJsonElement(string: "\"low\""))],
+            customBodies: [CustomBody(key: "reasoning_effort", value: .string("low"))],
             inputModalities: [.text], outputModalities: [.text], abilities: [.reasoning],
-            tools: Set<BuiltInTools>(), contextWindowTokens: KotlinInt(value: 272_000), providerOverwrite: nil
+            tools: Set<BuiltInTools>(), contextWindowTokens: 272_000, providerOverwrite: nil
         )
         let result = await IOSDeepReadDraftGenerator.generateViaLLMResult(
             task: makeTask(),
@@ -142,8 +189,8 @@ final class DeepReadPipelineTests: XCTestCase {
             provider: provider
         )
 
-        // 1 planning call + 4 synthesis calls (overview/narrative/analysis/extended-reading).
-        XCTAssertEqual(provider.callCount, 5)
+        // 1 planning call + 3 synthesis calls (overview/narrative/analysis).
+        XCTAssertEqual(provider.callCount, 4)
         XCTAssertFalse(result.didFail)
         XCTAssertTrue(result.missingSections.isEmpty, "no stage should be missing: \(result.missingSections)")
 
@@ -161,21 +208,29 @@ final class DeepReadPipelineTests: XCTestCase {
         let json = try XCTUnwrap(result.structuredJSON)
         let output = try JSONDecoder().decode(IOSDeepReadOutput.self, from: Data(json.utf8))
         XCTAssertEqual(output.topicType, "product")
+        XCTAssertEqual(output.bottomLine, "AmberAgent 把聊天、工具与深度阅读放进一个应用。")
         XCTAssertTrue(output.summary.count >= 24)
-        XCTAssertEqual(output.timeline.count, 1)
-        XCTAssertEqual(output.corePoints.first?.point, "能力分层")
-        XCTAssertEqual(output.analysis.coreDispute, "是否已到产品化拐点")
-        XCTAssertEqual(output.analysis.quotes.first?.attribution, "观察者")
-        XCTAssertEqual(output.extendedReading.first?.url, "https://example.com")
-        XCTAssertEqual(output.references.first?.url, "https://example.org")
+        XCTAssertEqual(output.timeline.first?.why, "首次公开")
+        XCTAssertEqual(output.corePoints.first?.sources, [2, 9])
+        XCTAssertEqual(output.analysis.coreDispute, "是否已到产品化拐点？")
+        XCTAssertEqual(output.analysis.perspectives.first?.interest, "看到真实用例")
+        XCTAssertEqual(output.analysis.perspectives.first?.quoteBy, "观察者")
+        XCTAssertEqual(output.impacts, [IOSDeepReadImpact(target: "开发者", horizon: "short", effect: "需要更多验证")])
+        XCTAssertEqual(output.watch, ["下一版是否开放插件"])
+        XCTAssertEqual(output.uncertainties, [IOSDeepReadUncertainty(claim: "上线时间未定", status: "pending_official"),
+                                              IOSDeepReadUncertainty(claim: "旧式字符串")])
+        // The numbered source list is filled locally, in the stage blocks' numbering.
+        XCTAssertEqual(output.sources.map(\.title), ["Source A", "Source B"])
 
         // The serialized markdown (for share / fallback) carries the section headings.
+        XCTAssertTrue(result.markdown.contains("**AmberAgent 把聊天、工具与深度阅读放进一个应用。**"))
         XCTAssertTrue(result.markdown.contains("## 摘要"))
+        XCTAssertTrue(result.markdown.contains("## 关键判断\n- **能力分层** [2][9]"))
         XCTAssertTrue(result.markdown.contains("## 时间轴"))
-        XCTAssertTrue(result.markdown.contains("## 关键脉络"))
-        XCTAssertTrue(result.markdown.contains("## 深度分析"))
-        XCTAssertTrue(result.markdown.contains("## 扩展阅读"))
-        XCTAssertTrue(result.markdown.contains("## 参考来源"))
+        XCTAssertTrue(result.markdown.contains("## 各方立场"))
+        XCTAssertTrue(result.markdown.contains("## 影响与走向\n- **开发者**（短期）：需要更多验证"))
+        XCTAssertTrue(result.markdown.contains("- 【待官方确认】上线时间未定"))
+        XCTAssertTrue(result.markdown.contains("## 来源\n- [1] Source A"))
     }
 
     func testLaterStagesSeededWithEarlierStructuredJSON() async {
@@ -184,8 +239,7 @@ final class DeepReadPipelineTests: XCTestCase {
             planReply,
             #"{"summary":"这是一个足够长的概览摘要，用来通过门闩并传递给后续段落。"}"#,
             #"{"core_points":[{"point":"叙事要点"}]}"#,
-            #"{"analysis":{"core_dispute":"分析分歧"}}"#,
-            #"{"extended_reading":[{"title":"链接","url":"https://example.com","source":"示例"}]}"#
+            #"{"analysis":{"core_dispute":"分析分歧"}}"#
         ])
         _ = await IOSDeepReadDraftGenerator.generateViaLLMResult(
             task: makeTask(),
@@ -193,15 +247,13 @@ final class DeepReadPipelineTests: XCTestCase {
             model: makeDeepReadModel("test-model"),
             provider: provider
         )
-        XCTAssertEqual(provider.userPrompts.count, 5)
+        XCTAssertEqual(provider.userPrompts.count, 4)
         // Prompt 0 is the planning call; stage 1 is prompt 1.
         XCTAssertTrue(provider.userPrompts[0].contains("结构规划"))
         // Stage 2 prompt references the overview summary (merged JSON).
         XCTAssertTrue(provider.userPrompts[2].contains("足够长的概览摘要"))
         // Stage 3 references the narrative core point.
         XCTAssertTrue(provider.userPrompts[3].contains("叙事要点"))
-        // Stage 4 references the analysis dispute.
-        XCTAssertTrue(provider.userPrompts[4].contains("分析分歧"))
     }
 
 
@@ -212,8 +264,7 @@ final class DeepReadPipelineTests: XCTestCase {
             planReply,
             goodSummaryReply,
             #"{"timeline":[{"date":"今天","event":"事件发生"}"#,
-            analysisReply,
-            extendedReply
+            analysisReply
         ], finishReasons: [3: "length"])
         let result = await IOSDeepReadDraftGenerator.generateViaLLMResult(
             task: makeTask(),
@@ -221,7 +272,7 @@ final class DeepReadPipelineTests: XCTestCase {
             model: makeDeepReadModel("test-model"),
             provider: provider
         )
-        XCTAssertEqual(provider.callCount, 5)
+        XCTAssertEqual(provider.callCount, 4)
         XCTAssertFalse(result.didFail)
         XCTAssertTrue(result.missingSections.isEmpty)
         let json = try XCTUnwrap(result.structuredJSON)
@@ -237,8 +288,7 @@ final class DeepReadPipelineTests: XCTestCase {
             goodSummaryReply,
             timelineReply,
             "分析部分我想写一段长文……",
-            "分析部分我想写一段长文……",
-            extendedReply
+            "分析部分我想写一段长文……"
         ])
         let result = await IOSDeepReadDraftGenerator.generateViaLLMResult(
             task: makeTask(),
@@ -246,12 +296,12 @@ final class DeepReadPipelineTests: XCTestCase {
             model: makeDeepReadModel("test-model"),
             provider: provider
         )
-        XCTAssertEqual(provider.callCount, 6) // analysis consumed its retry
+        XCTAssertEqual(provider.callCount, 5) // analysis consumed its retry
         XCTAssertFalse(result.didFail, "partial content is a completed draft")
         XCTAssertEqual(result.missingSections, ["深度分析"])
         XCTAssertTrue(result.markdown.contains("## 时间轴"))
-        XCTAssertTrue(result.markdown.contains("## 扩展阅读"))
-        XCTAssertFalse(result.markdown.contains("## 深度分析"))
+        XCTAssertTrue(result.markdown.contains("## 来源"))
+        XCTAssertFalse(result.markdown.contains("## 各方立场"))
     }
 
     // 全部调用失败且报错是未归类的英文时，失败原因要带上服务商原话，不能只剩「操作失败」。
@@ -311,7 +361,7 @@ final class DeepReadPipelineTests: XCTestCase {
         let json = try XCTUnwrap(result.structuredJSON)
         let output = try JSONDecoder().decode(IOSDeepReadOutput.self, from: Data(json.utf8))
         XCTAssertEqual(output.timeline.first?.event, "既有事件")
-        XCTAssertEqual(output.analysis.coreDispute, "是否已到产品化拐点")
+        XCTAssertEqual(output.analysis.coreDispute, "是否已到产品化拐点？")
     }
 
     func testTargetedRetryFailureKeepsPriorSectionsAndReportsMissing() async {
