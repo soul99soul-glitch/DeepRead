@@ -1,0 +1,107 @@
+✔ actual source action launches only absolute HTTP URLs through the system browser Want (30.698625ms)
+✔ browser errors are visible, duplicate activation is blocked and unavailable context is explicit (6.767417ms)
+✔ departed and reopened source pages reject old load, subscription and browser error callbacks (7.04025ms)
+✔ a newer source observation wins over the older initial repository read in the same page (3.628792ms)
+✔ embedded sources read the article topic, and closing during exit invalidates callbacks and actions (3.604833ms)
+✔ source disclosure animates the real expansion and reduced motion reaches the same content directly (7.237542ms)
+✔ a stale disclosure animation callback cannot change a departed and reopened source page (3.400417ms)
+✖ source disclosure keeps each discovery report separate while previewing full Composer text (5.623709ms)
+✖ hidden discovery mount loads on its first visible transition and reloads after cancellation (26.061708ms)
+✔ initially visible discovery mount uses its existing loading gate to prevent duplicate work (7.3775ms)
+✖ browser launch failures report the failed action without claiming a clipboard write (2.234125ms)
+✖ all discovery exit paths wait for the queued latest preference before returning (0.892ms)
+✖ failed discovery writes finish the existing reload and leave the error visible before exit is allowed (0.143208ms)
+ℹ tests 13
+ℹ suites 0
+ℹ pass 8
+ℹ fail 5
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 267.033084
+
+✖ failing tests:
+
+test at harmony/deepread/src/test/deepread_sources_ui.test.cjs:120:1
+✖ source disclosure keeps each discovery report separate while previewing full Composer text (5.623709ms)
+  TypeError: f.page.sourceBody is not a function
+      at TestContext.<anonymous> (/Users/arquiel/Downloads/AI/DeepRead/harmony/deepread/src/test/deepread_sources_ui.test.cjs:126:25)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1402:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:974:18)
+      at Test.postRun (node:internal/test_runner/test:1542:19)
+      at Test.run (node:internal/test_runner/test:1467:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7)
+
+test at harmony/entry/src/test/deepread_phase2_ui_regression.test.cjs:33:1
+✖ hidden discovery mount loads on its first visible transition and reloads after cancellation (26.061708ms)
+  AssertionError [ERR_ASSERTION]: first showing a hidden retained discovery root must load preferences and hotlist
+  
+  0 !== 1
+  
+      at TestContext.<anonymous> (/Users/arquiel/Downloads/AI/DeepRead/harmony/entry/src/test/deepread_phase2_ui_regression.test.cjs:36:10)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1402:25)
+      at Test.start (node:internal/test_runner/test:1262:17)
+      at startSubtestAfterBootstrap (node:internal/test_runner/harness:387:17) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 0,
+    expected: 1,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at harmony/entry/src/test/deepread_phase2_ui_regression.test.cjs:49:1
+✖ browser launch failures report the failed action without claiming a clipboard write (2.234125ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    [
+  +   '无法打开浏览器，已复制链接'
+  -   '无法打开浏览器，请稍后重试'
+    ]
+  
+      at TestContext.<anonymous> (/Users/arquiel/Downloads/AI/DeepRead/harmony/entry/src/test/deepread_phase2_ui_regression.test.cjs:57:43)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: [ '无法打开浏览器，已复制链接' ],
+    expected: [ '无法打开浏览器，请稍后重试' ],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+
+test at harmony/entry/src/test/deepread_phase2_ui_regression.test.cjs:79:1
+✖ all discovery exit paths wait for the queued latest preference before returning (0.892ms)
+  Error: missing actual method canLeave
+      at method (/Users/arquiel/Downloads/AI/DeepRead/harmony/deepread/src/test/deepread_ui_fixture.cjs:33:21)
+      at /Users/arquiel/Downloads/AI/DeepRead/harmony/entry/src/test/deepread_phase2_ui_regression.test.cjs:11:72
+      at Array.map (<anonymous>)
+      at controller (/Users/arquiel/Downloads/AI/DeepRead/harmony/entry/src/test/deepread_phase2_ui_regression.test.cjs:11:60)
+      at settings (/Users/arquiel/Downloads/AI/DeepRead/harmony/entry/src/test/deepread_phase2_ui_regression.test.cjs:68:16)
+      at TestContext.<anonymous> (/Users/arquiel/Downloads/AI/DeepRead/harmony/entry/src/test/deepread_phase2_ui_regression.test.cjs:81:13)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1402:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:974:18)
+      at Test.postRun (node:internal/test_runner/test:1542:19)
+
+test at harmony/entry/src/test/deepread_phase2_ui_regression.test.cjs:96:1
+✖ failed discovery writes finish the existing reload and leave the error visible before exit is allowed (0.143208ms)
+  Error: missing actual method canLeave
+      at method (/Users/arquiel/Downloads/AI/DeepRead/harmony/deepread/src/test/deepread_ui_fixture.cjs:33:21)
+      at /Users/arquiel/Downloads/AI/DeepRead/harmony/entry/src/test/deepread_phase2_ui_regression.test.cjs:11:72
+      at Array.map (<anonymous>)
+      at controller (/Users/arquiel/Downloads/AI/DeepRead/harmony/entry/src/test/deepread_phase2_ui_regression.test.cjs:11:60)
+      at settings (/Users/arquiel/Downloads/AI/DeepRead/harmony/entry/src/test/deepread_phase2_ui_regression.test.cjs:68:16)
+      at TestContext.<anonymous> (/Users/arquiel/Downloads/AI/DeepRead/harmony/entry/src/test/deepread_phase2_ui_regression.test.cjs:98:13)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1402:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:974:18)
+      at Test.postRun (node:internal/test_runner/test:1542:19)
+H04 original SourceSection Text expression: source.content.length > 0 ?
+          (source.kind === 'text' && this.inputText.length > 0 ? this.inputText.substring(0, 40000) : source.content) : '尚未取得正文。'
+H04 actual displayed bodies: ["热点 A 正文\n热点 B 正文","热点 A 正文\n热点 B 正文"]
+H06 immediate return discovery preference: {"keywords":"A","pendingWrites":2}
+H06 after writeQueue: {"keywords":"AI","pendingWrites":0}

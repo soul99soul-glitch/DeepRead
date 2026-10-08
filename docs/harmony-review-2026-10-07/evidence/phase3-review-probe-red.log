@@ -1,0 +1,25 @@
+{"input":"[坏](<https://bad.example) [来源](https://example.com/source)","before":[{"type":"link","text":"坏","url":"<https://bad.example"},{"type":"text","text":" "},{"type":"link","text":"来源","url":"https://example.com/source"}],"after":[{"type":"text","text":"[坏](<https://bad.example) [来源](https://example.com/source)"}]}
+node:internal/modules/run_main:107
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: valid source after malformed destination must remain a link
+    at assert (/private/tmp/deepread-harmony-review-20261007/phase3-review-probe.ts:18:10)
+    at Object.<anonymous> (/private/tmp/deepread-harmony-review-20261007/phase3-review-probe.ts:19:1)
+    at Module._compile (node:internal/modules/cjs/loader:1934:14)
+    at Object.transformer (/Users/arquiel/Downloads/AI/DeepRead/harmony/chat/node_modules/tsx/dist/register-BoI6-WNn.cjs:9:3252)
+    at Module.load (node:internal/modules/cjs/loader:1656:32)
+    at Module._load (node:internal/modules/cjs/loader:1448:12)
+    at wrapModuleLoad (node:internal/modules/cjs/loader:261:19)
+    at loadCJSModuleWithModuleLoad (node:internal/modules/esm/translators:376:15)
+    at ModuleWrap.<anonymous> (node:internal/modules/esm/translators:248:9)
+    at ModuleJob.run (node:internal/modules/esm/module_job:569:25) {
+  generatedMessage: false,
+  code: 'ERR_ASSERTION',
+  actual: false,
+  expected: true,
+  operator: '==',
+  diff: 'simple'
+}
+
+Node.js v26.8.1

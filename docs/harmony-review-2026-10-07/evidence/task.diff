@@ -1,0 +1,1314 @@
+--- baseline/harmony/chat/src/main/ets/chat/markdown_blocks.ts
++++ harmony/chat/src/main/ets/chat/markdown_blocks.ts
+@@ -159,6 +159,90 @@
+   return count % 2 !== 0;
+ };
+ 
++interface DestinationMatch extends InlineMatch {
++  escapedLabel: boolean;
++  destinationStart: number;
++}
++
++interface DestinationEnd {
++  end: number;
++  url: string | null;
++}
++
++const unescapeMarkdownPunctuation = (text: string): string =>
++  text.replace(/\\([\\`*_{}\[\]()<>#!|$])/g, '$1');
++
++const scanDestination = (text: string, opening: number, limit: number): DestinationEnd => {
++  let pos: number = opening + 1;
++  while (pos < limit && /\s/.test(text[pos])) pos++;
++  const angle: boolean = text[pos] === '<';
++  if (angle) pos++;
++  const start: number = pos;
++  let depth: number = 1;
++  for (; pos < limit; pos++) {
++    if (text[pos] === '\\' && pos + 1 < limit) { pos++; continue; }
++    // Preserve the existing trim at the wrapper boundary. Other unencoded
++    // whitespace ends a failed URL, allowing the next source link to recover.
++    if (/\s/.test(text[pos])) {
++      const urlEnd: number = pos;
++      while (pos < limit && /\s/.test(text[pos])) pos++;
++      return !angle && depth === 1 && pos < limit && text[pos] === ')'
++        ? { end: pos, url: text.substring(start, urlEnd) } : { end: pos - 1, url: null };
++    }
++    if (angle) {
++      if (text[pos] !== '>') continue;
++      const url: string = text.substring(start, pos);
++      pos++;
++      while (pos < limit && /\s/.test(text[pos])) pos++;
++      return pos < limit && text[pos] === ')'
++        ? { end: pos, url } : { end: pos - 1, url: null };
++    }
++    if (text[pos] === '(') depth++;
++    if (text[pos] === ')' && --depth === 0) {
++      return { end: pos, url: text.substring(start, pos) };
++    }
++  }
++  return { end: pos - 1, url: null };
++};
++
++// Consume labels and destinations once, including failed candidates. Retrying a
++// destination from each '[' would rescan long unfinished model output quadratically.
++const scanDestinationMatches = (text: string, codes: InlineMatch[]): DestinationMatch[] => {
++  const matches: DestinationMatch[] = [];
++  let labelStart: number = -1;
++  let codeIndex: number = 0;
++  for (let pos: number = 0; pos < text.length; pos++) {
++    while (codeIndex < codes.length && codes[codeIndex].end <= pos) codeIndex++;
++    if (codeIndex < codes.length && codes[codeIndex].start <= pos) {
++      pos = codes[codeIndex].end - 1;
++      labelStart = -1;
++      continue;
++    }
++    if (text[pos] === '\\' && pos + 1 < text.length) { pos++; continue; }
++    if (text[pos] === '[' && labelStart < 0) { labelStart = pos; continue; }
++    if (text[pos] !== ']' || labelStart < 0) continue;
++    const start: number = labelStart;
++    labelStart = -1;
++    if (text[pos + 1] !== '(') continue;
++    const image: boolean = start > 0 && text[start - 1] === '!' && !isEscaped(text, start - 1);
++    const label: string = text.substring(start + 1, pos);
++    if (!image && label.length === 0) continue;
++    const destinationStart: number = pos + 1;
++    const limit: number = codeIndex < codes.length ? codes[codeIndex].start : text.length;
++    const destination: DestinationEnd = scanDestination(text, destinationStart, limit);
++    pos = destination.end;
++    if (destination.url === null) continue;
++    const url: string | null = sanitizeUrl(unescapeMarkdownPunctuation(destination.url));
++    if (url === null) continue;
++    const literalLabel: string = unescapeMarkdownPunctuation(label);
++    matches.push({ start: image ? start - 1 : start, end: pos + 1,
++      escapedLabel: !image && label.includes('\\'), destinationStart,
++      token: image ? { type: 'image', alt: literalLabel, url } as InlineImageToken
++        : { type: 'link', text: literalLabel, url } as InlineLinkToken });
++  }
++  return matches;
++};
++
+ export const parseInline = (text: string): InlineToken[] => {
+   if (text.length === 0) return [];
+ 
+@@ -177,20 +261,22 @@
+   }
+ 
+   // Escaped labels are literal metadata, so their delimiters must not become math or code.
+-  const escapedLinkRe = /\[((?:\\.|[^\]\\])+)\]\(([^)]+)\)/g;
+-  while ((m = escapedLinkRe.exec(text)) !== null) {
+-    const start: number = m.index;
+-    const end: number = start + m[0].length;
+-    if (!m[1].includes('\\') || isEscaped(text, start) || overlaps(matches, start, end)
+-      || (start > 0 && text[start - 1] === '!' && !isEscaped(text, start - 1))) continue;
+-    const url: string | null = sanitizeUrl(m[2]);
+-    if (url === null) continue;
+-    matches.push({ start, end, token: { type: 'link',
+-      text: m[1].replace(/\\([\\`*_{}\[\]()<>#!|$])/g, '$1'), url } as InlineLinkToken });
++  const destinations: DestinationMatch[] = scanDestinationMatches(text, matches);
++  for (const destination of destinations) {
++    if (destination.escapedLabel && !overlaps(matches, destination.start, destination.end)) {
++      matches.push(destination);
++    }
+   }
+ 
+   // 1b. 标准数学定界符；展示公式可以跨行，代码及转义定界符不参与。
++  let destinationIndex: number = 0;
+   for (let pos: number = 0; pos < text.length; pos++) {
++    while (destinationIndex < destinations.length && destinations[destinationIndex].end <= pos) destinationIndex++;
++    // URL escapes belong to the destination, not to formula syntax (e.g. report_\(2026\)).
++    if (destinationIndex < destinations.length && pos >= destinations[destinationIndex].destinationStart) {
++      pos = destinations[destinationIndex].end - 1;
++      continue;
++    }
+     if (isEscaped(text, pos) || overlaps(matches, pos, pos + 1)) continue;
+     let opening: string = '';
+     let closing: string = '';
+@@ -224,34 +310,9 @@
+     }
+   }
+ 
+-  // 2. 图片 ![alt](url)
+-  const imgRe = /!\[([^\]]*)\]\(([^)]+)\)/g;
+-  while ((m = imgRe.exec(text)) !== null) {
+-    const start: number = m.index;
+-    const end: number = m.index + m[0].length;
+-    if (overlaps(matches, start, end)) continue;
+-    const safeUrl: string | null = sanitizeUrl(m[2]);
+-    if (safeUrl === null) continue;
+-    matches.push({
+-      start,
+-      end,
+-      token: { type: 'image', alt: m[1], url: safeUrl } as InlineImageToken,
+-    });
+-  }
+-
+-  // 3. 链接 [text](url)
+-  const linkRe = /\[([^\]]+)\]\(([^)]+)\)/g;
+-  while ((m = linkRe.exec(text)) !== null) {
+-    const start: number = m.index;
+-    const end: number = m.index + m[0].length;
+-    if (overlaps(matches, start, end)) continue;
+-    const safeUrl: string | null = sanitizeUrl(m[2]);
+-    if (safeUrl === null) continue;
+-    matches.push({
+-      start,
+-      end,
+-      token: { type: 'link', text: m[1], url: safeUrl } as InlineLinkToken,
+-    });
++  // 2–3. 图片和链接共用 destination，仍让代码、公式及转义标签先占用区间。
++  for (const destination of destinations) {
++    if (!overlaps(matches, destination.start, destination.end)) matches.push(destination);
+   }
+ 
+   // 4. 粗体 **text**
+--- baseline/harmony/chat/src/main/ets/chat/openai_responses_api.ts
++++ harmony/chat/src/main/ets/chat/openai_responses_api.ts
+@@ -290,7 +290,9 @@
+     if (state.error !== null) throw state.error;
+     if (transportError !== null) throw transportError;
+     if (resp === null) throw new Error('Responses transport did not return a response');
+-    if (resp.status < 200 || resp.status >= 300) {
++    // A protocol terminal can close the native stream before HTTP status arrives.
++    // Only that completed state permits status 0; known HTTP failures still reject.
++    if ((resp.status < 200 || resp.status >= 300) && !(state.done && resp.status === 0)) {
+       throw errorFromFailure(resp.status, resp.body);
+     }
+     // R06:2xx 但零 SSE 事件(网关 200 回普通 JSON)→ 不是成功流
+--- baseline/harmony/chat/src/test/generation_keepalive.test.cjs
++++ harmony/chat/src/test/generation_keepalive.test.cjs
+@@ -33,7 +33,7 @@
+ 
+ const keepAliveFixture = () => {
+   const calls = { starts: 0, stops: 0, publishes: [], startContexts: [], stopContexts: [] };
+-  const gate = { startDeferred: null };
++  const gate = { startDeferred: null, stopDeferred: null };
+   const notification = { notificationId: 4242, slotType: 4, contentType: 5 };
+   const imports = {
+     './ProductIdentity.ets': { getAppBundleName: () => 'app.amber.deepread' },
+@@ -46,7 +46,10 @@
+           if (gate.startDeferred !== null) return gate.startDeferred.promise;
+           return Promise.resolve(notification);
+         },
+-        stopBackgroundRunning: async (context) => { calls.stops++; calls.stopContexts.push(context); },
++        stopBackgroundRunning: (context) => {
++          calls.stops++; calls.stopContexts.push(context);
++          return gate.stopDeferred !== null ? gate.stopDeferred.promise : Promise.resolve();
++        },
+       },
+     },
+     '@kit.AbilityKit': { wantAgent: { getWantAgent: async (info) => ({ info }),
+@@ -198,6 +201,46 @@
+   await flush(8);
+   assert.equal(calls.stops, 1); // 迟到完成的任务被立即停掉
+   assert.equal(api.generationKeepAliveHeld(), false);
++});
++
++test('B registering while A native stop is pending regains the lease without another progress event', async () => {
++  const { api, calls, gate } = keepAliveFixture();
++  api.reportGenerationProgress(ctx, snap('deepread', 'A', true, 10, 30));
++  await api.setGenerationKeepAliveBackground(ctx, true);
++  let resolveStop;
++  gate.stopDeferred = { promise: new Promise((resolve) => { resolveStop = resolve; }) };
++  api.reportGenerationProgress(ctx, snap('deepread', 'A', false, 10, 30));
++  await flush();
++  assert.equal(calls.stops, 1, 'native stop is already in progress');
++  api.reportGenerationProgress(ctx, snap('deepread', 'B', true, 0, 0));
++  assert.equal(calls.starts, 1);
++  resolveStop();
++  await flush();
++  assert.equal(calls.starts, 2, 'the latest active B needs a new lease after stop succeeds');
++  assert.equal(api.generationKeepAliveHeld(), true);
++  gate.stopDeferred = null;
++  await api.disposeGenerationKeepAlive(ctx);
++});
++
++test('foreground or disposal while a replacement is waiting for native stop never restarts the lease', async () => {
++  for (const disposed of [false, true]) {
++    const { api, calls, gate } = keepAliveFixture();
++    api.reportGenerationProgress(ctx, snap('deepread', 'A', true, 10, 30));
++    await api.setGenerationKeepAliveBackground(ctx, true);
++    let resolveStop;
++    gate.stopDeferred = { promise: new Promise((resolve) => { resolveStop = resolve; }) };
++    api.reportGenerationProgress(ctx, snap('deepread', 'A', false, 10, 30));
++    await flush();
++    api.reportGenerationProgress(ctx, snap('deepread', 'B', true, 0, 0));
++    const lifecycle = disposed ? api.disposeGenerationKeepAlive(ctx) : api.setGenerationKeepAliveBackground(ctx, false);
++    resolveStop();
++    await lifecycle;
++    await flush();
++    assert.equal(calls.starts, 1);
++    assert.equal(api.generationKeepAliveHeld(), false);
++    gate.stopDeferred = null;
++    await api.disposeGenerationKeepAlive(ctx);
++  }
+ });
+ 
+ test('tracker: history baseline is zero, growth counts once, retry never decreases, USER/tool-output excluded, UTF8 bytes are real', async () => {
+--- baseline/harmony/chat/src/test/markdown_blocks.test.ts
++++ harmony/chat/src/test/markdown_blocks.test.ts
+@@ -67,6 +67,79 @@
+ });
+ 
+ describe('parseInline link', () => {
++  it('preserves balanced, escaped and angle-wrapped destinations for native reading', () => {
++    for (const [destination, url] of [
++      ['https://example.com/report_(2026)', 'https://example.com/report_(2026)'],
++      ['https://example.com/?q=(outer(inner))&year=2026', 'https://example.com/?q=(outer(inner))&year=2026'],
++      ['<https://example.com/source_(2026)>', 'https://example.com/source_(2026)'],
++      ['https://example.com/report_\\(2026\\)', 'https://example.com/report_(2026)'],
++      ['  https://example.com/source \t', 'https://example.com/source'],
++    ]) {
++      assert.deepEqual(parseInline(`[报告](${destination})`), [{ type: 'link', text: '报告', url }]);
++    }
++  });
++
++  it('uses the same destination rules for images and preserves escaped labels', () => {
++    assert.deepEqual(parseInline('![图\\]](<https://example.com/photo_(2026).png>)'), [
++      { type: 'image', alt: '图]', url: 'https://example.com/photo_(2026).png' },
++    ]);
++    assert.deepEqual(parseInline('[标题\\] \\$价格\\$](https://example.com/report_(2026))'), [
++      { type: 'link', text: '标题] $价格$', url: 'https://example.com/report_(2026)' },
++    ]);
++  });
++
++  it('keeps code precedence and rejects unsafe wrapped destinations', () => {
++    assert.deepEqual(parseInline('`[报告](https://example.com/report_(2026))`'), [
++      { type: 'code', text: '[报告](https://example.com/report_(2026))' },
++    ]);
++    for (const source of ['[x](<javascript:alert(1)>)', '![x](javascript:alert(1))']) {
++      assert.equal(parseInline(source).some(token => token.type === 'link' || token.type === 'image'), false);
++    }
++  });
++
++  it('retains unfinished destinations as text and consumes deeply balanced URLs without recursion', () => {
++    const unfinished = '[报告](https://example.com/report_(2026)';
++    assert.deepEqual(parseInline(unfinished), [{ type: 'text', text: unfinished }]);
++    const openLabels = '['.repeat(10000);
++    assert.deepEqual(parseInline(openLabels), [{ type: 'text', text: openLabels }]);
++    const url = `https://example.com/${'('.repeat(1000)}report${')'.repeat(1000)}`;
++    assert.deepEqual(parseInline(`[报告](${url})`), [{ type: 'link', text: '报告', url }]);
++  });
++
++  it('does not let an empty label consume a later valid link and retains formula precedence', () => {
++    assert.deepEqual(parseInline('[]( [来源](https://example.com/source))'), [
++      { type: 'text', text: '[]( ' },
++      { type: 'link', text: '来源', url: 'https://example.com/source' },
++      { type: 'text', text: ')' },
++    ]);
++    assert.deepEqual(parseInline('$[来源](https://example.com/source)$'), [
++      { type: 'math', latex: '[来源](https://example.com/source)', display: false },
++    ]);
++  });
++
++  it('recovers the later source after malformed angle or unbalanced destinations', () => {
++    for (const malformed of ['[坏](<https://bad.example)', '[坏](https://bad.example/path_(oops)']) {
++      const source = `${malformed} [来源](https://example.com/source)`;
++      assert.deepEqual(parseInline(source).filter(token => token.type === 'link' && token.text === '来源'), [
++        { type: 'link', text: '来源', url: 'https://example.com/source' },
++      ]);
++    }
++  });
++
++  it('code containing malformed destinations does not consume a following source', () => {
++    assert.deepEqual(parseInline('`[坏](<https://bad.example)` [来源](https://example.com/source)'), [
++      { type: 'code', text: '[坏](<https://bad.example)' },
++      { type: 'text', text: ' ' },
++      { type: 'link', text: '来源', url: 'https://example.com/source' },
++    ]);
++  });
++
++  it('recovers an unconsumed label directly after a malformed angle wrapper', () => {
++    assert.deepEqual(parseInline('[坏](<https://bad.example>[来源](https://example.com/source)').filter(token => token.type === 'link'), [
++      { type: 'link', text: '来源', url: 'https://example.com/source' },
++    ]);
++  });
++
+   it('escaped labels keep brackets, backticks and dollar signs literal', () => {
+     const tokens = parseInline('[标题\\]\\(https://other.example\\) \\[报告 \\`代码\\` \\$价格\\$](https://news.test/story_%28edition%29)');
+     assert.deepEqual(tokens, [{ type: 'link', text: '标题](https://other.example) [报告 `代码` $价格$', url: 'https://news.test/story_%28edition%29' }]);
+--- baseline/harmony/chat/src/test/openai_responses_terminal.test.ts
++++ harmony/chat/src/test/openai_responses_terminal.test.ts
+@@ -1,5 +1,10 @@
+ import { test } from 'node:test';
+ import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import vm from 'node:vm';
++import { createRequire } from 'node:module';
++import type { HttpClient } from '@amber/deepread-domain';
++import { httpResponseStatusFromHeaders, isEventStreamResponse } from '../../../deepread/src/main/ets/platform/http_response_status.ts';
+ import type { JsonObject } from '../main/ets/chat/json.ts';
+ import type { MessageChunk } from '../main/ets/chat/message.ts';
+ import { makeUIMessage, makeUserMessage } from '../main/ets/chat/message.ts';
+@@ -25,6 +30,98 @@
+ const textOf = (chunk: MessageChunk): string => chunk.choices
+   .flatMap((choice) => (choice.message ?? choice.delta)?.parts ?? [])
+   .filter((part) => part.type === 'text').map((part) => part.text).join('');
++
++// Execute the real adapter: native HTTP completion intentionally stays pending
++// while the Responses terminal asks shouldStop() to close the request.
++const actualRcpFixture = () => {
++  const require = createRequire(import.meta.url);
++  const ts = require('typescript');
++  const handlers: Record<string, (value?: unknown) => void> = {};
++  let destroys = 0;
++  const native = {
++    on: (name: string, handler: (value?: unknown) => void) => { handlers[name] = handler; },
++    destroy: () => { destroys++; },
++    requestInStream: () => new Promise(() => {}),
++  };
++  const imports: Record<string, unknown> = {
++    '@kit.NetworkKit': { http: { createHttp: () => native,
++      RequestMethod: { POST: 'POST' }, HttpDataType: { ARRAY_BUFFER: 'buffer' } } },
++    '@kit.ArkTS': { util: { TextDecoder: { create: () => ({
++      decodeToString: (bytes: Uint8Array) => new TextDecoder().decode(bytes),
++    }) } } },
++    '@kit.PerformanceAnalysisKit': { hilog: { info() {}, warn() {}, error() {} } },
++    '@amber/deepread-domain': { httpResponseStatusFromHeaders, isEventStreamResponse },
++  };
++  const exports: { createRcpHttpClient?: () => HttpClient } = {};
++  const filename = new URL('../../../entry/src/main/ets/platform_impl/RcpHttpClient.ets', import.meta.url);
++  vm.runInNewContext(ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
++    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
++  }).outputText, { exports, require: (name: string) => imports[name],
++    Error, Promise, Object, String, Number, ArrayBuffer, Uint8Array });
++  return {
++    http: exports.createRcpHttpClient!(),
++    terminal: () => {
++      handlers.headersReceive({ 'content-type': 'text/event-stream' });
++      handlers.dataReceive(new TextEncoder().encode(`data: ${JSON.stringify({
++        type: 'response.completed', sequence_number: 1,
++        response: { id: 'resp_actual', model: 'gpt-test', status: 'completed', output },
++      })}\n\n`).buffer);
++    },
++    destroys: () => destroys,
++  };
++};
++
++test('actual HTTP adapter terminal succeeds with unknown HTTP status and commits tools before the terminal cursor', async () => {
++  for (const resumable of [false, true]) {
++    const f = actualRcpFixture();
++    const chunks: MessageChunk[] = [];
++    let checkpointTools = -1;
++    const api = createOpenAIResponsesApi({ http: f.http, setting,
++      enableResponsesResume: resumable, runId: 'run',
++      onResumeCheckpoint: async (cursor) => {
++        assert.equal(cursor.terminalStatus, 'completed');
++        checkpointTools = chunks.flatMap((chunk) => chunk.choices).flatMap((choice) =>
++          (choice.delta ?? choice.message)?.parts ?? []).filter((part) => part.type === 'tool').length;
++      },
++    });
++    const running = api.streamText(messages, params, (chunk) => { chunks.push(chunk); });
++    f.terminal();
++    await running;
++    assert.equal(f.destroys(), 1);
++    assert.equal(chunks.map(textOf).join(''), 'Partial reply');
++    const tools = chunks.flatMap((chunk) => chunk.choices).flatMap((choice) =>
++      (choice.delta ?? choice.message)?.parts ?? []).filter((part) => part.type === 'tool');
++    assert.equal(tools.length, 1);
++    assert.equal(tools[0].toolCallId, 'call_failed');
++    assert.equal(checkpointTools, resumable ? 1 : -1);
++  }
++});
++
++test('unknown HTTP status never bypasses missing terminal, provider failure, transport failure or cancellation', async () => {
++  for (const mode of ['partial', 'failed', 'transport', 'cancelled']) {
++    const chunks: MessageChunk[] = [];
++    const signal = { aborted: false };
++    const event = mode === 'partial'
++      ? { type: 'response.output_item.added', item: output[1] }
++      : mode === 'failed'
++        ? { type: 'response.failed', response: { status: 'failed', error: { message: 'provider failed' }, output } }
++        : { type: 'response.completed', response: { status: 'completed', output } };
++    const api = createOpenAIResponsesApi({ setting, http: {
++      fetch: async () => ({ status: 200, headers: {}, body: '' }),
++      fetchStream: async (_request, opts) => {
++        opts.onChunk(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`).buffer as ArrayBuffer, true);
++        if (mode === 'transport') throw new Error('transport failed');
++        signal.aborted = mode === 'cancelled';
++        return { status: 0, headers: {}, body: '' };
++      },
++    } });
++    await assert.rejects(api.streamText(messages, params, (chunk) => { chunks.push(chunk); }, { signal }),
++      mode === 'failed' ? /provider failed/ : mode === 'transport' ? /transport failed/
++        : mode === 'cancelled' ? /cancelled/ : /Failed to get response: 0/);
++    assert.equal(chunks.flatMap((chunk) => chunk.choices).some((choice) =>
++      (choice.delta ?? choice.message)?.parts.some((part) => part.type === 'tool')), false);
++  }
++});
+ 
+ test('Responses native opaque reasoning survives output parsing and reconciliation', () => {
+   const response: JsonObject = {
+--- baseline/harmony/deepread/src/main/ets/agent/section_writer_tools.ts
++++ harmony/deepread/src/main/ets/agent/section_writer_tools.ts
+@@ -283,6 +283,11 @@
+ 
+   const isHeroCandidate = (url: string): boolean =>
+     candidateForUrl(url)?.confidence === IMAGE_CONFIDENCE.HERO;
++
++  const narrativeImageUrl = (url: string | null): string | null => {
++    const candidate = url !== null ? candidateForUrl(url) : null;
++    return candidate !== null && candidate.confidence !== IMAGE_CONFIDENCE.REJECT ? url : null;
++  };
+ 
+   // withCandidateEvidence — 照搬 Android:asset 必须在候选池且非 reject
+   const withCandidateEvidence = (asset: DeepReadImageAsset): DeepReadImageAsset | null => {
+@@ -363,8 +368,8 @@
+     isHighRisk: false,
+     execute: async (input: string): Promise<UIMessagePartText[]> => {
+       const obj = asObject(input);
+-      const timeline = parseTimeline(obj).slice(0, TIMELINE_MAX);
+-      const corePoints = parseCorePoints(obj, output.sources?.length ?? 0).slice(0, CORE_POINTS_MAX);
++      const timeline = parseTimeline(obj, narrativeImageUrl).slice(0, TIMELINE_MAX);
++      const corePoints = parseCorePoints(obj, output.sources?.length ?? 0, narrativeImageUrl).slice(0, CORE_POINTS_MAX);
+       const references = parseReadingLinks(obj, 'references');
+       const rawTimelineCount = objObjectList(obj, 'timeline').length;
+       const rawCorePointCount = objObjectList(obj, 'core_points').length;
+@@ -732,32 +737,35 @@
+ 
+ // ===== 子解析器(照搬 Android timeline/corePoints/perspectives/quotes/imageAssets/diagram) =====
+ 
+-const parseTimeline = (o: Record<string, unknown>): TimelineEvent[] =>
++const parseTimeline = (o: Record<string, unknown>, acceptImageUrl: (url: string | null) => string | null): TimelineEvent[] =>
+   objObjectList(o, 'timeline').map(obj => {
+     const event = objString(obj, 'event');
+     if (event === null) return null;
+     const date = objString(obj, 'date');
++    const imageUrl = acceptImageUrl(urlString(obj, 'image_url'));
+     return {
+       date: date !== null ? cleanText(date, 80) : '',
+       event: cleanText(event, TIMELINE_EVENT_MAX),
+       isHighlight: objBool(obj, 'is_highlight') ?? false,
+       why: objString(obj, 'why') !== null ? cleanText(objString(obj, 'why')!, 180) : null,
+-      imageUrl: urlString(obj, 'image_url'),
+-      imageCaption: (() => { const c = objString(obj, 'image_caption'); return c !== null ? cleanText(c, HERO_CAPTION_MAX) : null; })(),
++      imageUrl,
++      imageCaption: (() => { const c = objString(obj, 'image_caption'); return imageUrl !== null && c !== null ? cleanText(c, HERO_CAPTION_MAX) : null; })(),
+     } as TimelineEvent;
+   }).filter((x): x is TimelineEvent => x !== null);
+ 
+-const parseCorePoints = (o: Record<string, unknown>, sourceCount: number = 0): CorePoint[] =>
++const parseCorePoints = (o: Record<string, unknown>, sourceCount: number,
++  acceptImageUrl: (url: string | null) => string | null): CorePoint[] =>
+   objObjectList(o, 'core_points').map(obj => {
+     const point = objString(obj, 'point');
+     if (point === null) return null;
+     const supporting = objString(obj, 'supporting');
++    const imageUrl = acceptImageUrl(urlString(obj, 'image_url'));
+     return {
+       point: cleanText(point, CORE_POINT_MAX),
+       sources: parseSourceNumbers(obj, sourceCount),
+       supporting: supporting !== null ? cleanText(supporting, CORE_SUPPORTING_MAX) : null,
+-      imageUrl: urlString(obj, 'image_url'),
+-      imageCaption: (() => { const c = objString(obj, 'image_caption'); return c !== null ? cleanText(c, HERO_CAPTION_MAX) : null; })(),
++      imageUrl,
++      imageCaption: (() => { const c = objString(obj, 'image_caption'); return imageUrl !== null && c !== null ? cleanText(c, HERO_CAPTION_MAX) : null; })(),
+     } as CorePoint;
+   }).filter((x): x is CorePoint => x !== null);
+ 
+--- baseline/harmony/deepread/src/test/deepread_markdown_links.test.cjs
++++ harmony/deepread/src/test/deepread_markdown_links.test.cjs
+@@ -0,0 +1,51 @@
++const { test } = require('node:test');
++const assert = require('node:assert/strict');
++const fs = require('node:fs');
++const path = require('node:path');
++const vm = require('node:vm');
++const ts = require('typescript');
++const { entryRoot, loadPureModule, actualPage } = require('./deepread_ui_fixture.cjs');
++
++const parser = loadPureModule(path.resolve(__dirname, '../../../chat/src/main/ets/chat/markdown_blocks.ts'));
++const { deepReadMarkdownHtml } = loadPureModule(path.join(entryRoot, 'platform_impl/DeepReadMarkdownHtml.ets'));
++// Exercise the production TXT formatter without invoking SDK file/share APIs.
++const exportFile = path.join(entryRoot, 'platform_impl/DeepReadExportFiles.ets');
++const textExports = {};
++vm.runInNewContext(ts.transpileModule(fs.readFileSync(exportFile, 'utf8'), {
++  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
++}).outputText, { exports: textExports, require: spec => {
++  if (spec === '@amber/chat-domain') return parser;
++  if (spec.startsWith('@kit.')) return {};
++  throw Error('unexpected export module ' + spec);
++} }, { filename: exportFile });
++
++test('DeepRead Web and TXT retain balanced parentheses in report destinations', () => {
++  const url = 'https://example.com/report_(2026)?q=(outer(inner))&source=reader';
++  const source = `[报告](${url})`;
++  assert.equal(deepReadMarkdownHtml(source), '<p><a href="https://example.com/report_(2026)?q=(outer(inner))&amp;source=reader">报告</a></p>');
++  assert.equal(textExports.deepReadMarkdownToText(source), `报告 (${url})`);
++  const native = actualPage('components/NativeMarkdownText.ets', ['inlineRuns'], {});
++  native.inlines = parser.parseInline(source);
++  assert.deepEqual(native.inlineRuns(), [{ kind: 'link', text: '报告', url }]);
++});
++
++test('DeepRead Web and TXT unwrap angle destinations for links and images', () => {
++  const source = '[来源](<https://example.com/source_(2026)>) ![图](<https://example.com/photo_(2026).png>)';
++  assert.equal(deepReadMarkdownHtml(source), '<p><a href="https://example.com/source_(2026)">来源</a> <img class="inline" src="https://example.com/photo_(2026).png" alt="图"/></p>');
++  assert.equal(textExports.deepReadMarkdownToText(source), '来源 (https://example.com/source_(2026)) 图 (https://example.com/photo_(2026).png)');
++});
++
++test('DeepRead retains code spans and blocks unsafe link/image destinations', () => {
++  assert.equal(deepReadMarkdownHtml('`[来源](https://example.com/report_(2026))`'), '<p><code>[来源](https://example.com/report_(2026))</code></p>');
++  const html = deepReadMarkdownHtml('[来源](<javascript:alert(1)>) ![图](javascript:alert(1))');
++  assert.equal(html.includes('<a '), false);
++  assert.equal(html.includes('<img '), false);
++});
++
++test('DeepRead retains the source anchor following malformed destinations or code examples', () => {
++  for (const prefix of ['[坏](<https://bad.example)', '[坏](https://bad.example/path_(oops)', '`[坏](<https://bad.example)`']) {
++    const source = `${prefix} [来源](https://example.com/source)`;
++    assert.ok(deepReadMarkdownHtml(source).includes('<a href="https://example.com/source">来源</a>'));
++    assert.ok(textExports.deepReadMarkdownToText(source).includes('来源 (https://example.com/source)'));
++  }
++});
+--- baseline/harmony/deepread/src/test/deepread_pdf_import.test.cjs
++++ harmony/deepread/src/test/deepread_pdf_import.test.cjs
+@@ -0,0 +1,174 @@
++const { test } = require('node:test');
++const assert = require('node:assert/strict');
++const fs = require('node:fs');
++const os = require('node:os');
++const path = require('node:path');
++const vm = require('node:vm');
++const ts = require('typescript');
++
++const ENTRY = path.resolve(__dirname, '../../../entry/src/main/ets/platform_impl');
++const load = (filename, imports, globals = {}) => {
++  const exports = {};
++  vm.runInNewContext(ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
++    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
++  }).outputText, { exports, require: spec => {
++    if (Object.hasOwn(imports, spec)) return imports[spec];
++    throw new Error(`unexpected import ${spec}`);
++  }, Error, Promise, String, Date, Math, Uint8Array, ArrayBuffer, ...globals }, { filename });
++  return exports;
++};
++
++// Execute both production Entry modules and the actual domain normalizer. Only
++// SDK services are injected; preview temp files are written/read on the OS.
++const fixture = pages => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'deepread-pdf-'));
++  const selected = path.join(dir, 'selected.pdf');
++  fs.writeFileSync(selected, '%PDF-fixture');
++  const calls = { pages: [], text: [], releases: [], yields: 0, documentsReleased: 0 };
++  let activePages = 0;
++  const fileIo = {
++    OpenMode: { READ_ONLY: 1, READ_WRITE: 2, CREATE: 4, TRUNC: 8 },
++    openSync: (filename, mode) => ({ fd: fs.openSync(filename, mode === 1 ? 'r' : 'w+') }),
++    statSync: fd => fs.fstatSync(fd),
++    readSync: (fd, bytes, options) => fs.readSync(fd, new Uint8Array(bytes), 0, options.length, options.offset),
++    writeSync: (fd, bytes) => fs.writeSync(fd, new Uint8Array(bytes)),
++    closeSync: file => fs.closeSync(file.fd),
++    accessSync: filename => fs.existsSync(filename),
++    unlinkSync: filename => fs.unlinkSync(filename),
++  };
++  const pdfService = {
++    ParseResult: { PARSE_SUCCESS: 0, PARSE_ERROR_PASSWORD: 1 },
++    GraphicsObjectType: { OBJECT_TEXT: 1 },
++    PdfDocument: class {
++      loadDocument(filename) { assert.equal(fs.readFileSync(filename, 'utf8'), '%PDF-fixture'); return 0; }
++      getPageCount() { return pages.length; }
++      getPage(index) {
++        assert.equal(activePages, 0, 'the previous native page must be released');
++        activePages++; calls.pages.push(index);
++        return {
++          getGraphicsObjects: () => pages[index].map((text, objectIndex) => text === null ? { type: 2 } : {
++            type: 1, get text() { calls.text.push([index, objectIndex]); return text; },
++          }),
++          release: () => { activePages--; calls.releases.push(index); },
++        };
++      }
++      releaseDocument() { assert.equal(activePages, 0); calls.documentsReleased++; }
++    },
++  };
++  let sequence = 0;
++  const parser = load(path.join(ENTRY, 'PdfDocumentParser.ets'), {
++    '@kit.PDFKit': { pdfService }, '@kit.CoreFileKit': { fileIo },
++    '@amber/chat-domain': { MAX_INLINE_TEXT_CHARS: 40000, newId: () => String(++sequence) },
++  }, { canIUse: () => true, AppStorage: { get: () => ({ cacheDir: dir }) },
++    setTimeout: callback => { assert.equal(activePages, 0, 'yield cannot retain a native page'); calls.yields++; callback(); } });
++  const domain = load(path.resolve(__dirname, '../main/ets/domain/input_sources.ts'), {});
++  const importer = load(path.join(ENTRY, 'DeepReadSourceImporter.ets'), {
++    '@kit.CoreFileKit': { fileIo }, '@kit.ArkTS': { util: {} },
++    '@amber/chat-domain': {}, '@amber/deepread-domain': domain,
++    './EntryDocumentParser.ets': {}, './PdfDocumentParser.ets': parser,
++  });
++  return { parser, calls, selected, import: () => importer.importDeepReadSource(selected),
++    files: () => fs.readdirSync(dir), cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
++};
++
++const withPdf = async (pages, check) => {
++  const f = fixture(pages);
++  try {
++    await check(f);
++    assert.deepEqual(f.files(), ['selected.pdf'], 'native preview copy must be removed');
++    assert.deepEqual(f.calls.releases, f.calls.pages, 'every opened native page must be released');
++    assert.ok(f.calls.documentsReleased > 0);
++  } finally { f.cleanup(); }
++};
++
++test('cleaned long PDF still records extraction truncation and does not save its omitted evidence', async () => {
++  await withPdf([['正文内容  \n'.repeat(8000) + '此处为 PDF 尾部关键证据。']], async f => {
++    const source = await f.import();
++    assert.equal(source.status, 'ready');
++    assert.ok(source.content.length < 40000, 'whitespace cleanup shrinks the raw prefix');
++    assert.equal(source.content.includes('尾部关键证据'), false);
++    assert.equal(source.truncated, true);
++    assert.match(source.note, /已截断/);
++    assert.doesNotMatch(source.note, /已保存.*40000/);
++  });
++});
++
++test('complete short PDF has its text and no truncation warning', async () => {
++  await withPdf([['首页正文', '另一段'], ['第二页正文']], async f => {
++    const source = await f.import();
++    assert.equal(source.content, '首页正文\n另一段\n\n第二页正文');
++    assert.equal(source.truncated, false); assert.equal(source.note, null);
++    assert.equal(f.calls.yields, 1);
++  });
++});
++
++test('raw text exactly fills the extraction budget without unread text and must not be marked truncated', async () => {
++  await withPdf([['正文  \n'.repeat(8000) + '尾']], async f => {
++    const source = await f.import();
++    assert.ok(source.content.length < 40000);
++    assert.equal(source.content.endsWith('尾'), true);
++    assert.equal(source.truncated, false); assert.equal(source.note, null);
++  });
++});
++
++test('an extra nonempty object after an exact raw boundary proves omitted text and ends probing', async () => {
++  await withPdf([['正文  \n'.repeat(8000) + '尾', ' \n ', null, '遗漏证据', '不应读取']], async f => {
++    const source = await f.import();
++    assert.equal(source.truncated, true); assert.match(source.note, /已截断/);
++    assert.equal(source.content.includes('遗漏证据'), false);
++    assert.deepEqual(f.calls.text, [[0, 0], [0, 1], [0, 3]]);
++  });
++});
++
++test('boundary probing releases and yields pages, stops at the first later page containing text', async () => {
++  await withPdf([['正文  \n'.repeat(8000) + '尾'], [null, ' \n '], ['下一页证据', '不应读取'], ['不应打开']], async f => {
++    const source = await f.import();
++    assert.equal(source.truncated, true);
++    assert.deepEqual(f.calls.pages, [0, 1, 2]);
++    assert.deepEqual(f.calls.text, [[0, 0], [1, 1], [2, 0]]);
++    assert.equal(f.calls.yields, 2);
++  });
++});
++
++test('a separator consuming the remaining raw budget still records unread text in that object or page', async () => {
++  for (const pages of [[['正文  \n'.repeat(8000), '遗漏正文']], [['正文  \n'.repeat(8000)], ['遗漏正文']]]) {
++    await withPdf(pages, async f => {
++      const source = await f.import();
++      assert.equal(source.truncated, true); assert.match(source.note, /已截断/);
++      assert.equal(source.content.includes('遗漏正文'), false);
++      assert.ok(source.content.length < 40000);
++    });
++  }
++});
++
++test('an exact boundary followed only by blank/image objects or pages is complete', async () => {
++  await withPdf([['正文  \n'.repeat(8000) + '尾', '  '], [null, '\n\n']], async f => {
++    const source = await f.import();
++    assert.equal(source.truncated, false); assert.equal(source.note, null);
++    assert.deepEqual(f.calls.pages, [0, 1]);
++  });
++});
++
++test('only whitespace omitted within the final object is not lost body text', async () => {
++  await withPdf([['正文  \n'.repeat(8000) + '尾   \n']], async f => {
++    const source = await f.import();
++    assert.equal(source.truncated, false); assert.equal(source.note, null);
++    assert.equal(source.content.endsWith('尾'), true);
++  });
++});
++
++test('normalization still enforces the existing saved body budget for dense PDF text', async () => {
++  await withPdf([['字'.repeat(40001)]], async f => {
++    const source = await f.import();
++    assert.equal(source.content.length, 40000);
++    assert.equal(source.truncated, true); assert.match(source.note, /最多保存 40000 字符/);
++  });
++});
++
++test('existing Chat path/preview APIs return budgeted strings and stop at the budget', async () => {
++  await withPdf([['12345'], ['Chat 不需要探查的后页']], async f => {
++    assert.equal(await f.parser.parsePdfPath(f.selected, 5), '12345');
++    assert.equal(await f.parser.parsePdfPreviewBytes(new TextEncoder().encode('%PDF-fixture'), 5), '12345');
++    assert.deepEqual(f.calls.pages, [0, 0]);
++  });
++});
+--- baseline/harmony/deepread/src/test/deepread_sources_ui.test.cjs
++++ harmony/deepread/src/test/deepread_sources_ui.test.cjs
+@@ -116,3 +116,22 @@
+   update(); assert.equal(f.page.expanded, '');
+   f.page.aboutToDisappear(); f.page.toggleSource('departed'); assert.equal(f.page.expanded, '');
+ });
++
++test('source disclosure keeps each discovery report separate while previewing full Composer text', () => {
++  const f = fixture();
++  f.page.inputText = '热点 A 正文\n热点 B 正文';
++  for (const [title, content] of [['热点 A', '热点 A 正文'], ['热点 B', '热点 B 正文']]) {
++    const report = { ...source(null), kind: 'text', title, content,
++      researchSource: { providerName: title, rank: 1 } };
++    assert.equal(f.page.sourceBody(report), content);
++  }
++  f.page.inputText = '完整粘贴'.repeat(12000);
++  assert.equal(f.page.sourceBody({ ...source(null), kind: 'text', content: '保存前缀' }), f.page.inputText.slice(0, 40000));
++  for (const kind of ['file', 'web', 'search']) {
++    assert.equal(f.page.sourceBody({ ...source(null), kind }), '正文');
++  }
++  f.page.inputText = '';
++  assert.equal(f.page.sourceBody({ ...source(null), kind: 'text' }), '正文');
++  assert.equal((f.source.match(/Text\(this\.sourceBody\(source\)/g) || []).length, 2,
++    'host and standalone disclosures must both use the actual source body');
++});
+--- baseline/harmony/deepread/src/test/deepread_template.test.cjs
++++ harmony/deepread/src/test/deepread_template.test.cjs
+@@ -261,6 +261,28 @@
+     const visible = html.replace(/<!--[\s\S]*?-->/g, '');
+     includesAll(visible, ['SUMMARY_UNIQUE', 'POINT_UNIQUE_11', 'REFERENCE_UNIQUE', 'DIAGRAM_TITLE_UNIQUE']);
+     assert.equal(occurrences(visible, 'SUMMARY_UNIQUE'), 1);
++  }
++});
++
++test('style examples preserve CSS and do not consume visible article chapters', () => {
++  for (const style of ['style', 'STYLE']) {
++    for (const slot of ['content', 'summary']) {
++      for (const body of ['<h1>{{title}}</h1>', '<h1>{{title}}</h1>{{summary}}',
++        '<h1>{{title}}</h1>{{content}}']) {
++        const css = `<${style}>/* documented {{${slot}}} */ h1{color:#123abc}</${style}>`;
++        const raw = css + body;
++        assert.equal(template.validateTemplateHtml(raw), '');
++        const html = template.renderCustomTemplateHtml(raw, 'CSS title {{analysis}}', fullOutput());
++        assert.ok(html.includes(css), 'style content must be preserved');
++        const visible = html.replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, '');
++        includesAll(visible, ['CSS title {{analysis}}', 'SUMMARY_UNIQUE', 'POINT_UNIQUE_11',
++          'REFERENCE_UNIQUE', 'DIAGRAM_TITLE_UNIQUE']);
++        for (const marker of ['SUMMARY_UNIQUE', 'EVENT_UNIQUE_11', 'POINT_UNIQUE_11',
++          'DISPUTE_UNIQUE', 'REFERENCE_UNIQUE', 'DIAGRAM_TITLE_UNIQUE']) {
++          assert.equal(occurrences(visible, marker), 1, `CSS example must not consume or duplicate: ${marker}`);
++        }
++      }
++    }
+   }
+ });
+ 
+--- baseline/harmony/deepread/src/test/section_writer_tools.test.ts
++++ harmony/deepread/src/test/section_writer_tools.test.ts
+@@ -5,6 +5,12 @@
+ import type { ReadingLink, DeepReadOutput } from '../main/ets/domain/models.ts';
+ import { makeEmptyDeepReadOutput } from '../main/ets/domain/models.ts';
+ import { statusOf } from '../main/ets/domain/helpers.ts';
++import { writeStructuredStage } from '../main/ets/agent/structured_stage.ts';
++import { deepReadToMarkdown } from '../main/ets/domain/export.ts';
++import { createRequire } from 'node:module';
++
++const readerFixture = createRequire(import.meta.url)('./deepread_ui_fixture.cjs');
++const readerTemplate = readerFixture.loadPureModule(readerFixture.entryRoot + '/platform_impl/DeepReadTemplate.ets');
+ 
+ // 解析 tool output JSON
+ const parseOutput = (parts: { text: string }[]): Record<string, unknown> =>
+@@ -80,6 +86,47 @@
+   // core_points 救活了 narrative
+   assert.equal(parsed.status, 'ok');
+   assert.ok((parsed.accepted as Record<string, number>).timeline === 0);
++});
++
++test('structured narrative images require a non-rejected candidate while preserving the article', async () => {
++  const unknownUrl = 'https://images.example/unknown.jpg';
++  const rejectedUrl = 'https://images.example/rejected.jpg';
++  const acceptedUrl = 'https://images.example/inline.jpg';
++  const inlineCandidate: ScoredImageCandidate = { ...heroCandidate(acceptedUrl), confidence: 'inline' };
++  const w = createSectionWriterTools({ topicId: 'narrative-images', topicTitle,
++    imageCandidates: [rejectCandidate(rejectedUrl), inlineCandidate] });
++  const urls = [unknownUrl, rejectedUrl, acceptedUrl];
++  assert.equal(await writeStructuredStage(w, 'NARRATIVE', JSON.stringify({
++    timeline: urls.map((url, i) => ({ date: '2026-10-07',
++      event: `事件 ${i} 保留具体事实与完整叙事，内容不会因为配图未获认可而消失。`,
++      image_url: url, image_caption: `Timeline image caption ${i}` })),
++    core_points: urls.map((url, i) => ({ point: `核心判断 ${i} 与对应的事实依据`,
++      supporting: '这段支撑材料解释判断的来由并保持足够完整的正文信息。',
++      image_url: url, image_caption: `Core image caption ${i}` })),
++  })), true);
++  const o = w.current();
++  assert.ok(o.timeline !== null);
++  assert.ok(o.corePoints !== null);
++  assert.equal(o.timeline.length, 3);
++  assert.equal(o.corePoints.length, 3);
++  for (const items of [o.timeline, o.corePoints]) {
++    assert.deepEqual(items.map(item => item.imageUrl), [null, null, acceptedUrl]);
++    assert.equal(items[0].imageCaption, null);
++    assert.equal(items[1].imageCaption, null);
++    assert.ok(items[2].imageCaption?.endsWith(' 2'));
++  }
++  const rendered = [readerTemplate.renderEditorialSlantHtml(topicTitle, o),
++    readerTemplate.renderCustomTemplateHtml('<h1>{{title}}</h1>{{content}}', topicTitle, o),
++    deepReadToMarkdown({ topicId: 'narrative-images', title: topicTitle, sourceUrl: null, output: o,
++      phase: 'COMPLETE', attemptCount: 0, lastError: null, createdAt: 0, updatedAt: 0, expiresAt: 0 })];
++  for (const text of rendered) {
++    for (const url of [unknownUrl, rejectedUrl]) assert.equal(text.includes(url), false);
++    assert.ok(text.includes(acceptedUrl));
++    assert.ok(text.includes(o.timeline[0].event));
++    assert.ok(text.includes(o.corePoints[0].point));
++    assert.ok(text.includes('Timeline image caption 2'));
++    assert.ok(text.includes('Core image caption 2'));
++  }
+ });
+ 
+ test('analysis: all empty → missing_required_content', async () => {
+--- baseline/harmony/deepread/tsconfig.json
++++ harmony/deepread/tsconfig.json
+@@ -14,7 +14,11 @@
+     "allowImportingTsExtensions": true,
+     "noEmit": true,
+     "lib": ["ES2022"],
+-    "types": ["node"]
++    "types": ["node"],
++    "baseUrl": ".",
++    "paths": {
++      "@amber/deepread-domain": ["src/main/ets/index.ts"]
++    }
+   },
+   "include": ["src/**/*.ts"],
+   "exclude": ["node_modules"]
+--- baseline/harmony/entry/src/main/ets/pages/BoardPage.ets
++++ harmony/entry/src/main/ets/pages/BoardPage.ets
+@@ -234,7 +234,6 @@
+   private wifiOnly: boolean = false;
+   private translateTitles: boolean = false;
+   private cacheLoaded: boolean = false;
+-  private firstShowDone: boolean = false;
+   private refreshToken: number = 0;
+   private requestController: AbortControllerLike | null = null;
+   private runObservationToken: number = 0;
+@@ -256,8 +255,7 @@
+       this.loadIssue();
+       if (!this.embeddedRoot) this.arrive();
+     }
+-    if (this.firstShowDone) this.loadHotlist(false);
+-    else this.firstShowDone = true;
++    this.loadHotlist(false);
+   }
+ 
+   onPageHide(): void {
+@@ -508,10 +506,10 @@
+         entities: ['entity.system.browsable'],
+         uri: url,
+       }).catch((): void => {
+-        promptAction.showToast({ message: '无法打开浏览器，已复制链接', duration: 1400 });
++        promptAction.showToast({ message: '无法打开浏览器，请稍后重试', duration: 1400 });
+       });
+     } catch (_e) {
+-      promptAction.showToast({ message: '无法打开浏览器，已复制链接', duration: 1400 });
++      promptAction.showToast({ message: '无法打开浏览器，请稍后重试', duration: 1400 });
+     }
+   }
+ 
+--- baseline/harmony/entry/src/main/ets/pages/DeepReadDiscoverySettingsPage.ets
++++ harmony/entry/src/main/ets/pages/DeepReadDiscoverySettingsPage.ets
+@@ -1,3 +1,4 @@
++import { promptAction, router } from '@kit.ArkUI';
+ import { DeepReadSubpageDock, DeepReadDockLayout } from '../components/deepread/DeepReadSubpageDock.ets';
+ import { getAppContainer } from '../di/AppContainer.ets';
+ import { DEEPREAD_DISCOVERY_CATEGORIES, DEEPREAD_DISCOVERY_SOURCES } from '@amber/deepread-domain';
+@@ -51,6 +52,22 @@
+   aboutToDisappear(): void {
+     this.alive = false;
+     this.loadToken++;
++  }
++
++  private canLeave(): boolean {
++    if (this.saving || this.pendingWrites > 0) {
++      promptAction.showToast({ message: '正在保存设置，请稍候再返回', duration: 1400 });
++      return false;
++    }
++    return true;
++  }
++
++  private goBack(): void {
++    if (this.canLeave()) router.back();
++  }
++
++  onBackPress(): boolean {
++    return !this.canLeave();
+   }
+ 
+   private async loadSettings(token: number): Promise<void> {
+@@ -208,7 +225,7 @@
+     Column() {
+       ForEach([this.themeEpoch], (_epoch: number): void => {
+         Column() {
+-          CenteredTitleBar({ title: '发现设置' })
++          CenteredTitleBar({ title: '发现设置', onBack: (): void => { this.goBack(); } })
+           Scroll() {
+             Column() {
+               if (this.loading) {
+@@ -290,7 +307,7 @@
+     Stack({ alignContent: Alignment.Bottom }) {
+       DeepReadPaperBackground()
+       Column() {
+-        DeepReadSettingsHeader({ title: '热点来源' })
++        DeepReadSettingsHeader({ title: '热点来源', onBack: (): void => { this.goBack(); } })
+         Scroll() {
+           Column() {
+             if (this.loading) { Text('正在读取设置…').fontSize(15).fontColor(D.muted).padding({ top: 24 }) }
+@@ -314,7 +331,7 @@
+           }.width('100%').padding({ left: D.gutter, right: D.gutter, bottom: DeepReadDockLayout.bottomInset(this.navBarHeight) })
+         }.width('100%').layoutWeight(1).scrollBar(BarState.Off).align(Alignment.TopStart)
+       }.width('100%').height('100%')
+-      DeepReadSubpageDock().align(Alignment.Bottom).hitTestBehavior(HitTestMode.Transparent)
++      DeepReadSubpageDock({ onBeforeLeave: (): boolean => { return this.canLeave(); } }).align(Alignment.Bottom).hitTestBehavior(HitTestMode.Transparent)
+     }.width('100%').height('100%').backgroundColor(D.paper)
+       .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+   }
+--- baseline/harmony/entry/src/main/ets/pages/DeepReadSourcesPage.ets
++++ harmony/entry/src/main/ets/pages/DeepReadSourcesPage.ets
+@@ -77,6 +77,12 @@
+ 
+   private kindLabel(source: DeepReadInputSource): string {
+     return source.kind === 'file' ? '文件' : source.kind === 'text' ? '文本' : source.kind === 'search' ? '搜索' : '网页';
++  }
++
++  private sourceBody(source: DeepReadInputSource): string {
++    // Discovery text belongs to its individual report; inputText may combine several reports.
++    return source.kind === 'text' && source.researchSource == null && this.inputText.length > 0
++      ? this.inputText.substring(0, 40000) : source.content;
+   }
+ 
+   private sourceUrl(source: DeepReadInputSource): string {
+@@ -157,7 +163,7 @@
+                   Text(this.expanded === source.id ? '收起正文' : '查看正文（最多 40,000 字符预览）').fontSize(META).fontColor(ACCENT).height(44).width('100%')
+                     .onClick((): void => { this.expanded = this.expanded === source.id ? '' : source.id; })
+                   if (this.expanded === source.id) {
+-                    Text(source.kind === 'text' && this.inputText.length > 0 ? this.inputText.substring(0, 40000) : source.content)
++                    Text(this.sourceBody(source))
+                       .fontSize(BODY).fontColor(INK).width('100%').copyOption(CopyOptions.InApp)
+                     if (source.note !== null) { Text(source.note).fontSize(META).fontColor(INK3).width('100%') }
+                   }
+@@ -230,8 +236,7 @@
+       }.width('100%').constraintSize({ minHeight: 50 }).padding({ left: 14, right: 14 })
+         .onClick((): void => { this.toggleSource(source.id); })
+       if (this.expanded === source.id) {
+-        Text(source.content.length > 0 ?
+-          (source.kind === 'text' && this.inputText.length > 0 ? this.inputText.substring(0, 40000) : source.content) : '尚未取得正文。')
++        Text(this.sourceBody(source).length > 0 ? this.sourceBody(source) : '尚未取得正文。')
+           .fontSize(13).fontColor(D.ink).lineHeight(21).width('100%').copyOption(CopyOptions.InApp)
+           .padding({ left: 14, right: 14, bottom: 14 })
+           .transition(TransitionEffect.OPACITY.animation({ duration: this.reduceMotion || this.appBackgrounded ? 0 : 160 }))
+--- baseline/harmony/entry/src/main/ets/platform_impl/BackgroundGenerationKeepAlive.ets
++++ harmony/entry/src/main/ets/platform_impl/BackgroundGenerationKeepAlive.ets
+@@ -217,6 +217,8 @@
+     dirty = false;
+     lastError = '';
+     hilog.info(DOMAIN, TAG, 'generation keep-alive stopped');
++    // A replacement run can register while native stop is pending.
++    evaluateTask();
+   } catch (error) {
+     // 停止失败:保留仍持有的事实与真实错误,不谎称已停
+     lastError = `stop failed: ${String(error)}`;
+--- baseline/harmony/entry/src/main/ets/platform_impl/DeepReadSourceImporter.ets
++++ harmony/entry/src/main/ets/platform_impl/DeepReadSourceImporter.ets
+@@ -6,7 +6,8 @@
+ import { makeInputSource, extractDocxSourceText, decodeInputSourceText, MAX_INPUT_SOURCE_CHARS } from '@amber/deepread-domain';
+ import type { DeepReadInputSource } from '@amber/deepread-domain';
+ import { inflateRawEntry } from './EntryDocumentParser.ets';
+-import { parsePdfPreviewBytes } from './PdfDocumentParser.ets';
++import { parsePdfPreviewWithTruncation } from './PdfDocumentParser.ets';
++import type { PdfTextExtraction } from './PdfDocumentParser.ets';
+ 
+ const TEXT_EXTENSIONS: string[] = ['txt', 'md', 'markdown', 'json', 'csv', 'tsv', 'log', 'xml', 'html', 'htm', 'yaml', 'yml'];
+ export const MAX_DEEPREAD_SOURCE_BYTES: number = 20 * 1024 * 1024;
+@@ -50,8 +51,11 @@
+     }
+     const bytes: Uint8Array = readSelectedBytes(uri);
+     let text: string = '';
++    let extractionTruncated: boolean = false;
+     if (extension === 'pdf') {
+-      text = await parsePdfPreviewBytes(bytes, MAX_INPUT_SOURCE_CHARS + 1);
++      const extraction: PdfTextExtraction = await parsePdfPreviewWithTruncation(bytes, MAX_INPUT_SOURCE_CHARS + 1);
++      text = extraction.text;
++      extractionTruncated = extraction.truncated;
+       if (text.startsWith('[ERROR,')) throw new Error(text);
+     } else if (extension === 'docx') {
+       text = await readDocx(bytes);
+@@ -61,7 +65,12 @@
+         util.TextDecoder.create(encoding, { fatal: true }).decodeToString(input));
+     }
+     if (text.trim().length === 0) throw new Error('文件中没有可提取文本。扫描 PDF 需先进行 OCR。');
+-    return makeInputSource('file', name, text);
++    const source: DeepReadInputSource = makeInputSource('file', name, text);
++    if (extractionTruncated && !source.truncated) {
++      source.truncated = true;
++      source.note = '内容已截断：PDF 正文超过提取预算，后续正文未保存。';
++    }
++    return source;
+   } catch (error) {
+     return makeInputSource('file', name, '', null, error instanceof Error ? error.message : String(error));
+   }
+--- baseline/harmony/entry/src/main/ets/platform_impl/DeepReadTemplate.ets
++++ harmony/entry/src/main/ets/platform_impl/DeepReadTemplate.ets
+@@ -474,23 +474,25 @@
+   // Slots documented in comments do not consume visible article chapters.
+   let out: string = sanitizeTemplateHtml(templateHtml).replace(/<!--[\s\S]*?(?:-->|$)/g, '');
+   const article: ArticleChapter[] = chapters(o);
+-  const hasContent: boolean = /\{\{\s*content\s*\}\}/.test(out);
+   let missing: string = '';
+   let all: string = '';
+   for (const chapter of article) all += chapter.html;
+   // One replacement pass prevents generated article text from becoming another template slot.
+   const slots: string[] = [];
+-  out = out.replace(/\{\{\s*(title|kicker|topic|bottom_line|summary|timeline|core_points|analysis|outlook|uncertainties|reading|references|sources|hero|images|diagram|content)\s*\}\}/g,
+-    (_match: string, key: string): string => {
+-      const chapterKey: string = key === 'sources' ? 'references' : key;
+-      slots.push(chapterKey);
+-      if (key === 'title') return esc(title);
+-      if (key === 'kicker') return 'DEEP READ · 深度阅读';
+-      if (key === 'content') return all;
+-      const chapter = article.find((c: ArticleChapter): boolean => c.key === chapterKey);
+-      return chapter !== undefined ? chapter.html : '';
+-    });
+-  if (!hasContent) for (const chapter of article) if (!slots.includes(chapter.key)) missing += chapter.html;
++  // Captured style blocks stay intact; their documented slots are not visible article slots.
++  out = out.split(/(<\s*style\b[^>]*>[\s\S]*?(?:<\s*\/\s*style\s*>|$))/gi)
++    .map((part: string, index: number): string => index % 2 === 1 ? part :
++      part.replace(/\{\{\s*(title|kicker|topic|bottom_line|summary|timeline|core_points|analysis|outlook|uncertainties|reading|references|sources|hero|images|diagram|content)\s*\}\}/g,
++        (_match: string, key: string): string => {
++          const chapterKey: string = key === 'sources' ? 'references' : key;
++          slots.push(chapterKey);
++          if (key === 'title') return esc(title);
++          if (key === 'kicker') return 'DEEP READ · 深度阅读';
++          if (key === 'content') return all;
++          const chapter = article.find((c: ArticleChapter): boolean => c.key === chapterKey);
++          return chapter !== undefined ? chapter.html : '';
++        })).join('');
++  if (!slots.includes('content')) for (const chapter of article) if (!slots.includes(chapter.key)) missing += chapter.html;
+   if (!/<\s*html\b/i.test(out)) return `<!DOCTYPE html><html><head>${head(opts)}</head><body>${out}${missing}</body></html>`;
+   if (/<\s*\/\s*head\s*>/i.test(out)) out = out.replace(/<\s*\/\s*head\s*>/i, head(opts) + '</head>');
+   else out = out.replace(/<\s*html\b[^>]*>/i, (tag: string): string => tag + `<head>${head(opts)}</head>`);
+--- baseline/harmony/entry/src/main/ets/platform_impl/PdfDocumentParser.ets
++++ harmony/entry/src/main/ets/platform_impl/PdfDocumentParser.ets
+@@ -6,25 +6,32 @@
+ import { MAX_INLINE_TEXT_CHARS, newId } from '@amber/chat-domain';
+ import type { DocumentFileHandle } from '@amber/chat-domain';
+ 
+-export const parsePdfPath = async (
+-  path: string, maxCharsPlusOne: number = MAX_INLINE_TEXT_CHARS + 1,
+-): Promise<string> => {
++export interface PdfTextExtraction {
++  text: string;
++  truncated: boolean;
++}
++
++const extractPdfPath = async (
++  path: string, maxCharsPlusOne: number, detectTruncation: boolean,
++): Promise<PdfTextExtraction> => {
+   if (!canIUse('SystemCapability.OfficeService.PDFService.Core')) {
+-    return '[ERROR, 当前系统不支持 PDF 文字提取。]';
++    return { text: '[ERROR, 当前系统不支持 PDF 文字提取。]', truncated: false };
+   }
+   const document: pdfService.PdfDocument = new pdfService.PdfDocument();
+   try {
+     const result: pdfService.ParseResult = document.loadDocument(path);
+     if (result === pdfService.ParseResult.PARSE_ERROR_PASSWORD) {
+-      return '[ERROR, PDF 需要密码，请先解密后重新添加。]';
++      return { text: '[ERROR, PDF 需要密码，请先解密后重新添加。]', truncated: false };
+     }
+     if (result !== pdfService.ParseResult.PARSE_SUCCESS) {
+       throw new Error('PDF 文件无法解析');
+     }
+     const fragments: string[] = [];
+     let length: number = 0;
++    let truncated: boolean = false;
+     const pageCount: number = document.getPageCount();
+-    for (let index: number = 0; index < pageCount && length < maxCharsPlusOne; index++) {
++    for (let index: number = 0; index < pageCount && !truncated
++      && (length < maxCharsPlusOne || detectTruncation); index++) {
+       const page: pdfService.PdfPage = document.getPage(index);
+       try {
+         const objects: pdfService.GraphicsObject[] = page.getGraphicsObjects();
+@@ -34,38 +41,52 @@
+           const text: string = (object as pdfService.TextObject).text;
+           if (text.trim().length === 0) continue;
+           const remaining: number = maxCharsPlusOne - length;
+-          if (remaining <= 0) break;
++          if (remaining <= 0) {
++            truncated = detectTruncation;
++            break;
++          }
+           const separator: string = pageHasText ? '\n' : (length > 0 ? '\n\n' : '');
+-          const fragment: string = (separator + text).substring(0, remaining);
++          const fullFragment: string = separator + text;
++          const fragment: string = fullFragment.substring(0, remaining);
+           fragments.push(fragment);
+           length += fragment.length;
+           pageHasText = true;
++          // A full raw budget alone is not evidence of lost body text. Probe
++          // only until the first nonblank omitted suffix/object/page is found.
++          if (detectTruncation && fullFragment.substring(remaining).trim().length > 0) {
++            truncated = true;
++            break;
++          }
+         }
+       } finally {
+         page.release();
+       }
+       // Release each native page before yielding; long documents must not keep
+       // the UI thread occupied across all pages in one turn.
+-      if (index + 1 < pageCount && length < maxCharsPlusOne) {
++      if (index + 1 < pageCount && !truncated && (length < maxCharsPlusOne || detectTruncation)) {
+         await new Promise<void>((resolve: () => void): void => { setTimeout(resolve, 0); });
+       }
+     }
+     const text: string = fragments.join('');
+-    return text.length > 0 ? text
+-      : '[ERROR, PDF 没有可提取的文字；扫描件或图片 PDF 需要先进行 OCR。]';
++    return { text: text.length > 0 ? text
++      : '[ERROR, PDF 没有可提取的文字；扫描件或图片 PDF 需要先进行 OCR。]', truncated };
+   } finally {
+     document.releaseDocument();
+   }
+ };
++
++export const parsePdfPath = async (
++  path: string, maxCharsPlusOne: number = MAX_INLINE_TEXT_CHARS + 1,
++): Promise<string> => (await extractPdfPath(path, maxCharsPlusOne, false)).text;
+ 
+ export const parsePdfEntry = (handle: DocumentFileHandle): Promise<string> =>
+   parsePdfPath(handle.absolutePath);
+ 
+ // An unsent data: attachment has no native path. Only its temporary preview
+ // copy is created, then removed; it is never registered as a persisted upload.
+-export const parsePdfPreviewBytes = async (
+-  bytes: Uint8Array, maxCharsPlusOne: number,
+-): Promise<string> => {
++const extractPdfPreviewBytes = async (
++  bytes: Uint8Array, maxCharsPlusOne: number, detectTruncation: boolean,
++): Promise<PdfTextExtraction> => {
+   const context: Context = AppStorage.get<Context>('abilityContext') as Context;
+   const path: string = `${context.cacheDir}/amber_pdf_preview_${newId()}.pdf`;
+   try {
+@@ -77,8 +98,16 @@
+     } finally {
+       fileIo.closeSync(file);
+     }
+-    return await parsePdfPath(path, maxCharsPlusOne);
++    return await extractPdfPath(path, maxCharsPlusOne, detectTruncation);
+   } finally {
+     if (fileIo.accessSync(path)) fileIo.unlinkSync(path);
+   }
+ };
++
++export const parsePdfPreviewBytes = async (
++  bytes: Uint8Array, maxCharsPlusOne: number,
++): Promise<string> => (await extractPdfPreviewBytes(bytes, maxCharsPlusOne, false)).text;
++
++export const parsePdfPreviewWithTruncation = (
++  bytes: Uint8Array, maxCharsPlusOne: number,
++): Promise<PdfTextExtraction> => extractPdfPreviewBytes(bytes, maxCharsPlusOne, true);
+--- baseline/harmony/entry/src/test/deepread_phase2_ui_regression.test.cjs
++++ harmony/entry/src/test/deepread_phase2_ui_regression.test.cjs
+@@ -0,0 +1,104 @@
++const { test } = require('node:test');
++const assert = require('node:assert/strict');
++const fs = require('node:fs');
++const path = require('node:path');
++const ts = require('../../../chat/node_modules/typescript');
++const { method, entryRoot, loadPureModule, domainRoot } = require('../../../deepread/src/test/deepread_ui_fixture.cjs');
++const { DEEPREAD_DISCOVERY_SOURCES } = loadPureModule(path.join(domainRoot, 'discovery.ts'));
++const source = name => fs.readFileSync(path.join(entryRoot, 'pages', name), 'utf8');
++const boardSource = () => source('BoardPage.ets').slice(source('BoardPage.ets').indexOf('export struct BoardPageContent'));
++function controller(text, names, env) {
++  const code = ts.transpileModule('class Page {\n' + names.map(name => method(text, name)).join('\n') + '\n} return new Page();',
++    { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
++  return new Function(...Object.keys(env), code)(...Object.values(env));
++}
++const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
++const tick = () => new Promise(resolve => setImmediate(resolve));
++
++function board() {
++  const loads = [], gate = deferred();
++  const page = controller(boardSource(), ['aboutToAppear', 'onPageShow', 'onPageHide', 'loadHotlist', 'stopRefresh'], {
++    getProductKind: () => 'deepread', createEntryAbortController: () => ({ signal: { aborted: false }, abort() { this.signal.aborted = true; } }),
++    getAppContainer: () => ({ storage: { get: async (key, fallback) => { loads.push(key); await gate.promise; return fallback; } } }),
++    HOTLIST_PRESETS: [], HOTLIST_CACHE_KEY: 'cache', parseHotListFocusKeywords: value => value ? [value] : [],
++    shouldRefreshHotList: () => false,
++  });
++  Object.assign(page, { embeddedRoot: true, rootVisible: false, pageVisible: false, loading: false,
++    refreshing: false, refreshToken: 0, requestController: null, cacheLoaded: false, rawSections: [],
++    runObservationToken: 0, unsubscribeRuns: null, onBackHandler() {}, dockScroll: { reset() {} },
++    observeRuns() {}, loadIssue() {}, saveDiscoveryScroll() {}, settleArrival() {}, applyProjection() {} });
++  return { page, loads, gate };
++}
++
++test('hidden discovery mount loads on its first visible transition and reloads after cancellation', async () => {
++  const f = board(); f.page.aboutToAppear(); assert.equal(f.loads.length, 0);
++  f.page.rootVisible = true; f.page.onPageShow();
++  assert.equal(f.loads.length, 1, 'first showing a hidden retained discovery root must load preferences and hotlist');
++  const first = f.page.requestController;
++  f.page.onPageHide(); assert.equal(first.signal.aborted, true); assert.equal(f.page.loading, false);
++  f.page.onPageShow(); assert.equal(f.loads.length, 2);
++  f.gate.resolve(); await tick(); assert.equal(f.page.loading, false);
++});
++
++test('initially visible discovery mount uses its existing loading gate to prevent duplicate work', async () => {
++  const f = board(); f.page.rootVisible = true; f.page.aboutToAppear();
++  assert.equal(f.loads.length, 1); f.gate.resolve(); await tick();
++  assert.equal(f.loads.length, 6); assert.equal(f.page.loading, false);
++});
++
++test('browser launch failures report the failed action without claiming a clipboard write', async () => {
++  for (const synchronous of [false, true]) {
++    const calls = [], toasts = [];
++    const page = controller(boardSource(), ['openOriginal'], {
++      getContext: () => ({ startAbility: want => { calls.push(want); if (synchronous) throw Error('browser unavailable'); return Promise.reject(Error('browser unavailable')); } }),
++      promptAction: { showToast: toast => toasts.push(toast.message) },
++    });
++    page.openOriginal('https://news.test/item'); await tick();
++    assert.equal(calls.length, 1); assert.deepEqual(toasts, ['无法打开浏览器，请稍后重试']);
++  }
++  const toasts = [];
++  const page = controller(boardSource(), ['openOriginal'], {
++    getContext: () => ({ startAbility: async () => {} }), promptAction: { showToast: toast => toasts.push(toast) },
++  });
++  page.openOriginal('https://news.test/item'); await tick(); assert.equal(toasts.length, 0);
++});
++
++function settings(storage) {
++  const routes = [], toasts = [];
++  const page = controller(source('DeepReadDiscoverySettingsPage.ets'),
++    ['persistPreference', 'loadSettings', 'canLeave', 'goBack', 'onBackPress'], {
++      getProductKind: () => 'deepread', getAppContainer: () => ({ storage }), DEEPREAD_DISCOVERY_SOURCES,
++      DeepReadHaptics: { selection() {} }, router: { back: () => routes.push('back') },
++      promptAction: { showToast: value => toasts.push(value.message) },
++    });
++  Object.assign(page, { alive: true, settingsLoaded: true, loading: false, saving: false, loadToken: 1,
++    error: '', notice: '', writeFailure: '', pendingWrites: 0, writeQueue: Promise.resolve() });
++  return { page, routes, toasts };
++}
++
++test('all discovery exit paths wait for the queued latest preference before returning', async () => {
++  const values = new Map(), firstFlush = deferred(); let writes = 0;
++  const f = settings({ set: async (key, value) => { values.set(key, value); if (++writes === 1) await firstFlush.promise; } });
++  f.page.persistPreference('deepread_focus_keywords', 'A'); f.page.persistPreference('deepread_focus_keywords', 'AI');
++  await tick(); assert.equal(values.get('deepread_focus_keywords'), 'A');
++  assert.equal(f.page.onBackPress(), true); f.page.goBack(); assert.equal(f.routes.length, 0);
++  assert.equal(f.page.canLeave(), false, 'Dock must be denied while latest settings are queued');
++  assert.ok(f.toasts.every(message => /正在保存/.test(message)));
++  firstFlush.resolve(); await f.page.writeQueue;
++  assert.equal(values.get('deepread_focus_keywords'), 'AI'); assert.equal(f.page.pendingWrites, 0);
++  assert.equal(f.page.onBackPress(), false); assert.equal(f.page.canLeave(), true);
++  f.page.goBack(); assert.deepEqual(f.routes, ['back']);
++  const text = source('DeepReadDiscoverySettingsPage.ets');
++  assert.match(text, /DeepReadSettingsHeader\(\{[^}]*onBack:[^}]*this\.goBack\(\)/);
++  assert.match(text, /DeepReadSubpageDock\(\{[^}]*onBeforeLeave:[^}]*this\.canLeave\(\)/);
++});
++
++test('failed discovery writes finish the existing reload and leave the error visible before exit is allowed', async () => {
++  const reread = deferred();
++  const f = settings({ set: async () => { throw Error('disk'); }, get: async (_key, fallback) => { await reread.promise; return fallback; } });
++  f.page.persistPreference('deepread_focus_keywords', 'AI'); await tick();
++  assert.equal(f.page.pendingWrites, 0); assert.equal(f.page.canLeave(), false, 'saving also covers failure reload');
++  reread.resolve(); await f.page.writeQueue;
++  assert.match(f.page.error, /保存发现设置失败.*disk/); assert.equal(f.page.focusKeywords, '');
++  assert.equal(f.page.canLeave(), true);
++});

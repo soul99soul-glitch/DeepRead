@@ -4,3 +4,20 @@
 DerivedData/
 build/
 xcuserdata/
+
+# Harmony local dependencies, generated artifacts, and signing identity
+node_modules/
+oh_modules/
+.hvigor/
+.cxx/
+target/
+archives/
+/harmony/build-profile.json5
+local.properties
+*.hap
+*.app
+*.p12
+*.p7b
+*.cer
+*.keystore
+*.jks

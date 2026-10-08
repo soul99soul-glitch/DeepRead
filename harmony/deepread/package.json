@@ -1,0 +1,16 @@
+{
+  "name": "@amber/deepread-domain",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Deep Read domain layer (pure ArkTS, zero SDK deps)",
+  "type": "module",
+  "scripts": {
+    "test": "tsx --tsconfig ../chat/tsconfig.json --test --test-concurrency=4 \"src/test/**/*.test.ts\" \"src/test/**/*.test.cjs\"",
+    "test:watch": "tsx watch --tsconfig ../chat/tsconfig.json --test --test-concurrency=4 \"src/test/**/*.test.ts\" \"src/test/**/*.test.cjs\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0"
+  }
+}

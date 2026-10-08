@@ -1,0 +1,225 @@
+▶ parseInline basic
+  ✔ empty string → empty array (0.582042ms)
+✔ parseInline basic (0.994292ms)
+▶ parseInline code
+  ✔ code takes priority over bold/italic (0.252667ms)
+✔ parseInline code (0.310875ms)
+▶ parseInline bold
+  ✔ bold cannot contain asterisks (0.160792ms)
+✔ parseInline bold (0.208208ms)
+▶ parseInline italic
+  ✔ italic text (0.061125ms)
+✔ parseInline italic (0.093584ms)
+▶ parseInline link
+  ✖ preserves balanced, escaped and angle-wrapped destinations for native reading (2.244208ms)
+  ✖ uses the same destination rules for images and preserves escaped labels (0.254459ms)
+  ✖ keeps code precedence and rejects unsafe wrapped destinations (0.148209ms)
+  ✔ escaped labels keep brackets, backticks and dollar signs literal (0.075667ms)
+  ✔ escaped-label prepass preserves code, math and normal image priority (0.091375ms)
+  ✔ link (0.058875ms)
+  ✔ unsafe scheme → plain text (0.043708ms)
+✖ parseInline link (3.0785ms)
+▶ parseInline image
+  ✔ image takes priority over link (0.042333ms)
+✔ parseInline image (0.068542ms)
+▶ parseInline mixed
+  ✔ bold + code + link in one line (0.052084ms)
+✔ parseInline mixed (0.072375ms)
+▶ parseMarkdown headings
+  ✔ h1-h6 (0.315334ms)
+  ✔ not a heading without space after # (0.096708ms)
+✔ parseMarkdown headings (0.439417ms)
+▶ parseMarkdown paragraphs
+  ✔ two paragraphs separated by blank line (0.041834ms)
+  ✔ multi-line paragraph (0.054167ms)
+✔ parseMarkdown paragraphs (0.122459ms)
+▶ parseMarkdown code blocks
+  ✔ code block without lang (0.05125ms)
+  ✔ code block with lang (0.030083ms)
+  ✔ code block followed by paragraph (0.027958ms)
+✔ parseMarkdown code blocks (0.15225ms)
+▶ parseMarkdown lists
+  ✔ ordered list preserves its source start number (0.094167ms)
+  ✔ ordered list preserves zero as a valid start number (0.033125ms)
+  ✔ list items have inline tokens (0.043042ms)
+  ✔ flat list omits depths field (0.028708ms)
+  ✔ uniformly indented flat list also omits depths (0.03ms)
+  ✔ nested unordered list emits per-item depths (2 spaces per level) (0.035375ms)
+  ✔ nested ordered list emits per-item depths (0.039791ms)
+  ✔ depths clamp at 3 and never go negative on dedent (0.034584ms)
+✔ parseMarkdown lists (0.403708ms)
+▶ orderedListLabel numbering
+  ✔ flat list continues from start (0.047791ms)
+  ✔ nested depth restarts at 1, top level continues after it (0.275292ms)
+  ✔ deeper depth resets when returning to a shallower one (0.040792ms)
+✔ orderedListLabel numbering (0.417584ms)
+▶ parseMarkdown blockquote
+  ✔ multi-line blockquote (0.072ms)
+✔ parseMarkdown blockquote (0.099041ms)
+▶ parseMarkdown hr
+  ✔ --- is hr (0.034917ms)
+  ✔ *** is hr (0.020458ms)
+✔ parseMarkdown hr (0.089917ms)
+▶ parseMarkdown table
+  ✔ simple table has stable columns and default alignment (0.198166ms)
+  ✔ table preserves alignment markers and pads narrow rows (0.090417ms)
+  ✔ escaped pipe stays inside one table cell (0.037875ms)
+✔ parseMarkdown table (0.37025ms)
+▶ parseMarkdown mixed document
+  ✔ heading + paragraph + code + list (0.055ms)
+✔ parseMarkdown mixed document (0.074625ms)
+▶ parseMarkdown safety
+  ✔ does not collide with a user-written placeholder (0.102667ms)
+  ✔ retains malformed input as text instead of throwing (4.650916ms)
+✔ parseMarkdown safety (4.797875ms)
+▶ parseMarkdown empty
+  ✔ empty string → empty array (0.052667ms)
+  ✔ whitespace only → empty array (0.0245ms)
+✔ parseMarkdown empty (0.132833ms)
+✔ partial heading markers always consume their source line (0.207667ms)
+✖ DeepRead Web and TXT retain balanced parentheses in report destinations (1.543083ms)
+✖ DeepRead Web and TXT unwrap angle destinations for links and images (0.293167ms)
+✔ DeepRead retains code spans and blocks unsafe link/image destinations (0.128583ms)
+ℹ tests 46
+ℹ suites 18
+ℹ pass 41
+ℹ fail 5
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 299.219792
+
+✖ failing tests:
+
+test at ../chat/src/test/markdown_blocks.test.ts:1:1669
+✖ preserves balanced, escaped and angle-wrapped destinations for native reading (2.244208ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    [
+      {
+        text: '报告',
+        type: 'link',
+  +     url: 'https://example.com/report_(2026'
+  -     url: 'https://example.com/report_(2026)'
+      },
+  +   {
+  +     text: ')',
+  +     type: 'text'
+  +   }
+    ]
+  
+      at TestContext.<anonymous> (/Users/arquiel/Downloads/AI/DeepRead/harmony/chat/src/test/markdown_blocks.test.ts:77:14)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1402:25)
+      at Test.start (node:internal/test_runner/test:1262:17)
+      at node:internal/test_runner/test:1903:71
+      at node:internal/per_context/primordials:504:82
+      at new Promise (<anonymous>)
+      at new SafePromise (node:internal/per_context/primordials:478:3)
+      at node:internal/per_context/primordials:504:9
+      at Array.map (<anonymous>) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: [ { type: 'link', text: '报告', url: 'https://example.com/report_(2026' }, { type: 'text', text: ')' } ],
+    expected: [ { type: 'link', text: '报告', url: 'https://example.com/report_(2026)' } ],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+
+test at ../chat/src/test/markdown_blocks.test.ts:1:2225
+✖ uses the same destination rules for images and preserves escaped labels (0.254459ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    [
+      {
+  +     text: '![图\\]](<https://example.com/photo_(2026).png>)',
+  +     type: 'text'
+  -     alt: '图]',
+  -     type: 'image',
+  -     url: 'https://example.com/photo_(2026).png'
+      }
+    ]
+  
+      at TestContext.<anonymous> (/Users/arquiel/Downloads/AI/DeepRead/harmony/chat/src/test/markdown_blocks.test.ts:82:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1402:25)
+      at Suite.processPendingSubtests (node:internal/test_runner/test:974:18)
+      at Test.postRun (node:internal/test_runner/test:1542:19)
+      at Test.run (node:internal/test_runner/test:1467:12)
+      at async Promise.all (index 0)
+      at async Suite.run (node:internal/test_runner/test:1905:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: [ { type: 'text', text: '![图\\]](<https://example.com/photo_(2026).png>)' } ],
+    expected: [ { type: 'image', alt: '图]', url: 'https://example.com/photo_(2026).png' } ],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+
+test at ../chat/src/test/markdown_blocks.test.ts:1:2666
+✖ keeps code precedence and rejects unsafe wrapped destinations (0.148209ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  true !== false
+  
+      at TestContext.<anonymous> (/Users/arquiel/Downloads/AI/DeepRead/harmony/chat/src/test/markdown_blocks.test.ts:95:14)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1402:25)
+      at Suite.processPendingSubtests (node:internal/test_runner/test:974:18)
+      at Test.postRun (node:internal/test_runner/test:1542:19)
+      at Test.run (node:internal/test_runner/test:1467:12)
+      at async Suite.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: true,
+    expected: false,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at src/test/deepread_markdown_links.test.cjs:22:1
+✖ DeepRead Web and TXT retain balanced parentheses in report destinations (1.543083ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + '<p><a href="https://example.com/report_(2026">报告</a>?q=(outer(inner))&amp;source=reader)</p>'
+  - '<p><a href="https://example.com/report_(2026)?q=(outer(inner))&amp;source=reader">报告</a></p>'
+  
+      at TestContext.<anonymous> (/Users/arquiel/Downloads/AI/DeepRead/harmony/deepread/src/test/deepread_markdown_links.test.cjs:25:10)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1402:25)
+      at Test.start (node:internal/test_runner/test:1262:17)
+      at startSubtestAfterBootstrap (node:internal/test_runner/harness:387:17) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: '<p><a href="https://example.com/report_(2026">报告</a>?q=(outer(inner))&amp;source=reader)</p>',
+    expected: '<p><a href="https://example.com/report_(2026)?q=(outer(inner))&amp;source=reader">报告</a></p>',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at src/test/deepread_markdown_links.test.cjs:29:1
+✖ DeepRead Web and TXT unwrap angle destinations for links and images (0.293167ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + '<p>来源&gt;) 图.png&gt;)</p>'
+  - '<p><a href="https://example.com/source_(2026)">来源</a> <img class="inline" src="https://example.com/photo_(2026).png" alt="图"/></p>'
+  
+      at TestContext.<anonymous> (/Users/arquiel/Downloads/AI/DeepRead/harmony/deepread/src/test/deepread_markdown_links.test.cjs:31:10)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1402:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:974:18)
+      at Test.postRun (node:internal/test_runner/test:1542:19)
+      at Test.run (node:internal/test_runner/test:1467:12)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:387:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: '<p>来源&gt;) 图.png&gt;)</p>',
+    expected: '<p><a href="https://example.com/source_(2026)">来源</a> <img class="inline" src="https://example.com/photo_(2026).png" alt="图"/></p>',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

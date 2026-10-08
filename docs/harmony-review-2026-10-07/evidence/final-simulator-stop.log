@@ -1,0 +1,5 @@
+force stop process successfully.
+Stopping emulator "Amber DeepRead QA"...
+Emulator "Amber DeepRead QA" stopped successfully.
+
+New version 1.3.4 available, run `devecocli update` to upgrade

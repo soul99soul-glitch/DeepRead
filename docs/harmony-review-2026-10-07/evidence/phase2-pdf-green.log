@@ -1,0 +1,23 @@
+✔ cleaned long PDF still records extraction truncation and does not save its omitted evidence (42.863541ms)
+✔ complete short PDF has its text and no truncation warning (12.159458ms)
+✔ raw text exactly fills the extraction budget without unread text and must not be marked truncated (9.1275ms)
+✔ an extra nonempty object after an exact raw boundary proves omitted text and ends probing (9.337041ms)
+✔ boundary probing releases and yields pages, stops at the first later page containing text (10.723ms)
+✔ a separator consuming the remaining raw budget still records unread text in that object or page (18.049916ms)
+✔ an exact boundary followed only by blank/image objects or pages is complete (7.90225ms)
+✔ only whitespace omitted within the final object is not lost body text (9.502625ms)
+✔ normalization still enforces the existing saved body budget for dense PDF text (7.131167ms)
+✔ existing Chat path/preview APIs return budgeted strings and stop at the budget (6.646167ms)
+✔ text is normalized and truncation is explicit while all inputs remain stored (1.019625ms)
+✔ URL inputs validate independently, dedupe and preserve failure details (0.187834ms)
+✔ collection keeps full successful sources and failed original URLs; retry retains verified body (0.15675ms)
+✔ DOCX extraction includes paragraph boundaries and XML entities (0.19725ms)
+✔ file text decoder handles UTF-8 BOM, UTF-16 BOM and GB18030 fallback (0.204708ms)
+ℹ tests 15
+ℹ suites 0
+ℹ pass 15
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 385.238791

@@ -1,0 +1,99 @@
+✖ cleaned long PDF still records extraction truncation and does not save its omitted evidence (46.330416ms)
+✔ complete short PDF has its text and no truncation warning (12.022625ms)
+✔ raw text exactly fills the extraction budget without unread text and must not be marked truncated (11.713292ms)
+✖ an extra nonempty object after an exact raw boundary proves omitted text and ends probing (9.485959ms)
+✖ boundary probing releases and yields pages, stops at the first later page containing text (11.84975ms)
+✖ an exact boundary followed only by blank/image objects or pages is complete (8.694458ms)
+✔ only whitespace omitted within the final object is not lost body text (10.105042ms)
+✔ normalization still enforces the existing saved body budget for dense PDF text (8.119583ms)
+✔ existing Chat path/preview APIs return budgeted strings and stop at the budget (7.595917ms)
+ℹ tests 9
+ℹ suites 0
+ℹ pass 5
+ℹ fail 4
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 397.495792
+
+✖ failing tests:
+
+test at src/test/deepread_pdf_import.test.cjs:84:1
+✖ cleaned long PDF still records extraction truncation and does not save its omitted evidence (46.330416ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  false !== true
+  
+      at /Users/arquiel/Downloads/AI/DeepRead/harmony/deepread/src/test/deepread_pdf_import.test.cjs:90:12
+      at async withPdf (/Users/arquiel/Downloads/AI/DeepRead/harmony/deepread/src/test/deepread_pdf_import.test.cjs:77:5)
+      at async TestContext.<anonymous> (/Users/arquiel/Downloads/AI/DeepRead/harmony/deepread/src/test/deepread_pdf_import.test.cjs:85:3)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:387:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at src/test/deepread_pdf_import.test.cjs:114:1
+✖ an extra nonempty object after an exact raw boundary proves omitted text and ends probing (9.485959ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  false !== true
+  
+      at /Users/arquiel/Downloads/AI/DeepRead/harmony/deepread/src/test/deepread_pdf_import.test.cjs:117:12
+      at async withPdf (/Users/arquiel/Downloads/AI/DeepRead/harmony/deepread/src/test/deepread_pdf_import.test.cjs:77:5)
+      at async TestContext.<anonymous> (/Users/arquiel/Downloads/AI/DeepRead/harmony/deepread/src/test/deepread_pdf_import.test.cjs:115:3)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at src/test/deepread_pdf_import.test.cjs:123:1
+✖ boundary probing releases and yields pages, stops at the first later page containing text (11.84975ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  false !== true
+  
+      at /Users/arquiel/Downloads/AI/DeepRead/harmony/deepread/src/test/deepread_pdf_import.test.cjs:126:12
+      at async withPdf (/Users/arquiel/Downloads/AI/DeepRead/harmony/deepread/src/test/deepread_pdf_import.test.cjs:77:5)
+      at async TestContext.<anonymous> (/Users/arquiel/Downloads/AI/DeepRead/harmony/deepread/src/test/deepread_pdf_import.test.cjs:124:3)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at src/test/deepread_pdf_import.test.cjs:133:1
+✖ an exact boundary followed only by blank/image objects or pages is complete (8.694458ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    [
+      0,
+  -   1
+    ]
+  
+      at /Users/arquiel/Downloads/AI/DeepRead/harmony/deepread/src/test/deepread_pdf_import.test.cjs:137:12
+      at async withPdf (/Users/arquiel/Downloads/AI/DeepRead/harmony/deepread/src/test/deepread_pdf_import.test.cjs:77:5)
+      at async TestContext.<anonymous> (/Users/arquiel/Downloads/AI/DeepRead/harmony/deepread/src/test/deepread_pdf_import.test.cjs:134:3)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: [ 0 ],
+    expected: [ 0, 1 ],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }

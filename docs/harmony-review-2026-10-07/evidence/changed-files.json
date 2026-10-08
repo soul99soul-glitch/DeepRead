@@ -1,0 +1,22 @@
+[
+  "harmony/chat/src/main/ets/chat/markdown_blocks.ts",
+  "harmony/chat/src/main/ets/chat/openai_responses_api.ts",
+  "harmony/chat/src/test/generation_keepalive.test.cjs",
+  "harmony/chat/src/test/markdown_blocks.test.ts",
+  "harmony/chat/src/test/openai_responses_terminal.test.ts",
+  "harmony/deepread/src/main/ets/agent/section_writer_tools.ts",
+  "harmony/deepread/src/test/deepread_markdown_links.test.cjs",
+  "harmony/deepread/src/test/deepread_pdf_import.test.cjs",
+  "harmony/deepread/src/test/deepread_sources_ui.test.cjs",
+  "harmony/deepread/src/test/deepread_template.test.cjs",
+  "harmony/deepread/src/test/section_writer_tools.test.ts",
+  "harmony/deepread/tsconfig.json",
+  "harmony/entry/src/main/ets/pages/BoardPage.ets",
+  "harmony/entry/src/main/ets/pages/DeepReadDiscoverySettingsPage.ets",
+  "harmony/entry/src/main/ets/pages/DeepReadSourcesPage.ets",
+  "harmony/entry/src/main/ets/platform_impl/BackgroundGenerationKeepAlive.ets",
+  "harmony/entry/src/main/ets/platform_impl/DeepReadSourceImporter.ets",
+  "harmony/entry/src/main/ets/platform_impl/DeepReadTemplate.ets",
+  "harmony/entry/src/main/ets/platform_impl/PdfDocumentParser.ets",
+  "harmony/entry/src/test/deepread_phase2_ui_regression.test.cjs"
+]

@@ -1,0 +1,87 @@
+✔ UIAbility owner survives WorkScheduler progress and the last run stops with its original context (36.379916ms)
+✔ cold WorkScheduler progress does not request a UIAbility background lease (10.549666ms)
+✔ outgoing notification metadata and click target follow the remaining activity even without byte growth (3311.036292ms)
+✔ replacement activity refreshes its full title when display prefix and bytes stay unchanged (2217.392334ms)
+✔ A/B activity lifecycle: shared task, per-run removal, same-ID absolute progress, silence stays silent (3313.462041ms)
+✔ foreground during a pending start stops the late-acquired task immediately (11.254833ms)
+✖ B registering while A native stop is pending regains the lease without another progress event (9.711125ms)
+✔ foreground or disposal while a replacement is waiting for native stop never restarts the lease (16.851166ms)
+✔ tracker: history baseline is zero, growth counts once, retry never decreases, USER/tool-output excluded, UTF8 bytes are real (7.146208ms)
+✔ tracker skips unchanged history UTF8 work but measures immutable replacements and retry maxima (3.148875ms)
+✖ actual HTTP adapter terminal succeeds with unknown HTTP status and commits tools before the terminal cursor (199.183917ms)
+✖ unknown HTTP status never bypasses missing terminal, provider failure, transport failure or cancellation (1.757167ms)
+✔ Responses native opaque reasoning survives output parsing and reconciliation (0.247166ms)
+✔ Responses final opaque reasoning enriches streamed summary without duplicating visible reasoning (0.199875ms)
+✔ Responses reasoning identity preserves unstreamed final blocks beside a streamed block (0.093417ms)
+✔ Responses HTTP 200 failed rejects with provider message and displayable partial without tools (0.181209ms)
+✔ Responses output parser rejects content_filter and unknown incomplete reasons (0.103ms)
+✔ Responses legal output cap retains text and existing finishReason in both paths (0.046084ms)
+✔ Responses stream content_filter rejects, keeps previously delivered text and never publishes final tools (0.194708ms)
+✔ Responses stream failure preserves nested provider error and incomplete event checks missing status (0.109792ms)
+✔ Responses JSON-only terminal completion stops stream before trailing chunks (0.127375ms)
+✔ Responses failed stream never executes speculative tools in the real tool loop (1.646667ms)
+✔ Responses failed terminal preserves envelope-only text and reconciles overlapping partial text (0.255959ms)
+✔ Responses successful stream publishes each completed call once, after transport success, preserving wire IDs (0.459583ms)
+✔ Responses cancellation or HTTP failure after completed envelope never publishes buffered tools (0.1805ms)
+✔ Responses fragmented arguments and terminal-only call ID produce one complete replayable call (0.3085ms)
+✔ Responses EOF before successful terminal rejects and discards calls (0.094583ms)
+ℹ tests 27
+ℹ suites 0
+ℹ pass 24
+ℹ fail 3
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 9189.648541
+
+✖ failing tests:
+
+test at src/test/generation_keepalive.test.cjs:206:1
+✖ B registering while A native stop is pending regains the lease without another progress event (9.711125ms)
+  AssertionError [ERR_ASSERTION]: the latest active B needs a new lease after stop succeeds
+  
+  1 !== 2
+  
+      at TestContext.<anonymous> (/Users/arquiel/Downloads/AI/DeepRead/harmony/chat/src/test/generation_keepalive.test.cjs:219:10)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 1,
+    expected: 2,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at src/test/openai_responses_terminal.test.ts:3:88
+✖ actual HTTP adapter terminal succeeds with unknown HTTP status and commits tools before the terminal cursor (199.183917ms)
+  Error: Failed to get response: 0 
+      at errorFromFailure (/Users/arquiel/Downloads/AI/DeepRead/harmony/chat/src/main/ets/chat/openai_responses_api.ts:119:10)
+      at Object.streamText (/Users/arquiel/Downloads/AI/DeepRead/harmony/chat/src/main/ets/chat/openai_responses_api.ts:294:13)
+      at async TestContext.<anonymous> (/Users/arquiel/Downloads/AI/DeepRead/harmony/chat/src/test/openai_responses_terminal.test.ts:89:5)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:387:3)
+
+test at src/test/openai_responses_terminal.test.ts:3:1149
+✖ unknown HTTP status never bypasses missing terminal, provider failure, transport failure or cancellation (1.757167ms)
+  AssertionError [ERR_ASSERTION]: The input did not match the regular expression /cancelled/. Input:
+  
+  'Error: Failed to get response: 0 '
+  
+      at async TestContext.<anonymous> (/Users/arquiel/Downloads/AI/DeepRead/harmony/chat/src/test/openai_responses_terminal.test.ts:118:5)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: Error: Failed to get response: 0 
+        at errorFromFailure (/Users/arquiel/Downloads/AI/DeepRead/harmony/chat/src/main/ets/chat/openai_responses_api.ts:119:10)
+        at Object.streamText (/Users/arquiel/Downloads/AI/DeepRead/harmony/chat/src/main/ets/chat/openai_responses_api.ts:294:13)
+        at async waitForActual (node:assert:615:5)
+        at async strict.rejects (node:assert:738:25)
+        at async TestContext.<anonymous> (/Users/arquiel/Downloads/AI/DeepRead/harmony/chat/src/test/openai_responses_terminal.test.ts:118:5)
+        at async Test.run (node:internal/test_runner/test:1409:7)
+        at async Test.processPendingSubtests (node:internal/test_runner/test:974:7),
+    expected: /cancelled/,
+    operator: 'rejects',
+    diff: 'simple'
+  }

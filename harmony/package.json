@@ -1,0 +1,11 @@
+{
+  "name": "deepread-harmony",
+  "version": "0.0.2",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node ../scripts/test-harmony.mjs",
+    "lint": "bash scripts/lint-arkts.sh"
+  }
+}

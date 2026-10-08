@@ -1,0 +1,111 @@
+✔ editorial template renders every article field without the old display caps (2.825417ms)
+✔ a rejected hero asset is hidden in Web templates just as it is in native reading (0.84475ms)
+✔ Web hero uses the approved fallback asset and its caption without repeating it in the gallery (0.211ms)
+✔ Web gallery excludes rejected and non-HTTP assets while retaining accepted images once (0.152125ms)
+✔ summary Markdown uses the shared AST for blocks and inline formatting (0.716959ms)
+✔ article strings cannot escape HTML or create executable link/image URLs (0.1725ms)
+✔ old six-slot custom templates append chapters that had no original slot (0.436334ms)
+✔ the content slot renders the whole article once and title text is not substituted again (0.38625ms)
+✔ an unclosed full HTML shell still receives every unslotted article chapter (2.585ms)
+✔ placeholders in HTML comment examples do not consume visible article chapters (0.64875ms)
+✖ style examples preserve CSS and do not consume visible article chapters (0.61575ms)
+✔ partial articles show reference-only, diagram-only and core-point-only content (0.274792ms)
+✔ editorial and custom renders use current theme, font scale and serif preference (0.524125ms)
+✔ display options cannot inject CSS/HTML and non-finite scale falls back to a safe number (0.119667ms)
+✔ template limit counts UTF-8 bytes, accepts the limit and rejects one byte more (1.163458ms)
+✔ manual, generated and imported template contents share strict active-content validation (0.111083ms)
+✔ template documents disable scripts and external active fetches while allowing article images (0.392584ms)
+✔ corrupt template storage and real storage failures propagate instead of an empty list (0.292083ms)
+✔ saving rejects unsafe template content before storage mutation and preserves valid creation time (0.083833ms)
+✔ legacy custom templates default to an empty description and new descriptions round-trip without changing HTML (0.091542ms)
+✔ workbench reload uses the same percent scale and font mode as the article page (31.026917ms)
+✔ Workbench preview sends raw rendered HTML with Chinese, CSS colors and percent text to loadData (2.618792ms)
+✔ Workbench current main-document errors close the preview with an error, while obsolete and subresource errors do nothing (0.9835ms)
+✔ Workbench waits for each current initial blank document once, and old preview/theme callbacks cannot close a new preview (2.238041ms)
+✔ workbench saving an edited template preserves its creation time and other templates (3.280667ms)
+✔ workbench save failure keeps the list and editor identity and exposes the storage error (2.758458ms)
+✔ workbench delete failure retains the list, editor and selected template (3.033958ms)
+✔ workbench unsafe save leaves editor content visible and does not attempt a write (3.007792ms)
+✔ new hierarchy has a conclusion, judgments, turns, party interests and a verifiable outlook (0.55125ms)
+✔ numbered citations preserve text source positions, discard invalid ids, and never expose unsafe links (0.411ms)
+✔ topic type changes question order without dropping legacy sections (0.935416ms)
+✔ new template slots and old reference slots share one numbered source chapter (0.413166ms)
+✔ Workbench preview follows local citation anchors while blocking external navigation (1.05925ms)
+✔ reader appearance persists independently of generation templates and failed writes do not publish a selection (0.197333ms)
+✔ four reading layouts reorder real sections and eight styles render distinct canvases without changing captured custom HTML (2.465584ms)
+✔ safeTake: does not split UTF-16 surrogate pair (emoji) (0.421916ms)
+✔ mergeReadingLinks: dedup by url (trim trailing slash), http only, take limit (0.17025ms)
+✔ tools(stages) filters writer tools but keeps visuals/diagram/finish (0.388625ms)
+✔ overview: too-short summary → missing_required_content, not READY (0.289625ms)
+✔ narrative: event missing → timeline dropped (0.277625ms)
+✖ structured narrative images require a non-rejected candidate while preserving the article (2.021291ms)
+✔ analysis: all empty → missing_required_content (0.209625ms)
+✔ extended_reading: valid links → READY (0.192375ms)
+✔ extended_reading: no http links → missing (0.087708ms)
+✔ visuals: hero_url NOT in candidate pool → hero fields dropped (P1-1 gate) (0.192333ms)
+✔ visuals: hero_url in pool but confidence=reject → dropped (0.098958ms)
+✔ visuals: image_assets must be in candidate pool (withCandidateEvidence) (0.155667ms)
+✔ visuals: no hero no assets → no write (writeCount unchanged) (0.067125ms)
+✔ diagram: invalid type → missing (0.150375ms)
+✔ diagram: <2 nodes → missing (nodes < 2) (0.061416ms)
+✔ diagram: duplicate node id deduped (0.082417ms)
+✔ diagram: edge to unknown node / self edge dropped (0.074458ms)
+✔ finish: not all sections ready → generationComplete=false, missing list returned (0.08625ms)
+✔ finish: all ready → VERIFYING 过渡,二次 finish → COMPLETE (0.078666ms)
+✔ markFailed: sets FAILED with truncated message, skips READY (0.047583ms)
+✔ writeFallbackSection: OVERVIEW with useful assistant text → READY BASIC (0.196667ms)
+✔ writeFallbackSection: skips if already READY and !allowReadyRewrite (0.031875ms)
+✔ writeFallbackSection: low-quality assistant text → falls back to source/default text (0.067875ms)
+✔ tool execute: empty/invalid JSON input → treated as empty object (no throw) (0.054958ms)
+ℹ tests 59
+ℹ suites 0
+ℹ pass 57
+ℹ fail 2
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 446.457709
+
+✖ failing tests:
+
+test at src/test/deepread_template.test.cjs:267:1
+✖ style examples preserve CSS and do not consume visible article chapters (0.61575ms)
+  AssertionError [ERR_ASSERTION]: style content must be preserved
+      at TestContext.<anonymous> (/Users/arquiel/Downloads/AI/DeepRead/harmony/deepread/src/test/deepread_template.test.cjs:276:16)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1402:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:974:18)
+      at Test.postRun (node:internal/test_runner/test:1542:19)
+      at Test.run (node:internal/test_runner/test:1467:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }
+
+test at src/test/section_writer_tools.test.ts:1:3815
+✖ structured narrative images require a non-rejected candidate while preserving the article (2.021291ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    [
+  +   'https://images.example/unknown.jpg',
+  +   'https://images.example/rejected.jpg',
+  -   null,
+  -   null,
+      'https://images.example/inline.jpg'
+    ]
+  
+      at TestContext.<anonymous> (/Users/arquiel/Downloads/AI/DeepRead/harmony/deepread/src/test/section_writer_tools.test.ts:111:12)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: [ 'https://images.example/unknown.jpg', 'https://images.example/rejected.jpg', 'https://images.example/inline.jpg' ],
+    expected: [ null, null, 'https://images.example/inline.jpg' ],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
