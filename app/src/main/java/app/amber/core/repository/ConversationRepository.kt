@@ -1,0 +1,684 @@
+package app.amber.core.repository
+
+import android.database.sqlite.SQLiteBlobTooBigException
+import android.util.Log
+import androidx.paging.Pager
+import androidx.paging.PagingConfig
+import androidx.paging.PagingData
+import androidx.paging.map
+import androidx.room.withTransaction
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
+import app.amber.ai.core.MessageRole
+import app.amber.ai.ui.UIMessage
+import app.amber.agent.data.db.AppDatabase
+import app.amber.agent.data.db.fts.MessageFtsManager
+import app.amber.agent.data.db.dao.ConversationDAO
+import app.amber.agent.data.db.dao.FavoriteDAO
+import app.amber.agent.data.db.dao.MessageNodeDAO
+import app.amber.agent.data.db.dao.MessageStatsDAO
+import app.amber.agent.data.db.dao.findNodeIdContainingMessage
+import app.amber.agent.data.db.dao.findNodeIdContainingToolCall
+import app.amber.agent.data.db.entity.ConversationEntity
+import app.amber.agent.data.db.entity.MessageDayStatEntity
+import app.amber.agent.data.db.entity.MessageNodeEntity
+import app.amber.agent.data.db.entity.MessageNodeStatEntity
+import app.amber.core.files.FilesManager
+import app.amber.core.model.Conversation
+import app.amber.core.model.MessageNode
+import app.amber.core.sync.core.SyncRestoreWriteEpoch
+import app.amber.core.sync.core.SyncRestoreWriteGate
+import app.amber.core.utils.JsonInstant
+import java.time.Instant
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.withContext
+import kotlin.uuid.Uuid
+
+class ConversationRepository(
+    private val conversationDAO: ConversationDAO,
+    private val messageNodeDAO: MessageNodeDAO,
+    private val messageStatsDAO: MessageStatsDAO,
+    private val favoriteDAO: FavoriteDAO,
+    private val database: AppDatabase,
+    private val filesManager: FilesManager,
+    private val messageFtsManager: MessageFtsManager,
+    private val restoreWriteGate: SyncRestoreWriteGate? = null,
+    private val recapStore: app.amber.core.recap.ConversationRecapStore? = null,
+) {
+    companion object {
+        private const val PAGE_SIZE = 20
+        private const val INITIAL_LOAD_SIZE = 40
+    }
+
+    suspend fun getRecentConversations(limit: Int = 10): List<Conversation> {
+        return conversationDAO.getRecentConversations(limit).map { entity ->
+            val nodes = loadMessageNodes(entity.id)
+            conversationEntityToConversation(entity, nodes)
+        }
+    }
+
+    suspend fun getRecentConversationSummaries(limit: Int = 10): List<Conversation> {
+        return conversationDAO.getRecentConversationSummaries(limit)
+            .map(::conversationSummaryToConversation)
+    }
+
+    fun getConversations(): Flow<List<Conversation>> {
+        return conversationDAO
+            .getAll()
+            .map { flow ->
+                flow.map { entity ->
+                    // 列表视图不需要完整的 nodes，使用空列表
+                    conversationEntityToConversation(entity, emptyList())
+                }
+            }
+    }
+
+    /** All conversation rows needed by list surfaces, without loading the nodes JSON column. */
+    fun getConversationSummaries(): Flow<List<Conversation>> {
+        return conversationDAO
+            .getAllSummaries()
+            .map { summaries -> summaries.map(::conversationSummaryToConversation) }
+            .flowOn(Dispatchers.Default)
+    }
+
+    fun getConversationsPaging(): Flow<PagingData<Conversation>> = Pager(
+        config = PagingConfig(
+            pageSize = PAGE_SIZE,
+            initialLoadSize = INITIAL_LOAD_SIZE,
+            enablePlaceholders = false
+        ),
+        pagingSourceFactory = { conversationDAO.getAllPaging() }
+    ).flow.map { pagingData ->
+        pagingData.map { entity ->
+            conversationSummaryToConversation(entity)
+        }
+    }
+
+    fun searchConversations(titleKeyword: String): Flow<List<Conversation>> {
+        return conversationDAO
+            .searchConversations(escapeLikePattern(titleKeyword))
+            .map { flow ->
+                flow.map { entity ->
+                    conversationEntityToConversation(entity, emptyList())
+                }
+            }
+    }
+
+    fun searchConversationsPaging(titleKeyword: String): Flow<PagingData<Conversation>> = Pager(
+        config = PagingConfig(
+            pageSize = PAGE_SIZE,
+            initialLoadSize = INITIAL_LOAD_SIZE,
+            enablePlaceholders = false
+        ),
+        pagingSourceFactory = { conversationDAO.searchConversationsPaging(escapeLikePattern(titleKeyword)) }
+    ).flow.map { pagingData ->
+        pagingData.map { entity ->
+            conversationSummaryToConversation(entity)
+        }
+    }
+
+    suspend fun getConversationById(uuid: Uuid): Conversation? {
+        val entity = conversationDAO.getConversationById(uuid.toString())
+        return if (entity != null) {
+            val nodes = loadMessageNodes(entity.id)
+            conversationEntityToConversation(entity, nodes)
+        } else null
+    }
+
+    suspend fun getConversationSummaryById(uuid: Uuid): Conversation? {
+        return conversationDAO.getConversationSummaryById(uuid.toString())
+            ?.let(::conversationSummaryToConversation)
+    }
+
+    /** Load only the title needed to preview a cross-platform exchange conflict. */
+    suspend fun getConversationTitleById(uuid: Uuid): String? {
+        return conversationDAO.getConversationTitleById(uuid.toString())
+    }
+
+    suspend fun getConversationTailById(uuid: Uuid, limit: Int): ConversationWindow? {
+        val entity = conversationDAO.getConversationById(uuid.toString()) ?: return null
+        val total = messageNodeDAO.countNodesOfConversation(entity.id)
+        val safeLimit = limit.coerceAtLeast(0)
+        val offset = (total - safeLimit).coerceAtLeast(0)
+        val nodes = loadMessageNodesPage(
+            conversationId = entity.id,
+            limit = safeLimit,
+            offset = offset,
+        )
+        // Use actual node_index instead of row offset to handle gaps correctly
+        val oldestIndex = if (nodes.isNotEmpty()) {
+            messageNodeDAO.getNodeIndexAtOffset(entity.id, offset) ?: offset
+        } else offset
+        return ConversationWindow(
+            conversation = conversationEntityToConversation(entity, nodes),
+            totalNodeCount = total,
+            oldestLoadedIndex = oldestIndex,
+        )
+    }
+
+    suspend fun getConversationNodePage(
+        conversationId: Uuid,
+        offset: Int,
+        limit: Int,
+    ): List<MessageNode> {
+        return loadMessageNodesPage(
+            conversationId = conversationId.toString(),
+            offset = offset.coerceAtLeast(0),
+            limit = limit.coerceAtLeast(0),
+        )
+    }
+
+    suspend fun getConversationNodeRange(
+        conversationId: Uuid,
+        startIndex: Int,
+        endIndex: Int,
+    ): List<MessageNode> {
+        if (endIndex < startIndex) return emptyList()
+        val entities = messageNodeDAO.getNodesOfConversationRange(
+            conversationId = conversationId.toString(),
+            startIndex = startIndex.coerceAtLeast(0),
+            endIndex = endIndex.coerceAtLeast(0),
+        )
+        return decodeMessageNodeEntities(entities)
+    }
+
+    suspend fun getConversationNodeIndex(
+        conversationId: Uuid,
+        nodeId: String,
+    ): Int? {
+        return messageNodeDAO.getNodeIndex(
+            conversationId = conversationId.toString(),
+            nodeId = nodeId,
+        )
+    }
+
+    suspend fun findNodeIdForMessage(
+        conversationId: Uuid,
+        messageId: String,
+    ): String? {
+        return messageFtsManager.findNodeIdForMessage(
+            conversationId = conversationId.toString(),
+            messageId = messageId,
+        )
+    }
+
+    suspend fun findNodeIdContainingMessage(
+        conversationId: Uuid,
+        messageId: String,
+    ): String? {
+        return messageNodeDAO.findNodeIdContainingMessage(
+            conversationId = conversationId.toString(),
+            messageId = messageId,
+        )
+    }
+
+    suspend fun findNodeIdContainingToolCall(
+        conversationId: Uuid,
+        toolCallId: String,
+    ): String? {
+        return messageNodeDAO.findNodeIdContainingToolCall(
+            conversationId = conversationId.toString(),
+            toolCallId = toolCallId,
+        )
+    }
+
+    suspend fun countConversationNodes(conversationId: Uuid): Int {
+        return messageNodeDAO.countNodesOfConversation(conversationId.toString())
+    }
+
+    suspend fun existsConversationById(uuid: Uuid): Boolean {
+        return conversationDAO.existsById(uuid.toString())
+    }
+
+    /**
+     * Loads the complete conversation documents for the lightweight
+     * cross-platform exchange format. This intentionally bypasses list flows,
+     * whose summaries omit message nodes.
+     */
+    suspend fun getAllConversationsForExchange(): List<Conversation> {
+        return conversationDAO.getAllIds()
+            .map { Uuid.parse(it) }
+            .mapNotNull { getConversationById(it) }
+    }
+
+    /**
+     * Imports complete documents in one transaction. Existing rows are
+     * replaced while the separately-owned Council Room checkpoint is kept by
+     * [ConversationDAO.updatePreservingCouncilState]. No unrelated rows or
+     * attachment files are deleted here.
+     */
+    suspend fun upsertConversationsForExchange(conversations: List<Conversation>) {
+        if (conversations.isEmpty()) return
+        database.withTransaction {
+            conversations.forEach { conversation ->
+                val entity = conversationToConversationEntity(conversation)
+                val inserted = conversationDAO.insert(entity)
+                if (inserted == -1L) {
+                    conversationDAO.updatePreservingCouncilState(entity)
+                    messageNodeDAO.deleteByConversation(conversation.id.toString())
+                }
+                saveMessageNodes(conversation.id.toString(), conversation.messageNodes)
+                messageFtsManager.indexConversationInTransaction(conversation)
+            }
+        }
+    }
+
+    suspend fun insertConversation(conversation: Conversation) {
+        database.withTransaction {
+            val inserted = conversationDAO.insert(
+                conversationToConversationEntity(conversation)
+            )
+            if (inserted == -1L) return@withTransaction
+            saveMessageNodes(conversation.id.toString(), conversation.messageNodes)
+            // FTS 与会话写入同一事务，避免"已入库但搜不到"的崩溃窗口
+            messageFtsManager.indexConversationInTransaction(conversation)
+        }
+    }
+
+    suspend fun updateConversation(conversation: Conversation) {
+        database.withTransaction {
+            conversationDAO.updatePreservingCouncilState(
+                conversationToConversationEntity(conversation)
+            )
+            // 删除旧的节点，插入新的节点
+            messageNodeDAO.deleteByConversation(conversation.id.toString())
+            saveMessageNodes(conversation.id.toString(), conversation.messageNodes)
+            messageFtsManager.indexConversationInTransaction(conversation)
+        }
+    }
+
+    suspend fun upsertConversationWindow(
+        conversation: Conversation,
+        firstNodeIndex: Int,
+        indexFts: Boolean,
+    ) {
+        val conversationId = conversation.id.toString()
+        val startIndex = firstNodeIndex.coerceAtLeast(0)
+        val endIndex = startIndex + conversation.messageNodes.size - 1
+        database.withTransaction {
+            conversationDAO.updatePreservingCouncilState(
+                conversationToConversationEntity(conversation)
+            )
+            val oldNodeIds = if (endIndex >= startIndex) {
+                messageNodeDAO.getNodeIdsOfConversationRange(
+                    conversationId = conversationId,
+                    startIndex = startIndex,
+                    endIndex = endIndex,
+                )
+            } else {
+                emptyList()
+            }
+            if (endIndex >= startIndex) {
+                messageNodeDAO.deleteByConversationRange(
+                    conversationId = conversationId,
+                    startIndex = startIndex,
+                    endIndex = endIndex,
+                )
+            }
+            saveMessageNodes(
+                conversationId = conversationId,
+                nodes = conversation.messageNodes,
+                firstNodeIndex = startIndex,
+            )
+            if (indexFts) {
+                if (oldNodeIds.isNotEmpty()) {
+                    messageFtsManager.deleteNodeIdsInTransaction(oldNodeIds)
+                }
+                messageFtsManager.indexConversationNodesInTransaction(conversation)
+            }
+        }
+    }
+
+    suspend fun updateConversationMetadata(
+        conversationId: Uuid,
+        title: String? = null,
+        chatSuggestions: List<String>? = null,
+        updateAt: Instant = Instant.now(),
+    ) {
+        val id = conversationId.toString()
+        database.withTransaction {
+            val currentTitle = title ?: conversationDAO.getConversationById(id)?.title ?: return@withTransaction
+            title?.let { conversationDAO.updateTitle(id, it, updateAt.toEpochMilli()) }
+            chatSuggestions?.let {
+                conversationDAO.updateChatSuggestions(id, JsonInstant.encodeToString(it), updateAt.toEpochMilli())
+            }
+            messageFtsManager.updateConversationMetadataInTransaction(id, currentTitle, updateAt)
+        }
+    }
+
+    suspend fun deleteConversation(conversation: Conversation, deferCleanup: Boolean = false) {
+        val expectedRestoreEpoch = captureRestoreEpoch()
+        // Load attachment references before entering the short durable
+        // transaction; the captured epoch is checked again before deletion.
+        val fullConversation = if (conversation.messageNodes.isEmpty()) {
+            getConversationById(conversation.id) ?: conversation
+        } else {
+            conversation
+        }
+        // The captured epoch is carried to cleanup so a delayed purge cannot
+        // unlink files imported by a later restore.
+        withRestoreWrite(expectedRestoreEpoch) {
+            database.withTransaction {
+                messageFtsManager.deleteConversationInTransaction(fullConversation.id.toString())
+                // message_node 会通过 CASCADE 自动删除
+                conversationDAO.delete(conversationToConversationEntity(fullConversation))
+            }
+        }
+        if (!deferCleanup) {
+            cleanupDeletedConversation(fullConversation, expectedRestoreEpoch)
+        }
+    }
+
+    /**
+     * Final cleanup once a deleted conversation can no longer be restored:
+     * favorites, attachments and generated images. Split from
+     * [deleteConversation] so the History undo window can restore the
+     * conversation with its files still intact.
+     */
+    suspend fun cleanupDeletedConversation(
+        conversation: Conversation,
+        expectedRestoreEpoch: Long? = null,
+    ) {
+        val cleanupEpoch = expectedRestoreEpoch ?: captureRestoreEpoch()
+        // Favorite rows are part of the archive and must be removed under the
+        // same captured epoch as the file cleanup. Release the gate before the
+        // file manager acquires it again; nested gate acquisition would deadlock.
+        withRestoreWrite(cleanupEpoch) {
+            favoriteDAO.deleteByConversation(conversation.id.toString())
+        }
+        filesManager.deleteChatFilesAndAwait(conversation.files, cleanupEpoch)
+        // Drop any generate_image tool output bound to this conversation.
+        // The dir is `filesDir/chat_images/{conversationId}/` and is created
+        // lazily on first generation — deleteRecursively no-ops when missing.
+        filesManager.deleteChatImagesDirAndAwait(conversation.id, cleanupEpoch)
+        recapStore?.delete(conversation.id.toString())
+    }
+
+    suspend fun searchMessages(keyword: String) = messageFtsManager.search(keyword)
+
+    suspend fun rebuildAllIndexes(onProgress: (current: Int, total: Int) -> Unit = { _, _ -> }) {
+        // Rebuilding in one transaction prevents a concurrent conversation
+        // write from being indexed against a mixed old/new snapshot.
+        database.withTransaction {
+            messageFtsManager.deleteAllInTransaction()
+            val allIds = conversationDAO.getAllIds()
+            val total = allIds.size
+            allIds.forEachIndexed { index, id ->
+                val entity = conversationDAO.getConversationById(id) ?: return@forEachIndexed
+                val nodes = loadMessageNodes(entity.id)
+                val conversation = conversationEntityToConversation(entity, nodes)
+                messageFtsManager.indexConversationInTransaction(conversation)
+                onProgress(index + 1, total)
+            }
+        }
+    }
+
+    suspend fun deleteAllConversations() {
+        getConversations().first().forEach { conversation ->
+            deleteConversation(conversation)
+        }
+    }
+
+    private suspend fun captureRestoreEpoch(): Long? {
+        val gate = restoreWriteGate ?: return null
+        return currentCoroutineContext()[SyncRestoreWriteEpoch]?.value ?: gate.currentEpoch()
+    }
+
+    private suspend fun <T> withRestoreWrite(
+        expectedRestoreEpoch: Long?,
+        block: suspend () -> T,
+    ): T {
+        val gate = restoreWriteGate ?: return block()
+        val epoch = expectedRestoreEpoch
+            ?: currentCoroutineContext()[SyncRestoreWriteEpoch]?.value
+            ?: gate.currentEpoch()
+        return withContext(SyncRestoreWriteEpoch(epoch)) {
+            gate.withCurrentWriterOrCancel(block)
+        }
+    }
+
+    fun conversationToConversationEntity(conversation: Conversation): ConversationEntity {
+        require(conversation.messageNodes.none { it.messages.any { message -> message.hasBase64Part() } })
+        return ConversationEntity(
+            id = conversation.id.toString(),
+            title = conversation.title,
+            nodes = "[]",  // nodes 现在存储在单独的表中
+            createAt = conversation.createAt.toEpochMilli(),
+            updateAt = conversation.updateAt.toEpochMilli(),
+            assistantId = conversation.assistantId.toString(),
+            chatSuggestions = JsonInstant.encodeToString(conversation.chatSuggestions),
+            isPinned = conversation.isPinned,
+            autoApproveToolCalls = conversation.autoApproveToolCalls,
+        )
+    }
+
+    private suspend fun ConversationDAO.updatePreservingCouncilState(entity: ConversationEntity) {
+        updatePreservingCouncilState(
+            id = entity.id,
+            assistantId = entity.assistantId,
+            title = entity.title,
+            nodes = entity.nodes,
+            createAt = entity.createAt,
+            updateAt = entity.updateAt,
+            chatSuggestions = entity.chatSuggestions,
+            isPinned = entity.isPinned,
+            autoApproveToolCalls = entity.autoApproveToolCalls,
+        )
+    }
+
+    fun conversationEntityToConversation(
+        conversationEntity: ConversationEntity,
+        messageNodes: List<MessageNode>
+    ): Conversation {
+        return Conversation(
+            id = Uuid.parse(conversationEntity.id),
+            title = conversationEntity.title,
+            messageNodes = messageNodes.filter { it.messages.isNotEmpty() },
+            createAt = Instant.ofEpochMilli(conversationEntity.createAt),
+            updateAt = Instant.ofEpochMilli(conversationEntity.updateAt),
+            assistantId = Uuid.parse(conversationEntity.assistantId),
+            chatSuggestions = JsonInstant.decodeFromString(conversationEntity.chatSuggestions),
+            isPinned = conversationEntity.isPinned,
+            autoApproveToolCalls = conversationEntity.autoApproveToolCalls,
+        )
+    }
+
+    fun getPinnedConversations(): Flow<List<Conversation>> {
+        return conversationDAO
+            .getPinnedConversations()
+            .map { flow ->
+                flow.map { entity ->
+                    conversationEntityToConversation(entity, emptyList())
+                }
+            }
+    }
+
+    suspend fun togglePinStatus(conversationId: Uuid) {
+        // 原子 SQL 翻转：不加载整条会话，也无读-改-写竞态
+        conversationDAO.togglePinStatus(conversationId.toString())
+    }
+
+    /** Escape LIKE wildcards so user input like "100%" matches literally. */
+    private fun escapeLikePattern(input: String): String =
+        input.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    private fun conversationSummaryToConversation(entity: LightConversationEntity): Conversation {
+        return Conversation(
+            id = Uuid.parse(entity.id),
+            assistantId = Uuid.parse(entity.assistantId),
+            title = entity.title,
+            isPinned = entity.isPinned,
+            createAt = Instant.ofEpochMilli(entity.createAt),
+            updateAt = Instant.ofEpochMilli(entity.updateAt),
+            messageNodes = emptyList(),
+            messageCount = entity.messageCount,
+            lastMessagePreview = entity.lastMessagePreview,
+        )
+    }
+
+    private suspend fun loadMessageNodes(conversationId: String): List<MessageNode> {
+        val total = messageNodeDAO.countNodesOfConversation(conversationId)
+        if (total <= 0) return emptyList()
+        return loadMessageNodesRange(conversationId = conversationId, offset = 0, total = total)
+    }
+
+    private suspend fun loadMessageNodesPage(
+        conversationId: String,
+        offset: Int,
+        limit: Int,
+    ): List<MessageNode> {
+        if (limit <= 0) return emptyList()
+        return loadMessageNodesRange(
+            conversationId = conversationId,
+            offset = offset,
+            total = offset + limit,
+            pageLimit = limit,
+        )
+    }
+
+    private suspend fun loadMessageNodesRange(
+        conversationId: String,
+        offset: Int,
+        total: Int,
+        pageLimit: Int = 64,
+    ): List<MessageNode> {
+        val favoriteNodeIds = favoriteDAO
+            .getFavoriteNodeIdsOfConversation(conversationId)
+            .mapNotNull { runCatching { Uuid.parse(it) }.getOrNull() }
+            .toSet()
+
+        return database.withTransaction {
+            val nodes = mutableListOf<MessageNode>()
+            var currentOffset = offset.coerceAtLeast(0)
+            val endExclusive = total.coerceAtLeast(currentOffset)
+            val pageSize = pageLimit.coerceAtLeast(1).coerceAtMost(64)
+            while (currentOffset < endExclusive) {
+                val currentLimit = (endExclusive - currentOffset).coerceAtMost(pageSize)
+                val page = try {
+                    messageNodeDAO.getNodesOfConversationPaged(conversationId, currentLimit, currentOffset)
+                } catch (e: SQLiteBlobTooBigException) {
+                    if (currentLimit > 1) {
+                        // Retry with limit=1 to isolate the oversized row
+                        val single = try {
+                            messageNodeDAO.getNodesOfConversationPaged(conversationId, 1, currentOffset)
+                        } catch (_: SQLiteBlobTooBigException) {
+                            Log.w("ConversationRepo", "Skipping oversized node at offset $currentOffset")
+                            currentOffset += 1
+                            continue
+                        }
+                        single
+                    } else {
+                        Log.w("ConversationRepo", "Skipping oversized node at offset $currentOffset")
+                        currentOffset += 1
+                        continue
+                    }
+                }
+                if (page.isEmpty()) break
+                page.forEach { entity ->
+                    val messages = JsonInstant.decodeFromString<List<UIMessage>>(entity.messages)
+                    val nodeId = Uuid.parse(entity.id)
+                    nodes.add(
+                        MessageNode(
+                            id = nodeId,
+                            messages = messages,
+                            selectIndex = entity.selectIndex,
+                            isFavorite = favoriteNodeIds.contains(nodeId)
+                        )
+                    )
+                }
+                currentOffset += page.size
+            }
+            nodes
+        }
+    }
+
+    private fun decodeMessageNodeEntities(entities: List<MessageNodeEntity>): List<MessageNode> {
+        return entities.mapNotNull { entity ->
+            runCatching {
+                MessageNode(
+                    id = Uuid.parse(entity.id),
+                    messages = JsonInstant.decodeFromString<List<UIMessage>>(entity.messages),
+                    selectIndex = entity.selectIndex,
+                )
+            }.getOrNull()
+        }
+    }
+
+    private suspend fun saveMessageNodes(
+        conversationId: String,
+        nodes: List<MessageNode>,
+        firstNodeIndex: Int = 0,
+    ) {
+        val entities = nodes.mapIndexed { index, node ->
+            MessageNodeEntity(
+                id = node.id.toString(),
+                conversationId = conversationId,
+                nodeIndex = firstNodeIndex + index,
+                messages = JsonInstant.encodeToString(node.messages),
+                selectIndex = node.selectIndex
+            )
+        }
+        messageNodeDAO.insertAll(entities)
+        messageStatsDAO.insertNodeStats(
+            nodes.map { node ->
+                node.toNodeStat(
+                    conversationId = conversationId,
+                )
+            }
+        )
+        messageStatsDAO.insertDayStats(
+            nodes.flatMap { node ->
+                node.toDayStats()
+            }
+        )
+    }
+
+    private fun MessageNode.toNodeStat(conversationId: String): MessageNodeStatEntity {
+        return MessageNodeStatEntity(
+            nodeId = id.toString(),
+            conversationId = conversationId,
+            totalMessages = messages.size,
+            promptTokens = messages.sumOf { it.usage?.promptTokens?.toLong() ?: 0L },
+            completionTokens = messages.sumOf { it.usage?.completionTokens?.toLong() ?: 0L },
+            cachedTokens = messages.sumOf { it.usage?.cachedTokens?.toLong() ?: 0L },
+        )
+    }
+
+    private fun MessageNode.toDayStats(): List<MessageDayStatEntity> {
+        return messages
+            .asSequence()
+            .filter { it.role == MessageRole.USER }
+            .groupingBy { it.createdAt.date.toString() }
+            .eachCount()
+            .map { (day, count) ->
+                MessageDayStatEntity(
+                    nodeId = id.toString(),
+                    day = day,
+                    count = count,
+                )
+            }
+    }
+}
+
+/**
+ * 轻量级的会话查询结果，不包含 nodes 和 suggestions 字段
+ */
+data class LightConversationEntity(
+    val id: String,
+    val assistantId: String,
+    val title: String,
+    val isPinned: Boolean,
+    val createAt: Long,
+    val updateAt: Long,
+    val messageCount: Int,
+    val lastMessagePreview: String,
+)
+
+data class ConversationWindow(
+    val conversation: Conversation,
+    val totalNodeCount: Int,
+    val oldestLoadedIndex: Int,
+)

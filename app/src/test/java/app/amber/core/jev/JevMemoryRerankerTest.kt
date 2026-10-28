@@ -1,0 +1,207 @@
+package app.amber.core.jev
+
+import app.amber.core.memory.model.MemoryKind
+import app.amber.core.memory.model.MemoryRecord
+import app.amber.core.memory.model.MemoryScope
+import app.amber.core.settings.Settings
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/** 记忆重排：多 chunk 判分聚合进单条校准记录；chunk 失败整体不落记录。 */
+class JevMemoryRerankerTest {
+
+    private class ScriptedTransport(
+        private val failFromCall: Int? = null,
+    ) : JevTransport {
+        var calls = 0
+
+        override suspend fun execute(request: JevHttpRequest): JevTransportResponse {
+            calls++
+            if (failFromCall != null && calls >= failFromCall) {
+                return JevTransportResponse.Failure("down")
+            }
+            val ids = requestedIds(request)
+            val answer = ids.joinToString(",") { """"$it":{"type":"noul","noul":0.9}""" }
+            return JevTransportResponse.Http(200, """{"model":"jev-test","answers":{$answer}}""".toByteArray(), null)
+        }
+
+        /** 从出站请求里提取 questions 的候选 id（记录 id 字符串）。 */
+        private fun requestedIds(request: JevHttpRequest): List<String> =
+            Regex("\"Is the memory with id ([0-9a-f-]+) in state\\.memories").findAll(request.body)
+                .map { it.groupValues[1] }
+                .toList()
+    }
+
+    private fun runtime(
+        mode: JevMode,
+        calibration: JevCalibrationStore,
+        transport: JevTransport,
+        shadowScope: CoroutineScope = CoroutineScope(Dispatchers.Unconfined),
+    ): JevRuntime {
+        val settings = Settings(
+            jev = JevSetting(
+                enabled = true,
+                purposes = mapOf(JevPurpose.MEMORY_RECALL to mode),
+                dataScopes = setOf(JevDataScope.PERSONAL_MEMORY, JevDataScope.TASK_TEXT),
+            ),
+        )
+        return JevRuntime(
+            coordinator = JevDecisionCoordinator(
+                client = JevClient(transport = transport),
+                apiKeyProvider = { "key" },
+                clock = { 1_000_000L },
+            ),
+            settingsProvider = { settings },
+            calibration = calibration,
+            backgroundScope = shadowScope,
+        )
+    }
+
+    /** 40 条 → 32+8 两个 chunk，覆盖跨 chunk 聚合路径。 */
+    private fun records(count: Int) = (1..count).map { index ->
+        MemoryRecord(
+            id = index,
+            content = "memory content $index",
+            scope = MemoryScope.CORE,
+            kind = MemoryKind.USER,
+            assistantId = "assistant",
+        )
+    }
+
+    @Test
+    fun multiChunkAggregatesIntoSingleRecord() = runTest {
+        val all = records(40)
+        val calibration = FreshCalibrationStore()
+        val transport = ScriptedTransport()
+        val result = JevMemoryReranker(runtime(JevMode.ACTIVE, calibration, transport))
+            .rerank(all, taskText = "what did I say about coffee?", runKey = "run1")
+        assertTrue(result.applied)
+        assertEquals(40, result.rankedIds?.size)
+        assertEquals(2, transport.calls)
+        val record = calibration.records.single()
+        assertEquals(JevPurpose.MEMORY_RECALL, record.purpose)
+        assertEquals(JevMode.ACTIVE, record.mode)
+        assertEquals(40, record.scores.size)
+        assertEquals(all.first().id.toString(), record.incumbentTop1)
+        assertTrue(record.jevTop1 != null && record.scores[record.jevTop1] == 0.9)
+    }
+
+    @Test
+    fun secondChunkFailureRecordsNothing() = runTest {
+        val calibration = FreshCalibrationStore()
+        val result = JevMemoryReranker(runtime(JevMode.ACTIVE, calibration, ScriptedTransport(failFromCall = 2)))
+            .rerank(records(40), taskText = "what did I say about coffee?", runKey = "run1")
+        assertFalse(result.applied)
+        assertTrue(calibration.records.isEmpty())
+    }
+
+    @Test
+    fun shadowStillRecordsAllChunksWithoutApplying() = runTest {
+        val calibration = FreshCalibrationStore()
+        val transport = ScriptedTransport()
+        val result = JevMemoryReranker(runtime(JevMode.SHADOW, calibration, transport, backgroundScope))
+            .rerank(records(40), taskText = "what did I say about coffee?", runKey = "run1")
+        // backgroundScope 的任务不计入 advanceUntilIdle，用 runCurrent 执行后台 shadow。
+        runCurrent()
+
+        assertFalse(result.applied)
+        assertEquals(2, transport.calls)
+        assertEquals(1, calibration.records.size)
+        assertEquals(JevMode.SHADOW, calibration.records.single().mode)
+        assertEquals(40, calibration.records.single().scores.size)
+    }
+
+    /** shadow 不等 Jev：立即走原路径，判断在后台完成并照常落校准记录。 */
+    @Test
+    fun shadowReturnsWithoutWaitingForJev() = runTest {
+        val gate = CompletableDeferred<Unit>()
+        val inner = ScriptedTransport()
+        val transport = object : JevTransport {
+            override suspend fun execute(request: JevHttpRequest): JevTransportResponse {
+                gate.await()
+                return inner.execute(request)
+            }
+        }
+        val calibration = FreshCalibrationStore()
+        val result = JevMemoryReranker(runtime(JevMode.SHADOW, calibration, transport, backgroundScope))
+            .rerank(records(3), taskText = "what did I say about coffee?", runKey = "run1")
+
+        assertFalse(result.applied)
+        assertEquals(0L, testScheduler.currentTime)
+        gate.complete(Unit)
+        // backgroundScope 的任务不计入 advanceUntilIdle，用 runCurrent 执行后台 shadow。
+        runCurrent()
+        assertEquals(1, inner.calls)
+        assertEquals(JevMode.SHADOW, calibration.records.single().mode)
+    }
+
+    @Test
+    fun modeSwitchBetweenChunksDiscardsEarlierActiveScores() = runTest {
+        fun settings(mode: JevMode) = Settings(
+            jev = JevSetting(
+                enabled = true,
+                purposes = mapOf(JevPurpose.MEMORY_RECALL to mode),
+                dataScopes = setOf(JevDataScope.PERSONAL_MEMORY, JevDataScope.TASK_TEXT),
+            ),
+        )
+
+        val all = records(40)
+        val answer = all.joinToString(",") { """"${it.id}":{"type":"noul","noul":0.9}""" }
+        var liveSettings = settings(JevMode.ACTIVE)
+        var flipAfterNextRead = false
+        val transport = object : JevTransport {
+            var calls = 0
+
+            override suspend fun execute(request: JevHttpRequest): JevTransportResponse {
+                calls++
+                if (calls == 1) flipAfterNextRead = true
+                return JevTransportResponse.Http(
+                    200,
+                    """{"model":"jev-test","answers":{$answer}}""".toByteArray(),
+                    null,
+                )
+            }
+        }
+        val calibration = FreshCalibrationStore()
+        val runtime = JevRuntime(
+            coordinator = JevDecisionCoordinator(
+                client = JevClient(transport = transport),
+                apiKeyProvider = { "key" },
+                clock = { 1_000_000L },
+            ),
+            settingsProvider = {
+                val snapshot = liveSettings
+                if (flipAfterNextRead) {
+                    flipAfterNextRead = false
+                    liveSettings = settings(JevMode.SHADOW)
+                }
+                snapshot
+            },
+            calibration = calibration,
+        )
+
+        val result = JevMemoryReranker(runtime)
+            .rerank(all, taskText = "what did I say about coffee?", runKey = "run1")
+
+        assertFalse(result.applied)
+        assertEquals(1, transport.calls)
+        assertTrue(calibration.records.isEmpty())
+    }
+
+    /** 局部独立记录器：IN_MEMORY 是进程级单例，会被其他测试污染。 */
+    private class FreshCalibrationStore : JevCalibrationStore {
+        val records = mutableListOf<JevCalibrationRecord>()
+        override fun append(record: JevCalibrationRecord) {
+            records += record
+        }
+        override fun readAll(): List<JevCalibrationRecord> = records.toList()
+        override fun clear() = records.clear()
+    }
+}

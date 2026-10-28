@@ -1,0 +1,116 @@
+name: Build APK
+
+on:
+  push:
+    branches: [Android, main]
+  pull_request:
+    branches: [Android, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK
+        uses: actions/setup-java@v6
+        with:
+          # Match the Gradle daemon criteria; JVM-only modules also require JDK 17.
+          distribution: 'jetbrains'
+          java-version: |
+            17
+            21
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK and NDK packages
+        run: |
+          sdkmanager --install "platforms;android-36" "platforms;android-37.0" \
+            "build-tools;36.0.0" "ndk;27.0.12077973"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/27.0.12077973" >> "$GITHUB_ENV"
+
+      - name: Set up Rust and Android target
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked --version 3.5.4
+
+      - name: Cargo cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            native/target
+          key: ${{ runner.os }}-${{ runner.arch }}-android-cargo-1.95.0-ndk27-${{ hashFiles('native/**/Cargo.lock', 'native/**/Cargo.toml', 'native/**/*.rs', 'native/.cargo/config.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-android-cargo-1.95.0-ndk27-
+
+      - name: Cargo tests
+        working-directory: native
+        run: cargo test --workspace --locked
+
+      - name: Gradle debug build
+        run: ./gradlew :app:assembleDeepreadDebug :app:assembleDeepreadDebugAndroidTest --no-daemon --console=plain
+
+      - name: Native extraction and terminal upgrade regression tests
+        run: |
+          ./gradlew :app:testDeepreadDebugUnitTest \
+            --tests '*NativeLibraryOnDiskTest' \
+            --tests '*AlpineRuntimeUpgradeTest' \
+            --tests '*TerminalAdmissionTest' \
+            --no-daemon --console=plain
+
+      - name: Verify native libraries in debug APK
+        run: |
+          set -euo pipefail
+          expected=(
+            "lib/arm64-v8a/liboffice_parsers.so"
+            "lib/arm64-v8a/libmarkdown_parser.so"
+            "lib/arm64-v8a/libhighlight_parser.so"
+            "lib/arm64-v8a/libregex_transformer.so"
+            "lib/arm64-v8a/libreader_extractor.so"
+            "lib/arm64-v8a/libsync_crypto.so"
+            "lib/arm64-v8a/libmarkdown_preprocess.so"
+            "lib/arm64-v8a/libhtml_diff_normalizer.so"
+            "lib/arm64-v8a/libproot-loader.so"
+          )
+          for APK in app/build/outputs/apk/deepread/debug/*.apk; do
+            APK_ENTRIES="$(unzip -Z1 "$APK")"
+            for so in "${expected[@]}"; do
+              if ! grep -Fxq "$so" <<< "$APK_ENTRIES"; then
+                echo "Missing native library in $APK: $so" >&2
+                exit 1
+              fi
+            done
+            if grep -Fxq "assets/embedded-terminal-runtime/libproot-loader.so" <<< "$APK_ENTRIES"; then
+              echo "proot loader must be installer-extracted, not copied to app data: $APK" >&2
+              exit 1
+            fi
+          done
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: DeepRead-Android-debug-${{ github.run_number }}
+          path: app/build/outputs/apk/deepread/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

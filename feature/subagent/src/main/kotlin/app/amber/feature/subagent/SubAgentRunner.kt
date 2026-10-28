@@ -1,0 +1,364 @@
+package app.amber.feature.subagent
+
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.MutableStateFlow
+import app.amber.ai.core.MessageRole
+import app.amber.ai.core.Tool
+import app.amber.ai.ui.ToolApprovalState
+import app.amber.ai.ui.UIMessage
+import app.amber.ai.ui.UIMessagePart
+import app.amber.core.ai.GenerationChunk
+import app.amber.core.ai.GenerationTerminal
+import app.amber.core.ai.GenerationRunSession
+import app.amber.core.ai.toGenerationSettings
+import app.amber.core.ai.RunKernel
+import app.amber.feature.runtime.ToolInvocationContext
+import app.amber.core.settings.Settings
+import app.amber.core.settings.findModelById
+import app.amber.core.settings.getCurrentChatModel
+
+interface SubAgentRunner {
+    /**
+     * Run a subagent task. [liveText] receives the running assistant text as it streams in;
+     * [liveParts] receives the latest message parts so UI can derive render-time presentation
+     * from tool outputs without rewriting assistant text.
+     * UI code can subscribe via [SubAgentManager.liveTextFlow] to render real-time output.
+     * Pass a no-op flow if you don't need live updates.
+     *
+     * P4-02 (thread graph): [runId] + [onTerminal] activate the durable
+     * runtime path inside the generator, so child tool effects are recorded in
+     * the unified ToolEffectLedger under the child runId (plan §P4-02 "child
+     * tool effect 仍使用统一 ledger"). [consumeSteerMessages] drains messages
+     * delivered to a running thread (send_message mid-run). [previousAnswer]
+     * seeds a followup turn with the thread's last final answer.
+     *
+     * Step 3: [events] is the run scope's protocol event writer; the kernel
+     * emits ToolPrepared/Started/Finished into it on the durable path.
+     */
+    suspend fun run(
+        settings: Settings,
+        definition: SubAgentDefinition,
+        task: SubAgentTaskSpec,
+        tools: List<Tool>,
+        liveText: MutableStateFlow<String>,
+        liveParts: MutableStateFlow<List<UIMessagePart>>,
+        runId: String? = null,
+        onTerminal: (suspend (GenerationTerminal) -> Unit)? = null,
+        consumeSteerMessages: suspend () -> List<UIMessage> = { emptyList() },
+        previousAnswer: String = "",
+        events: app.amber.core.agent.runtime.AgentEventWriter? = null,
+        /**
+         * Step 6: the parent run's sandbox policy. The child session runs on
+         * [ExecutionPolicy.narrow] of this and the payload's optional child
+         * policy — each dimension intersects, so a child can never widen the
+         * parent's sandbox. Default stays permissive (v1: no producer narrows
+         * yet).
+         */
+        parentPolicy: app.amber.feature.runtime.ExecutionPolicy =
+            app.amber.feature.runtime.ExecutionPolicy.permissive(),
+        /** Optional narrowing carried by the sub-agent turn payload. */
+        childPolicy: app.amber.feature.runtime.ExecutionPolicy? = null,
+    ): SubAgentResult
+}
+
+class GenerationSubAgentRunner(
+    private val kernel: RunKernel,
+) : SubAgentRunner {
+    override suspend fun run(
+        settings: Settings,
+        definition: SubAgentDefinition,
+        task: SubAgentTaskSpec,
+        tools: List<Tool>,
+        liveText: MutableStateFlow<String>,
+        liveParts: MutableStateFlow<List<UIMessagePart>>,
+        runId: String?,
+        onTerminal: (suspend (GenerationTerminal) -> Unit)?,
+        consumeSteerMessages: suspend () -> List<UIMessage>,
+        previousAnswer: String,
+        events: app.amber.core.agent.runtime.AgentEventWriter?,
+        parentPolicy: app.amber.feature.runtime.ExecutionPolicy,
+        childPolicy: app.amber.feature.runtime.ExecutionPolicy?,
+    ): SubAgentResult {
+        // Step 6: the child runs on the intersection of the parent run's
+        // sandbox and the payload's optional narrowing — never wider than the
+        // parent. A permissive parent passes the child policy through as-is.
+        val sessionPolicy = parentPolicy.narrow(
+            childPolicy ?: app.amber.feature.runtime.ExecutionPolicy.permissive()
+        )
+        val isolatedSettings = settings.toIsolatedSubAgentSettings().copy(
+            systemPrompt = definition.systemPrompt,
+            temperature = definition.temperature ?: settings.temperature,
+            reasoningLevel = definition.reasoningLevel ?: settings.reasoningLevel,
+        )
+        // Per-role model: explicit override → fallback to current chat model.
+        // If the user removed/renamed the configured model after saving the override,
+        // fall through silently rather than failing the run.
+        val model = definition.modelId?.let { settings.findModelById(it) }
+            ?: settings.getCurrentChatModel()
+            ?: error("Current chat model is not configured")
+        val generationSettings = isolatedSettings.toGenerationSettings(model)
+        val messages = listOf(UIMessage.user(buildTaskPrompt(definition, task, previousAnswer)))
+        val reportCapture = SubAgentReportCapture()
+        var latest = messages
+        var supervisorDisplayText = ""
+        var generationError: Throwable? = null
+
+        try {
+            kernel.run(
+                GenerationRunSession(
+                    settings = generationSettings,
+                model = model,
+                messages = messages,
+                memories = emptyList(),
+                tools = tools + reportCapture.tool(),
+                maxSteps = definition.maxTurns,
+                processingStatus = MutableStateFlow("SubAgent ${definition.id}"),
+                autoApproveTools = settings.agentRuntime.autoApproveAllToolCalls,
+                autoApproveHighRiskTools = settings.agentRuntime.autoApproveHighRiskToolCalls,
+                invocationContext = ToolInvocationContext.SubAgent,
+                conversation = null,
+                consumeSteerMessages = consumeSteerMessages,
+                runId = runId,
+                onTerminal = onTerminal,
+                toolLifecycleEvents = events,
+                executionPolicy = sessionPolicy,
+                ),
+            ).collect { chunk ->
+                if (chunk is GenerationChunk.Messages) {
+                    latest = chunk.messages
+                    latest.toLiveParts().also { parts ->
+                        if (parts != liveParts.value) liveParts.value = parts
+                    }
+                    // Stream the assistant's accumulated content to subscribers (UI live view).
+                    // Include reasoning so the user has something to watch during the (often long)
+                    // thinking phase — UIMessage.toText() skips Reasoning parts entirely, which would
+                    // leave the sheet blank for reasoning-heavy models like deepseek-v4-pro.
+                    val assistantContent = latest.lastOrNull { it.role == MessageRole.ASSISTANT }
+                        ?.let(::renderAssistantContentForLive)
+                        .orEmpty()
+                    if (assistantContent != liveText.value) liveText.value = assistantContent
+                }
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            generationError = error
+        }
+
+        supervisorDisplayText = renderAssistantTranscriptForDisplay(latest)
+            .ifBlank { liveText.value }
+            .take(definition.outputBudgetChars)
+        if (supervisorDisplayText.isNotBlank()) liveText.value = supervisorDisplayText
+        if (generationError != null) {
+            if (
+                supervisorDisplayText.isBlank() ||
+                !generationError.isRecoverableReportToolArgumentFailure(definition)
+            ) {
+                return SubAgentResult(
+                    status = SubAgentRunStatus.FAILED,
+                    error = generationError.subAgentErrorMessage(),
+                )
+            }
+        }
+
+        latest.pendingApprovalResult()?.let { return it }
+
+        var reportRetryError: Throwable? = null
+        if (!reportCapture.hasReport && generationError == null) {
+            latest = latest + UIMessage.user(
+                """
+                Internal supervisor reminder: call `${SUBAGENT_REPORT_TOOL_NAME}` now with the compact structured result.
+                The report tool is injected directly into this subagent run and may not appear in tools_list/catalog output.
+                Do not repeat the full visible answer; keep any final text short.
+                """.trimIndent()
+            )
+            try {
+                kernel.run(
+                    GenerationRunSession(
+                        settings = generationSettings,
+                    model = model,
+                    messages = latest,
+                    memories = emptyList(),
+                    tools = tools + reportCapture.tool(),
+                    maxSteps = SUBAGENT_REPORT_RETRY_STEPS,
+                    processingStatus = MutableStateFlow("SubAgent ${definition.id} report"),
+                    autoApproveTools = settings.agentRuntime.autoApproveAllToolCalls,
+                    autoApproveHighRiskTools = settings.agentRuntime.autoApproveHighRiskToolCalls,
+                    invocationContext = ToolInvocationContext.SubAgent,
+                    conversation = null,
+                    consumeSteerMessages = consumeSteerMessages,
+                    runId = runId,
+                    onTerminal = onTerminal,
+                    toolLifecycleEvents = events,
+                    executionPolicy = sessionPolicy,
+                    ),
+                ).collect { chunk ->
+                    if (chunk is GenerationChunk.Messages) {
+                        latest = chunk.messages
+                        latest.toLiveParts().also { parts ->
+                            if (parts != liveParts.value) liveParts.value = parts
+                        }
+                    }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                reportRetryError = error
+            }
+        }
+
+        latest.pendingApprovalResult()?.let { return it }
+
+        val finalDisplayText = supervisorDisplayText
+            .ifBlank { renderAssistantTranscriptForDisplay(latest).take(definition.outputBudgetChars) }
+        // Final write to liveText so a sheet opened/refreshed AFTER completion still shows the
+        // human-facing answer. A report-only retry is intentionally not allowed to replace the
+        // user's visible transcript with internal reminder chatter.
+        if (finalDisplayText.isNotBlank()) liveText.value = finalDisplayText
+        latest.toLiveParts().also { parts ->
+            if (parts != liveParts.value) liveParts.value = parts
+        }
+        val result = reportCapture.resultOrFallback(finalDisplayText)
+        val reportError = generationError ?: reportRetryError
+        return if (!reportCapture.hasReport && reportError != null && finalDisplayText.isNotBlank()) {
+            result.copy(
+                risks = result.risks + "Structured subagent report failed; summary was derived from visible text. ${reportError.subAgentErrorMessage()}"
+            )
+        } else {
+            result
+        }
+    }
+
+    private fun List<UIMessage>.pendingApprovalResult(): SubAgentResult? {
+        val pendingTool = lastOrNull()?.getTools()
+            ?.firstOrNull { it.approvalState is ToolApprovalState.Pending }
+            ?: return null
+        return SubAgentResult(
+            status = SubAgentRunStatus.APPROVAL_REQUIRED,
+            summary = "Subagent requested approval for ${pendingTool.toolName}.",
+            risks = listOf("Subagent cannot self-approve sensitive tools."),
+            recommendedNextSteps = listOf("Main agent should decide whether to ask the user for approval in the parent conversation."),
+        )
+    }
+
+    /**
+     * Render an in-flight assistant message for the live-view sheet. Reasoning is shown above
+     * the answer in a Markdown blockquote so the user sees progress during long reasoning
+     * phases (deepseek-v4-pro, gpt-5 high, claude opus etc. can sit in reasoning for many
+     * seconds before producing any visible text).
+     */
+    private fun renderAssistantContentForLive(message: UIMessage): String {
+        val reasoning = message.parts.filterIsInstance<UIMessagePart.Reasoning>()
+            .joinToString("\n") { it.reasoning }
+            .trim()
+        val text = message.parts.filterIsInstance<UIMessagePart.Text>()
+            .joinToString("\n") { it.text }
+            .trim()
+        if (reasoning.isBlank() && text.isBlank()) return ""
+        return buildString {
+            if (reasoning.isNotBlank()) {
+                append("> 💭 ")
+                append(reasoning.replace("\n", "\n> "))
+                if (text.isNotBlank()) append("\n\n")
+            }
+            if (text.isNotBlank()) append(text)
+        }
+    }
+
+    private fun renderAssistantTranscriptForDisplay(messages: List<UIMessage>): String =
+        messages
+            .filter { it.role == MessageRole.ASSISTANT }
+            .map { it.toText().trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .joinToString("\n\n")
+
+    private fun List<UIMessage>.toLiveParts(): List<UIMessagePart> =
+        filter { it.role == MessageRole.ASSISTANT }.flatMap { it.parts }
+
+    private fun Throwable.isRecoverableReportToolArgumentFailure(definition: SubAgentDefinition): Boolean {
+        if (definition.toolAllowlist.isNotEmpty()) return false
+        val lower = subAgentErrorMessage().lowercase()
+        return lower.contains("invalid function arguments json string") &&
+            lower.contains("tool_call")
+    }
+
+    private fun Throwable.subAgentErrorMessage(): String =
+        (message ?: javaClass.simpleName).take(300)
+
+    private fun buildTaskPrompt(definition: SubAgentDefinition, task: SubAgentTaskSpec, previousAnswer: String = ""): String = """
+        You are running as subagent `${definition.id}`.
+
+        Objective:
+        ${task.objective}
+
+        Output format:
+        ${task.outputFormat}
+
+        Tools and sources guidance:
+        ${task.toolsAndSources}
+
+        Boundaries:
+        ${task.boundaries}
+
+        Context from parent:
+        ${task.context.ifBlank { "(none)" }}
+
+        ${if (previousAnswer.isNotBlank()) "Previous final answer of this thread (from an earlier turn):\n$previousAnswer\n" else ""}
+
+        ${historyGrantPrompt(task)}
+
+        Subagent reporting:
+        - Keep writing normal Markdown for the human live panel; do not print JSON or machine-only wrappers.
+        - Before you finish, call `${SUBAGENT_REPORT_TOOL_NAME}` once with the compact result the supervisor should consume: summary, findings, evidence, risks, recommended_next_steps, and confidence.
+        - `${SUBAGENT_REPORT_TOOL_NAME}` is an internal injected tool for this subagent run. It may not appear in tools_list or tool catalog output; use it anyway when you are done.
+        - The report tool is not the human-facing answer. It is the structured channel back to the main agent.
+
+        Return only the useful result for the supervisor. Do not ask the user follow-up questions.
+    """.trimIndent()
+
+    private fun historyGrantPrompt(task: SubAgentTaskSpec): String {
+        if (task.sessionGrantId.isBlank() && task.sourceSessionIds.isEmpty() && task.historyQuery.isBlank()) {
+            return ""
+        }
+        return """
+            Historical session scope:
+            - session_grant_id: ${task.sessionGrantId.ifBlank { "(none)" }}
+            - source_session_ids: ${task.sourceSessionIds.joinToString(", ").ifBlank { "(none)" }}
+            - history_query: ${task.historyQuery.ifBlank { "(none)" }}
+            - shard: ${task.shardIndex + 1}/${task.shardCount.coerceAtLeast(1)}
+
+            When using session_read or session_expand, include the session_grant_id in the tool input.
+            Keep source_message_ids in your evidence whenever the tool returns them.
+        """.trimIndent()
+    }
+}
+
+fun Settings.toIsolatedSubAgentSettings(): Settings = copy(
+    // Keep the subagent on the same provider/model catalog, but remove every
+    // parent-only prompt and extension surface from its generation snapshot.
+    systemPrompt = "",
+    contextMessageSize = 0,
+    streamOutput = true,
+    messageTemplate = "{{ message }}",
+    presetMessages = emptyList(),
+    quickMessages = emptyList(),
+    regexes = emptyList(),
+    mcpServers = emptyList(),
+    enabledMcpServerIds = emptySet(),
+    enabledModeInjectionIds = emptySet(),
+    enabledLorebookIds = emptySet(),
+    enabledSkills = emptySet(),
+    agentRuntime = agentRuntime.copy(
+        enableCoreMemory = false,
+        enableShortTermMemory = false,
+        enableLongTermMemory = false,
+        enableRecentChatsReference = false,
+        enableTimeReminder = false,
+        agentSoulMarkdown = "",
+        generativeUi = agentRuntime.generativeUi.copy(enabled = false),
+        speculativeToolExecution = agentRuntime.speculativeToolExecution.copy(enabled = false),
+    )
+)
+
+private const val SUBAGENT_REPORT_RETRY_STEPS = 2

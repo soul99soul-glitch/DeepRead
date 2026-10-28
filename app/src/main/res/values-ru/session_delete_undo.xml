@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <plurals name="session_home_deleted_count">
+        <item quantity="one">Удалён %d диалог</item>
+        <item quantity="few">Удалено %d диалога</item>
+        <item quantity="many">Удалено %d диалогов</item>
+        <item quantity="other">Удалено %d диалога</item>
+    </plurals>
+    <string name="session_home_undo">Отменить</string>
+    <plurals name="session_home_undo_seconds">
+        <item quantity="one">Осталась %d секунда для отмены</item>
+        <item quantity="few">Осталось %d секунды для отмены</item>
+        <item quantity="many">Осталось %d секунд для отмены</item>
+        <item quantity="other">Осталось %d секунды для отмены</item>
+    </plurals>
+    <string name="session_home_delete_failed_restored">Не удалось удалить диалог. Он восстановлен в списке.</string>
+    <string name="session_home_delete_cleanup_failed">Диалог удалён, но часть данных не удалось очистить.</string>
+    <string name="session_home_delete_unverified">Не удалось проверить удаление. Перезапустите приложение, чтобы проверить диалог.</string>
+</resources>

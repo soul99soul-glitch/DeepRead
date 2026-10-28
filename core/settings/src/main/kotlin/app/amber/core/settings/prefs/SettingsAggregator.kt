@@ -1,0 +1,578 @@
+package app.amber.core.settings.prefs
+
+import android.util.Log
+import androidx.datastore.core.DataStore
+import androidx.datastore.core.IOException
+import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.emptyPreferences
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import app.amber.ai.provider.Model
+import app.amber.ai.provider.OpenAIBrand
+import app.amber.ai.provider.ProviderSetting
+import app.amber.core.infra.AppScope
+import app.amber.core.settings.DEFAULT_AUTO_MODEL_ID
+import app.amber.core.settings.DEFAULT_PROVIDERS
+import app.amber.core.settings.GeminiProviderIdRef
+import app.amber.core.settings.GenerativeUiSetting
+import app.amber.core.settings.OpenAIProviderIdRef
+import app.amber.core.settings.REMOVED_DEFAULT_PROVIDER_IDS
+import app.amber.core.settings.SeedGeminiImageModel
+import app.amber.core.settings.SeedGeminiImageModelId
+import app.amber.core.settings.SeedOpenAIImageModel
+import app.amber.core.settings.SeedOpenAIImageModelId
+import app.amber.core.settings.SeedRoutingQuickMessages
+import app.amber.core.settings.SeedSvgQuickMessageId
+import app.amber.core.settings.AMBER_AGENT_REQUIRED_SKILLS
+import app.amber.core.settings.Settings
+import app.amber.core.infra.PreferencesKeys
+import app.amber.core.settings.secret.SecretRedactor
+import app.amber.core.settings.secret.SecretReference
+import app.amber.core.agent.utils.JsonInstant
+import app.amber.core.settings.withMigratedPromptDefaults
+import kotlin.uuid.Uuid
+
+private const val TAG = "SettingsAggregator"
+
+/**
+ * Decodes the six domains from one committed Preferences snapshot and owns
+ * canonical [Settings] publication, cross-domain consistency and atomic writes.
+ */
+class SettingsAggregator(
+    private val dataStore: DataStore<Preferences>,
+    private val uiPrefs: UIPrefs,
+    private val searchPrefs: SearchPrefs,
+    private val agentPrefs: AgentPrefs,
+    private val providerPrefs: ProviderPrefs,
+    private val chatPrefs: ChatPrefs,
+    private val extensionPrefs: ExtensionPrefs,
+    scope: AppScope,
+    private val secretRedactor: SecretRedactor,
+) {
+
+    private val writeMutex = Mutex()
+    private val _settingsFlow = MutableStateFlow(Settings.dummy())
+    private val readablePreferences = dataStore.data.catch { error ->
+        if (error is IOException) emit(emptyPreferences()) else throw error
+    }
+
+    val settingsFlow: StateFlow<Settings> get() = _settingsFlow
+
+    init {
+        scope.launch {
+            runCatching {
+                readablePreferences.collect {
+                    writeMutex.withLock {
+                        withContext(Dispatchers.Default) {
+                            // A notification may predate an acknowledged update. Read
+                            // the latest durable snapshot and publish under its write lock.
+                            _settingsFlow.value = composeCurrentSettings(readablePreferences.first())
+                        }
+                    }
+                }
+            }.onFailure {
+                if (it is CancellationException) throw it
+                // Preserve the settings collection's existing fatal error contract.
+                it.printStackTrace()
+                Log.e(TAG, "Error while collecting settings flow: ${it.message}", it)
+                Runtime.getRuntime().halt(1)
+            }
+        }
+    }
+
+    /** Atomic write: all settings keys are updated in one [dataStore.edit] block. */
+    suspend fun update(settings: Settings) = writeMutex.withLock {
+        withContext(Dispatchers.IO) {
+            writeSettings(settings)
+        }
+    }
+
+    private suspend fun writeSettings(settings: Settings) {
+        if (settings.init) {
+            Log.w(TAG, "Cannot update dummy settings")
+            return
+        }
+        val settingsForWrite = settings
+            .withMigratedMemoryDreamLegacy()
+            .withMigratedPromptDefaults()
+            .withMigratedGenerativeUiBudget()
+            .normalizeRemovedDisplayFields()
+        var legacyMigrationPending = false
+        dataStore.edit { p ->
+            legacyMigrationPending = hasPendingLegacyAssistantSettings(p)
+            // 保存边界 redaction：明文进 SecretStore，DataStore 只留掩码 + reference。
+            // Legacy secret fields retain plaintext on write failure for compatibility;
+            // MCP OAuth and credential-bearing URLs fail closed in SecretRedactor.
+            val existingRefs = secretRedactor.readRefsStrict(p)
+            val redacted = secretRedactor.redactSettings(
+                providers = settingsForWrite.providers,
+                customHeaders = settingsForWrite.customHeaders,
+                searchServices = settingsForWrite.searchServices,
+                mcpServers = settingsForWrite.mcpServers,
+                webDavConfig = settingsForWrite.webDavConfig,
+                s3Config = settingsForWrite.s3Config,
+                existingRefs = existingRefs,
+            )
+            p[PreferencesKeys.DEVELOPER_MODE] = settings.developerMode
+            p[PreferencesKeys.DISPLAY_SETTING] = JsonInstant.encodeToString(settingsForWrite.displaySetting)
+
+            p[PreferencesKeys.ENABLE_WEB_SEARCH] = settings.enableWebSearch
+            p[PreferencesKeys.FAVORITE_MODELS] = JsonInstant.encodeToString(settings.favoriteModels)
+            p[PreferencesKeys.SELECT_MODEL] = settings.chatModelId.toString()
+            p[PreferencesKeys.TITLE_MODEL] = settings.titleModelId.toString()
+            p[PreferencesKeys.SUGGESTION_MODEL] = settings.suggestionModelId.toString()
+            p[PreferencesKeys.IMAGE_GENERATION_MODEL] = settingsForWrite.imageGenerationModelId.toString()
+            p[PreferencesKeys.TITLE_PROMPT] = settings.titlePrompt
+            p[PreferencesKeys.SUGGESTION_PROMPT] = settings.suggestionPrompt
+            p[PreferencesKeys.OCR_MODEL] = settings.ocrModelId.toString()
+            p[PreferencesKeys.OCR_PROMPT] = settings.ocrPrompt
+            p[PreferencesKeys.COMPRESS_MODEL] = settings.compressModelId.toString()
+            p[PreferencesKeys.COMPRESS_PROMPT] = settings.compressPrompt
+            p[PreferencesKeys.MODEL_GROUP_SESSION_DEFAULTS] =
+                JsonInstant.encodeToString(settings.modelGroupSessionDefaults)
+
+            p[PreferencesKeys.PROVIDERS] = JsonInstant.encodeToString(redacted.providers)
+
+            p[PreferencesKeys.AMBER_SYSTEM_PROMPT] = settingsForWrite.systemPrompt
+            settingsForWrite.temperature?.let { p[PreferencesKeys.AMBER_TEMPERATURE] = it.toString() }
+                ?: p.remove(PreferencesKeys.AMBER_TEMPERATURE)
+            settingsForWrite.topP?.let { p[PreferencesKeys.AMBER_TOP_P] = it.toString() }
+                ?: p.remove(PreferencesKeys.AMBER_TOP_P)
+            p[PreferencesKeys.AMBER_CONTEXT_MESSAGE_SIZE] = settingsForWrite.contextMessageSize
+            p[PreferencesKeys.AMBER_STREAM_OUTPUT] = settingsForWrite.streamOutput
+            p[PreferencesKeys.AMBER_MESSAGE_TEMPLATE] = settingsForWrite.messageTemplate
+            p[PreferencesKeys.AMBER_PRESET_MESSAGES] = JsonInstant.encodeToString(settingsForWrite.presetMessages)
+            p[PreferencesKeys.AMBER_REGEXES] = JsonInstant.encodeToString(settingsForWrite.regexes)
+            p[PreferencesKeys.AMBER_REASONING_LEVEL] = JsonInstant.encodeToString(settingsForWrite.reasoningLevel)
+            settingsForWrite.maxTokens?.let { p[PreferencesKeys.AMBER_MAX_TOKENS] = it }
+                ?: p.remove(PreferencesKeys.AMBER_MAX_TOKENS)
+            p[PreferencesKeys.AMBER_CUSTOM_HEADERS] = JsonInstant.encodeToString(redacted.customHeaders)
+            p[PreferencesKeys.AMBER_CUSTOM_BODIES] = JsonInstant.encodeToString(settingsForWrite.customBodies)
+            p[PreferencesKeys.AMBER_REMEMBERED_REASONING_LEVELS] =
+                JsonInstant.encodeToString(settingsForWrite.rememberedReasoningLevelsByModelId)
+
+            p[PreferencesKeys.SEARCH_SERVICES] = JsonInstant.encodeToString(redacted.searchServices)
+            p[PreferencesKeys.SEARCH_COMMON] =
+                JsonInstant.encodeToString(
+                    settings.searchCommonOptions.copy(
+                        resultSize = settings.searchCommonOptions.resultSize.coerceIn(1, 30)
+                    )
+                )
+            p[PreferencesKeys.SEARCH_SELECTED] = if (settings.searchServices.isEmpty()) {
+                0
+            } else {
+                settings.searchServiceSelected.coerceIn(0, settings.searchServices.lastIndex)
+            }
+            p[PreferencesKeys.SEARCH_ENABLED_SERVICE_IDS] = JsonInstant.encodeToString(
+                settings.searchEnabledServiceIds.filter { id ->
+                    settings.searchServices.any { service -> service.id == id }
+                }
+            )
+            p[PreferencesKeys.SEARCH_BUILTIN_DUCKDUCKGO_ENABLED] =
+                settings.searchBuiltinDuckDuckGoEnabled
+            p[PreferencesKeys.SEARCH_BUILTIN_BING_ENABLED] = settings.searchBuiltinBingEnabled
+            p[PreferencesKeys.SEARCH_BUILTIN_JINA_ENABLED] = settings.searchBuiltinJinaEnabled
+            p[PreferencesKeys.SEARCH_BUILTIN_WIKIPEDIA_ENABLED] =
+                settings.searchBuiltinWikipediaEnabled
+            p[PreferencesKeys.SEARCH_BUILTIN_HACKERNEWS_ENABLED] =
+                settings.searchBuiltinHackerNewsEnabled
+            p[PreferencesKeys.SEARCH_GOOGLE_WEBVIEW_FALLBACK_ENABLED] =
+                settings.searchGoogleWebViewFallbackEnabled
+
+            p[PreferencesKeys.MCP_SERVERS] = JsonInstant.encodeToString(redacted.mcpServers)
+            p[PreferencesKeys.WEBDAV_CONFIG] = JsonInstant.encodeToString(redacted.webDavConfig)
+            p[PreferencesKeys.S3_CONFIG] = JsonInstant.encodeToString(redacted.s3Config)
+            p[PreferencesKeys.MODE_INJECTIONS] = JsonInstant.encodeToString(settings.modeInjections)
+            p[PreferencesKeys.LOREBOOKS] = JsonInstant.encodeToString(settings.lorebooks)
+            p[PreferencesKeys.QUICK_MESSAGES] = JsonInstant.encodeToString(settings.quickMessages)
+            p[PreferencesKeys.AMBER_ENABLED_SKILLS] = JsonInstant.encodeToString(settingsForWrite.enabledSkills)
+            p[PreferencesKeys.AMBER_ENABLED_MCP_SERVER_IDS] =
+                JsonInstant.encodeToString(settingsForWrite.enabledMcpServerIds)
+            p[PreferencesKeys.AMBER_ENABLED_MODE_INJECTION_IDS] =
+                JsonInstant.encodeToString(settingsForWrite.enabledModeInjectionIds)
+            p[PreferencesKeys.AMBER_ENABLED_LOREBOOK_IDS] =
+                JsonInstant.encodeToString(settingsForWrite.enabledLorebookIds)
+            p[PreferencesKeys.AGENT_RUNTIME] = JsonInstant.encodeToString(settingsForWrite.agentRuntime)
+            p[PreferencesKeys.JEV] = JsonInstant.encodeToString(settingsForWrite.jev)
+            p[PreferencesKeys.BACKUP_REMINDER_CONFIG] =
+                JsonInstant.encodeToString(settings.backupReminderConfig)
+            p[PreferencesKeys.SYNC_SETTINGS] = JsonInstant.encodeToString(settings.syncSettings)
+            p[PreferencesKeys.LAUNCH_COUNT] = settings.launchCount
+            p[PreferencesKeys.SPONSOR_ALERT_DISMISSED_AT] = settings.sponsorAlertDismissedAt
+            // A failed legacy migration leaves these keys as the retry marker. Keep their
+            // refs and payload intact while allowing ordinary direct settings to update.
+            if (legacyMigrationPending) {
+                secretRedactor.writeRefs(p, existingRefs + redacted.refs)
+            } else {
+                secretRedactor.writeRefs(p, redacted.refs)
+                p.remove(PreferencesKeys.AMBER_PROFILE)
+                p.remove(PreferencesKeys.LEGACY_SELECTED_ASSISTANT)
+                p.remove(PreferencesKeys.LEGACY_ASSISTANTS)
+                p.remove(PreferencesKeys.LEGACY_ASSISTANT_TAGS)
+            }
+            if (settings.imageModelsSeededVersion > 0) {
+                p[PreferencesKeys.SEEDED_IMAGE_MODELS_V1] = true
+            }
+            if (settings.routingQuickMessagesSeededVersion > 0) {
+                p[PreferencesKeys.SEEDED_ROUTING_QUICK_MESSAGES_V1] = true
+            }
+        }
+        // Publish the same canonical projection as the collector before
+        // acknowledging the write, while still holding writeMutex.
+        _settingsFlow.value = readCurrentSettings()
+        // Do not sweep while the legacy profile/list still signals a migration retry.
+        if (!legacyMigrationPending) {
+            val activeRefs = dataStore.data.first().let { secretRedactor.readRefsStrict(it) }
+            secretRedactor.deleteOrphans(activeRefs.values.map { it.descriptor() }.toSet())
+        }
+    }
+
+    private suspend fun readCurrentSettings(): Settings = composeCurrentSettings(dataStore.data.first())
+
+    private fun composeCurrentSettings(preferences: Preferences): Settings =
+        applyCrossDomainConsistency(
+            applyBackfillAndSeed(
+                composeRawSettings(
+                    ui = uiPrefs.readFrom(preferences),
+                    search = searchPrefs.readFrom(preferences),
+                    agent = agentPrefs.readFrom(preferences),
+                    provider = providerPrefs.readFrom(preferences),
+                    chat = chatPrefs.readFrom(preferences),
+                    ext = extensionPrefs.readFrom(preferences),
+                )
+            )
+        )
+
+    /**
+     * 恢复路径专用：把备份携带的 reference 写回 DataStore，
+     * 使恢复出的掩码值能通过 redact keep 规则找回本机 secret（备份不含明文）。
+     */
+    suspend fun restoreSecretRefs(refs: List<SecretReference>) = writeMutex.withLock {
+        if (refs.isEmpty()) return@withLock
+        withContext(Dispatchers.IO) {
+            dataStore.edit { p ->
+                val merged = secretRedactor.readRefsStrict(p) + refs.associateBy { it.descriptor().key }
+                secretRedactor.writeRefs(p, merged)
+            }
+            _settingsFlow.value = readCurrentSettings()
+        }
+    }
+
+    suspend fun update(fn: (Settings) -> Settings) = writeMutex.withLock {
+        withContext(Dispatchers.IO) {
+            // Keep the original dummy gate during cold start. Once the
+            // canonical flow is initialized, read the persisted Preferences
+            // directly so a delayed raw-flow projection cannot drop fields.
+            val current = settingsFlow.value
+            val persisted = if (current.init) current else readCurrentSettings()
+            writeSettings(fn(persisted))
+        }
+    }
+
+    suspend fun updateLaunchCount(launchCount: Int) = writeMutex.withLock {
+        withContext(Dispatchers.IO) {
+            dataStore.edit { p ->
+                p[PreferencesKeys.LAUNCH_COUNT] = launchCount
+            }
+            _settingsFlow.value = readCurrentSettings()
+        }
+    }
+
+}
+
+private fun hasPendingLegacyAssistantSettings(p: Preferences): Boolean =
+    p[PreferencesKeys.AMBER_PROFILE] != null ||
+        p[PreferencesKeys.LEGACY_SELECTED_ASSISTANT] != null ||
+        p[PreferencesKeys.LEGACY_ASSISTANTS] != null ||
+        p[PreferencesKeys.LEGACY_ASSISTANT_TAGS] != null
+
+/**
+ * Assembles [Settings] from the six domain snapshots. Cross-domain cleanup
+ * is applied by [applyCrossDomainConsistency] after assembly.
+ */
+internal fun composeRawSettings(
+    ui: UIPrefsData,
+    search: SearchPrefsData,
+    agent: AgentPrefsData,
+    provider: ProviderPrefsData,
+    chat: ChatPrefsData,
+    ext: ExtensionPrefsData,
+): Settings = Settings(
+    init = false,
+    developerMode = ui.developerMode,
+    displaySetting = ui.displaySetting,
+    launchCount = ui.launchCount,
+    sponsorAlertDismissedAt = ui.sponsorAlertDismissedAt,
+
+    enableWebSearch = chat.enableWebSearch && !search.retiredServiceRequiresReconfiguration,
+    favoriteModels = chat.favoriteModels,
+    chatModelId = chat.chatModelId,
+    titleModelId = chat.titleModelId,
+    suggestionModelId = chat.suggestionModelId,
+    imageGenerationModelId = chat.imageGenerationModelId,
+    titlePrompt = chat.titlePrompt,
+    suggestionPrompt = chat.suggestionPrompt,
+    ocrModelId = chat.ocrModelId,
+    ocrPrompt = chat.ocrPrompt,
+    compressModelId = chat.compressModelId,
+    compressPrompt = chat.compressPrompt,
+    modelGroupSessionDefaults = chat.modelGroupSessionDefaults,
+
+    providers = provider.providers,
+    imageModelsSeededVersion = provider.imageModelsSeededVersion,
+    systemPrompt = chat.systemPrompt,
+    temperature = chat.temperature,
+    topP = chat.topP,
+    contextMessageSize = chat.contextMessageSize,
+    streamOutput = chat.streamOutput,
+    messageTemplate = chat.messageTemplate,
+    presetMessages = chat.presetMessages,
+    regexes = chat.regexes,
+    reasoningLevel = chat.reasoningLevel,
+    maxTokens = chat.maxTokens,
+    customHeaders = chat.customHeaders,
+    customBodies = chat.customBodies,
+    rememberedReasoningLevelsByModelId = chat.rememberedReasoningLevelsByModelId,
+
+    searchServices = search.searchServices,
+    searchCommonOptions = search.searchCommonOptions,
+    searchServiceSelected = search.searchServiceSelected,
+    searchEnabledServiceIds = search.searchEnabledServiceIds,
+    searchBuiltinDuckDuckGoEnabled = search.searchBuiltinDuckDuckGoEnabled,
+    searchBuiltinBingEnabled = search.searchBuiltinBingEnabled,
+    searchBuiltinJinaEnabled = search.searchBuiltinJinaEnabled,
+    searchBuiltinWikipediaEnabled = search.searchBuiltinWikipediaEnabled,
+    searchBuiltinHackerNewsEnabled = search.searchBuiltinHackerNewsEnabled,
+    searchGoogleWebViewFallbackEnabled = search.searchGoogleWebViewFallbackEnabled,
+
+    agentRuntime = agent.agentRuntime,
+    jev = agent.jev,
+
+    mcpServers = ext.mcpServers,
+    webDavConfig = ext.webDavConfig,
+    s3Config = ext.s3Config,
+    modeInjections = ext.modeInjections,
+    lorebooks = ext.lorebooks,
+    quickMessages = ext.quickMessages,
+    enabledSkills = ext.enabledSkills,
+    enabledMcpServerIds = ext.enabledMcpServerIds,
+    enabledModeInjectionIds = ext.enabledModeInjectionIds,
+    enabledLorebookIds = ext.enabledLorebookIds,
+    backupReminderConfig = ext.backupReminderConfig,
+    syncSettings = ext.syncSettings,
+    routingQuickMessagesSeededVersion = ext.routingQuickMessagesSeededVersion,
+)
+
+/**
+ * Applies per-load backfill, seeding and branding:
+ * - Remove deprecated providers (REMOVED_DEFAULT_PROVIDER_IDS)
+ * - Sync built-in provider metadata (description / shortDescription / brand)
+ * - Seed gpt-image-2 / nano-banana-2 (gated by imageModelsSeededVersion < 1)
+ * - Seed routing quick messages (/draw /svg /diagram /slide) into the global pool
+ * - Apply the fixed Amber required skills
+ * - Flip both seed version flags to 1 once seeding done
+ */
+internal fun applyBackfillAndSeed(it: Settings): Settings {
+    val normalized = it.copy(enabledSkills = it.enabledSkills + AMBER_AGENT_REQUIRED_SKILLS)
+    val shouldSeedImageModels = normalized.imageModelsSeededVersion < 1
+    val providers = normalized.providers
+        .filterNot { provider -> provider.id in REMOVED_DEFAULT_PROVIDER_IDS }
+        .map { provider ->
+            val defaultProvider = DEFAULT_PROVIDERS.find { dp -> dp.id == provider.id }
+            if (defaultProvider != null) {
+                val withMeta = provider.copyProvider(
+                    builtIn = defaultProvider.builtIn,
+                    description = defaultProvider.description,
+                    shortDescription = defaultProvider.shortDescription,
+                )
+                val withBrand = if (
+                    withMeta is ProviderSetting.OpenAI &&
+                    defaultProvider is ProviderSetting.OpenAI &&
+                    withMeta.brand == OpenAIBrand.GENERIC &&
+                    defaultProvider.brand != OpenAIBrand.GENERIC
+                ) {
+                    withMeta.copy(brand = defaultProvider.brand)
+                } else {
+                    withMeta
+                }
+                if (!shouldSeedImageModels) withBrand
+                else when {
+                    withBrand is ProviderSetting.OpenAI &&
+                        withBrand.id == OpenAIProviderIdRef &&
+                        withBrand.models.none { m ->
+                            m.id == SeedOpenAIImageModelId || m.modelId == SeedOpenAIImageModel.modelId
+                        } -> {
+                        withBrand.copy(models = withBrand.models + SeedOpenAIImageModel)
+                    }
+                    withBrand is ProviderSetting.Google &&
+                        withBrand.id == GeminiProviderIdRef &&
+                        withBrand.models.none { m ->
+                            m.id == SeedGeminiImageModelId || m.modelId == SeedGeminiImageModel.modelId
+                        } -> {
+                        withBrand.copy(models = withBrand.models + SeedGeminiImageModel)
+                    }
+                    else -> withBrand
+                }
+            } else provider
+        }
+    val routingQuickMessagesToSeed = SeedRoutingQuickMessages.filter { qm ->
+        normalized.routingQuickMessagesSeededVersion < if (qm.id == SeedSvgQuickMessageId) 2 else 1
+    }
+    val shouldSeedRoutingQuickMessages = routingQuickMessagesToSeed.isNotEmpty()
+    val nextQuickMessages = if (shouldSeedRoutingQuickMessages) {
+        val existingIds = normalized.quickMessages.map { qm -> qm.id }.toSet()
+        normalized.quickMessages + routingQuickMessagesToSeed.filter { qm -> qm.id !in existingIds }
+    } else normalized.quickMessages
+    return normalized.copy(
+        providers = providers,
+        quickMessages = nextQuickMessages,
+        imageModelsSeededVersion = if (shouldSeedImageModels) 1 else normalized.imageModelsSeededVersion,
+        routingQuickMessagesSeededVersion =
+            if (shouldSeedRoutingQuickMessages) 2 else normalized.routingQuickMessagesSeededVersion,
+    )
+}
+
+/**
+ * Applies cross-domain consistency:
+ * - Dedup providers (by id) and dedup their models (by id)
+ * - Filter stale enabled MCP/mode-injection/lorebook references
+ * - Filter favoriteModels — only models that still exist in providers survive
+ * - Reset dangling chat/title/suggestion/imageGeneration/ocr/compress model ids
+ *   to DEFAULT_AUTO_MODEL_ID (same reason as favoriteModels: the provider or
+ *   model was deleted and the runtime would fail with "Provider not found")
+ * - Trim trailing slashes from provider baseUrls (OpenAI-style callers
+ *   concatenate baseUrl + path; also inside model providerOverwrite)
+ * - Filter searchEnabledServiceIds — only services that still exist survive
+ * - Dedup modeInjections / lorebooks / quickMessages (by id)
+ * - Normalize display fields whose settings controls were removed
+ */
+internal fun applyCrossDomainConsistency(settings: Settings): Settings {
+    val migratedSettings = settings
+        .withMigratedMemoryDreamLegacy()
+        .withMigratedPromptDefaults()
+        .withMigratedGenerativeUiBudget()
+        .normalizeRemovedDisplayFields()
+    val validMcpServerIds = migratedSettings.mcpServers.map { it.id }.toSet()
+    val validModeInjectionIds = migratedSettings.modeInjections.map { it.id }.toSet()
+    val validLorebookIds = migratedSettings.lorebooks.map { it.id }.toSet()
+    // 悬空模型选择自愈为“自动”：删 provider 后 chatModelId 等仍指向不存在的模型，
+    // 运行时会 Provider not found（与 favoriteModels 的过滤同因）。
+    val modelIds = migratedSettings.providers.flatMap { it.models }.map { m -> m.id }.toSet()
+    fun Uuid.orAutoModelId(): Uuid =
+        if (this != DEFAULT_AUTO_MODEL_ID && this !in modelIds) DEFAULT_AUTO_MODEL_ID else this
+    // Empty enabled IDs are an explicit user choice. SearchPrefs alone can
+    // distinguish a legacy missing key and migrate the selected service.
+    val cleanedSearchSelected = if (migratedSettings.searchServices.isEmpty()) {
+        0
+    } else {
+        migratedSettings.searchServiceSelected.coerceIn(0, migratedSettings.searchServices.lastIndex)
+    }
+    val cleanedSearchEnabledIds = migratedSettings.searchEnabledServiceIds
+        .filter { id -> migratedSettings.searchServices.any { service -> service.id == id } }
+    return migratedSettings.copy(
+        searchServiceSelected = cleanedSearchSelected,
+        searchEnabledServiceIds = cleanedSearchEnabledIds,
+        providers = migratedSettings.providers.distinctBy { it.id }.map { provider ->
+            when (provider) {
+                is ProviderSetting.OpenAI -> provider.copy(
+                    baseUrl = provider.baseUrl.normalizedBaseUrl(),
+                    models = provider.models
+                        .distinctBy { model -> model.id }
+                        .map { model -> model.withNormalizedOverwriteBaseUrl() },
+                )
+
+                is ProviderSetting.Google -> provider.copy(
+                    baseUrl = provider.baseUrl.normalizedBaseUrl(),
+                    models = provider.models
+                        .distinctBy { model -> model.id }
+                        .map { model -> model.withNormalizedOverwriteBaseUrl() },
+                )
+
+                is ProviderSetting.Claude -> provider.copy(
+                    baseUrl = provider.baseUrl.normalizedBaseUrl(),
+                    models = provider.models
+                        .distinctBy { model -> model.id }
+                        .map { model -> model.withNormalizedOverwriteBaseUrl() },
+                )
+            }
+        },
+        enabledMcpServerIds = migratedSettings.enabledMcpServerIds.filter { it in validMcpServerIds }.toSet(),
+        enabledModeInjectionIds = migratedSettings.enabledModeInjectionIds.filter { it in validModeInjectionIds }.toSet(),
+        enabledLorebookIds = migratedSettings.enabledLorebookIds.filter { it in validLorebookIds }.toSet(),
+        chatModelId = migratedSettings.chatModelId.orAutoModelId(),
+        titleModelId = migratedSettings.titleModelId.orAutoModelId(),
+        suggestionModelId = migratedSettings.suggestionModelId.orAutoModelId(),
+        imageGenerationModelId = migratedSettings.imageGenerationModelId.orAutoModelId(),
+        ocrModelId = migratedSettings.ocrModelId.orAutoModelId(),
+        compressModelId = migratedSettings.compressModelId.orAutoModelId(),
+        favoriteModels = migratedSettings.favoriteModels.filter { uuid ->
+            migratedSettings.providers.flatMap { it.models }.any { m -> m.id == uuid }
+        },
+        modeInjections = migratedSettings.modeInjections.distinctBy { it.id },
+        lorebooks = migratedSettings.lorebooks.distinctBy { it.id },
+        quickMessages = migratedSettings.quickMessages.distinctBy { it.id },
+    )
+}
+
+/**
+ * OpenAI 系裸拼接 baseUrl + path（OpenAIProvider.kt:109 `"$baseUrl/models"`），尾斜杠会产生 `//models`；
+ * 只归一尾部斜杠，不碰 chatCompletionsPath。模型内嵌 providerOverwrite 同样生效。
+ */
+private fun String.normalizedBaseUrl(): String = trim().trimEnd('/')
+
+private fun Model.withNormalizedOverwriteBaseUrl(): Model =
+    copy(providerOverwrite = providerOverwrite?.withNormalizedBaseUrl())
+
+private fun ProviderSetting.withNormalizedBaseUrl(): ProviderSetting = when (this) {
+    is ProviderSetting.OpenAI -> copy(baseUrl = baseUrl.normalizedBaseUrl())
+    is ProviderSetting.Google -> copy(baseUrl = baseUrl.normalizedBaseUrl())
+    is ProviderSetting.Claude -> copy(baseUrl = baseUrl.normalizedBaseUrl())
+}
+
+/** Keep the two display switches removed from the settings UI canonical on both read and write. */
+private fun Settings.normalizeRemovedDisplayFields(): Settings = copy(
+    displaySetting = displaySetting.copy(
+        autoCloseThinking = true,
+        enableLatexRendering = true,
+    ),
+)
+
+/**
+ * maxWidgetCodeChars ships persisted (JsonInstant encodeDefaults) at the old
+ * 12k default; animated SVG widgets need the new 20k headroom. Only lift the
+ * legacy default — a deliberately customized value is left alone.
+ */
+private fun Settings.withMigratedGenerativeUiBudget(): Settings {
+    val generativeUi = agentRuntime.generativeUi
+    if (generativeUi.maxWidgetCodeChars != LEGACY_WIDGET_CODE_CHARS) return this
+    return copy(
+        agentRuntime = agentRuntime.copy(
+            generativeUi = generativeUi.copy(maxWidgetCodeChars = GenerativeUiSetting().maxWidgetCodeChars),
+        )
+    )
+}
+
+private const val LEGACY_WIDGET_CODE_CHARS = 12_000
+
+private fun Settings.withMigratedMemoryDreamLegacy(): Settings {
+    val worker = agentRuntime.memoryWorker
+    if (!worker.dreamEnabled) return this
+    return copy(
+        agentRuntime = agentRuntime.copy(
+            memoryWorker = worker.copy(
+                dreamModelEnabled = worker.dreamModelEnabled || worker.dreamEnabled,
+                dreamEnabled = false,
+            )
+        )
+    )
+}

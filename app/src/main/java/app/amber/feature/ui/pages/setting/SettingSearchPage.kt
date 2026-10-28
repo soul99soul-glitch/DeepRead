@@ -1,0 +1,249 @@
+package app.amber.feature.ui.pages.setting
+
+import app.amber.core.ai.tools.SearchOrchestrator
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.consumeWindowInsets
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.launch
+import com.composables.icons.lucide.Lucide
+import com.composables.icons.lucide.Plus
+import app.amber.agent.R
+import app.amber.feature.ui.components.ds.amberCanvas
+import app.amber.feature.ui.components.nav.BackButton
+import app.amber.feature.ui.components.ui.WorkspaceTopBar
+import app.amber.feature.ui.components.ui.workspaceColors
+import app.amber.search.SearchServiceOptions
+import org.koin.androidx.compose.koinViewModel
+
+@Composable
+fun SettingSearchPage(vm: SettingVM = koinViewModel()) {
+    val settings by vm.settings.collectAsStateWithLifecycle()
+    val scrollBehavior = TopAppBarDefaults.pinnedScrollBehavior()
+    val lazyListState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
+    var editingService by remember { mutableStateOf<SearchServiceEditorTarget?>(null) }
+
+    Scaffold(
+        topBar = {
+            WorkspaceTopBar(
+                title = stringResource(R.string.setting_page_search_title),
+                navigationIcon = { BackButton() },
+                actions = {
+                    IconButton(
+                        onClick = {
+                            editingService = SearchServiceEditorTarget(
+                                index = null,
+                                service = SearchServiceOptions.BingLocalOptions(),
+                            )
+                        }
+                    ) {
+                        Icon(
+                            imageVector = Lucide.Plus,
+                            contentDescription = stringResource(R.string.setting_page_search_add_provider),
+                        )
+                    }
+                },
+                scrollBehavior = scrollBehavior,
+            )
+        },
+        modifier = Modifier
+            .nestedScroll(scrollBehavior.nestedScrollConnection)
+            .amberCanvas(),
+        containerColor = androidx.compose.ui.graphics.Color.Transparent,
+    ) { contentPadding ->
+        fun moveSearchService(fromIndex: Int, toIndex: Int) {
+            if (fromIndex !in settings.searchServices.indices || toIndex !in settings.searchServices.indices) return
+            vm.updateSettings { current ->
+                val selectedServiceId = current.searchServices.getOrNull(current.searchServiceSelected)?.id
+                val newServices = current.searchServices.toMutableList().apply {
+                    add(toIndex, removeAt(fromIndex))
+                }
+                current.copy(
+                    searchServices = newServices,
+                    searchServiceSelected = resolveSelectedSearchIndex(newServices, selectedServiceId),
+                )
+            }
+        }
+
+        fun deleteSearchService(target: SearchServiceEditorTarget) {
+            if (target.index == null || settings.searchServices.size <= 1) return
+            vm.updateSettings { current ->
+                val currentIndex = current.searchServices.indexOfFirst { it.id == target.service.id }
+                    .takeIf { it >= 0 }
+                    ?: target.index
+                if (currentIndex !in current.searchServices.indices) return@updateSettings current
+                val selectedServiceId = current.searchServices.getOrNull(current.searchServiceSelected)?.id
+                val newServices = current.searchServices.toMutableList()
+                val deleted = newServices.removeAt(currentIndex)
+                current.copy(
+                    searchServices = newServices,
+                    searchServiceSelected = resolveSelectedSearchIndex(
+                        services = newServices,
+                        selectedServiceId = selectedServiceId.takeUnless { it == deleted.id },
+                    ),
+                    searchEnabledServiceIds = current.searchEnabledServiceIds.filterNot { it == deleted.id },
+                )
+            }
+        }
+
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(contentPadding)
+                .consumeWindowInsets(contentPadding)
+                .imePadding(),
+            contentPadding = PaddingValues(horizontal = SettingPageHorizontalInset, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            state = lazyListState,
+        ) {
+            item("agent_search_enable") {
+                SearchHeroCard(
+                    enabled = settings.enableWebSearch,
+                    enabledCount = settings.searchServices.count { it.id in settings.searchEnabledServiceIds } +
+                        listOf(
+                            SearchOrchestrator.freeAggregateEnabled(settings),
+                            settings.searchBuiltinJinaEnabled,
+                            settings.searchGoogleWebViewFallbackEnabled,
+                        ).count { it },
+                    serviceCount = settings.searchServices.size + 3,
+                    onCheckedChange = { enabled ->
+                        vm.updateSettings { current -> current.copy(enableWebSearch = enabled) }
+                    },
+                )
+            }
+
+            item("service_list") {
+                SearchServiceListCard(
+                    freeAggregateEnabled = SearchOrchestrator.freeAggregateEnabled(settings),
+                    jinaEnabled = settings.searchBuiltinJinaEnabled,
+                    googleWebViewFallbackEnabled = settings.searchGoogleWebViewFallbackEnabled,
+                    onFreeAggregateEnabledChange = { enabled ->
+                        vm.updateSettings { current ->
+                            current.copy(searchBuiltinDuckDuckGoEnabled = enabled, searchBuiltinBingEnabled = enabled)
+                        }
+                    },
+                    onJinaEnabledChange = { enabled ->
+                        vm.updateSettings { current -> current.copy(searchBuiltinJinaEnabled = enabled) }
+                    },
+                    onGoogleWebViewFallbackEnabledChange = { enabled ->
+                        vm.updateSettings { current -> current.copy(searchGoogleWebViewFallbackEnabled = enabled) }
+                    },
+                    services = settings.searchServices,
+                    enabledServiceIds = settings.searchEnabledServiceIds,
+                    onServiceMove = ::moveSearchService,
+                    onServiceEnabledChange = { service, enabled ->
+                        vm.updateSettings { current ->
+                            val enabledIds = if (enabled) {
+                                (current.searchEnabledServiceIds + service.id).distinct()
+                            } else {
+                                current.searchEnabledServiceIds.filterNot { it == service.id }
+                            }
+                            current.copy(searchEnabledServiceIds = enabledIds)
+                        }
+                    },
+                    onEditService = { service ->
+                        editingService = SearchServiceEditorTarget(
+                            index = settings.searchServices.indexOfFirst { it.id == service.id },
+                            service = service,
+                        )
+                    },
+                )
+            }
+
+            item("common_options") {
+                SearchCommonOptionsCard(
+                    settings = settings,
+                    onUpdate = { options ->
+                        vm.updateSettings { current -> current.copy(searchCommonOptions = options) }
+                    },
+                )
+            }
+
+            item("recommended_search_sets") {
+                SearchRecommendationFooter()
+            }
+        }
+
+        editingService?.let { target ->
+            SearchServiceEditorSheet(
+                title = if (target.index == null) {
+                    stringResource(R.string.setting_page_search_add_provider)
+                } else {
+                    stringResource(R.string.edit)
+                },
+                confirmText = if (target.index == null) {
+                    stringResource(R.string.setting_page_search_add_provider)
+                } else {
+                    stringResource(R.string.chat_page_save)
+                },
+                initialService = target.service,
+                onDismiss = {
+                    editingService = null
+                },
+                onDelete = if (target.index != null && settings.searchServices.size > 1) {
+                    {
+                        deleteSearchService(target)
+                        editingService = null
+                    }
+                } else {
+                    null
+                },
+                onConfirm = { updatedService ->
+                    if (target.index == null) {
+                        vm.updateSettings { current ->
+                            current.copy(
+                                searchServices = listOf(updatedService) + current.searchServices,
+                                searchEnabledServiceIds = (listOf(updatedService.id) + current.searchEnabledServiceIds).distinct(),
+                                searchServiceSelected = 0,
+                            )
+                        }
+                        scope.launch {
+                            lazyListState.animateScrollToItem(1)
+                        }
+                    } else {
+                        vm.updateSettings { current ->
+                            val currentIndex = current.searchServices.indexOfFirst { it.id == target.service.id }
+                                .takeIf { it >= 0 }
+                                ?: target.index
+                            if (currentIndex !in current.searchServices.indices) return@updateSettings current
+                            val oldService = current.searchServices[currentIndex]
+                            val wasEnabled = oldService.id in current.searchEnabledServiceIds
+                            val newServices = current.searchServices.toMutableList()
+                            newServices[currentIndex] = updatedService
+                            val enabledIds = if (wasEnabled) {
+                                current.searchEnabledServiceIds.filterNot { it == oldService.id } + updatedService.id
+                            } else {
+                                current.searchEnabledServiceIds
+                            }
+                            current.copy(
+                                searchServices = newServices,
+                                searchEnabledServiceIds = enabledIds.distinct(),
+                            )
+                        }
+                    }
+                    editingService = null
+                },
+            )
+        }
+    }
+}

@@ -1,0 +1,275 @@
+package app.amber.feature.ui.components.ds
+
+import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.keyframes
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.dropShadow
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.shadow.Shadow
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.DpOffset
+import androidx.compose.ui.unit.dp
+import app.amber.feature.ui.theme.LocalAmberTokens
+import app.amber.feature.ui.theme.LocalAmberType
+import app.amber.feature.ui.theme.LocalThemeDesign
+
+/**
+ * Amber · "Terminal × Modern" design-system primitives. Stateless, token-driven building blocks
+ * (oc-amber.css §6.1 + design §6.2). All read [LocalAmberTokens] / [LocalAmberType]; never a raw hex.
+ */
+
+/**
+ * Shared timings for high-frequency controls (segmented options, press scale).
+ * Instant feedback 100–140ms with a strong ease-out; default springs settle too slowly.
+ */
+internal object AmberFeedback {
+    const val PressMs = 100
+    const val PressDownMs = 50
+    const val OptionMs = 140
+    val EaseOut = CubicBezierEasing(0.23f, 1f, 0.32f, 1f)
+}
+
+/** Press feedback: scale(.975) on press. Add to every tappable control (design §5 `.pressable`). */
+@Composable
+fun Modifier.pressable(
+    onClick: () -> Unit,
+    enabled: Boolean = true,
+    role: Role? = Role.Button,
+): Modifier {
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val scale by animateFloatAsState(
+        if (pressed) 0.975f else 1f,
+        animationSpec = tween(
+            durationMillis = if (pressed) AmberFeedback.PressDownMs else AmberFeedback.PressMs,
+            easing = AmberFeedback.EaseOut,
+        ),
+        label = "pressable",
+    )
+    return this
+        .graphicsLayer { scaleX = scale; scaleY = scale }
+        .clickable(
+            interactionSource = interaction,
+            indication = null,
+            enabled = enabled,
+            role = role,
+            onClick = onClick,
+        )
+}
+
+/** Default container: surface + hairline + 14dp radius (oc-amber `.card`). */
+@Composable
+fun AmberCard(
+    modifier: Modifier = Modifier,
+    containerColor: Color? = null,
+    borderColor: Color? = null,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    val t = LocalAmberTokens.current
+    val components = LocalThemeDesign.current?.components
+    val radius = components?.cardRadius?.toFloat()?.dp ?: 14.dp
+    val borderWidth = components?.borderWidth?.toFloat()?.dp ?: 1.dp
+    val shadowRadius = components?.shadowRadius?.toFloat()?.dp ?: 0.dp
+    val shadowOpacity = components?.shadowOpacity?.toFloat() ?: 0f
+    val shape = RoundedCornerShape(radius)
+    val shadowModifier = if (shadowOpacity > 0f) {
+        modifier.dropShadow(
+            shape = shape,
+            shadow = Shadow(
+                radius = shadowRadius,
+                color = Color.Black.copy(alpha = shadowOpacity),
+                offset = DpOffset(0.dp, shadowRadius * 0.5f),
+            ),
+        )
+    } else {
+        modifier
+    }
+    Column(
+        shadowModifier
+            .clip(shape)
+            .background(containerColor ?: t.surface)
+            .then(
+                if (borderWidth > 0.dp) Modifier.border(borderWidth, borderColor ?: t.line, shape)
+                else Modifier,
+            ),
+        content = content,
+    )
+}
+
+/** 1dp hairline divider (oc-amber `.hair`). */
+@Composable
+fun Hairline(modifier: Modifier = Modifier) {
+    val t = LocalAmberTokens.current
+    Box(modifier.fillMaxWidth().height(1.dp).background(t.line))
+}
+
+/** Primary action: ink fill, bg text, 15dp radius (oc-amber `.btn-ink`; superellipse → rounded). */
+@Composable
+fun BtnInk(text: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    val t = LocalAmberTokens.current
+    val type = LocalAmberType.current
+    Box(
+        modifier
+            .heightIn(min = 48.dp)
+            .clip(RoundedCornerShape(15.dp))
+            .background(t.ink)
+            .pressable(onClick = onClick)
+            .padding(horizontal = 18.dp, vertical = 12.dp),
+        contentAlignment = Alignment.Center,
+    ) { Text(text, color = t.bg, style = type.body.copy(fontWeight = FontWeight.SemiBold)) }
+}
+
+/** Accent action: accent fill, accent-ink text (oc-amber `.btn-accent`). */
+@Composable
+fun BtnAccent(text: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    val t = LocalAmberTokens.current
+    val type = LocalAmberType.current
+    Box(
+        modifier
+            .heightIn(min = 48.dp)
+            .clip(RoundedCornerShape(15.dp))
+            .background(t.accent)
+            .pressable(onClick = onClick)
+            .padding(horizontal = 18.dp, vertical = 12.dp),
+        contentAlignment = Alignment.Center,
+    ) { Text(text, color = t.accentInk, style = type.body.copy(fontWeight = FontWeight.SemiBold)) }
+}
+
+/** Live dot with breathing halo (oc-amber `.dot`); [idle] = grey, no halo. Signal-green = liveness. */
+@Composable
+fun LiveDot(modifier: Modifier = Modifier, idle: Boolean = false, dotSize: Dp = 7.dp) {
+    val t = LocalAmberTokens.current
+    val color = if (idle) t.ink4 else t.signal
+    Box(modifier.size(dotSize * 2.2f), contentAlignment = Alignment.Center) {
+        if (!idle) {
+            val tr = rememberInfiniteTransition(label = "dotHalo")
+            val p by tr.animateFloat(
+                initialValue = 0f,
+                targetValue = 1f,
+                animationSpec = infiniteRepeatable(tween(2400, easing = LinearEasing), RepeatMode.Restart),
+                label = "p",
+            )
+            Box(
+                Modifier
+                    .size(dotSize)
+                    .graphicsLayer {
+                        val s = 1f + p * 1.1f
+                        scaleX = s
+                        scaleY = s
+                        alpha = 0.35f * (1f - p)
+                    }
+                    .background(color, CircleShape)
+            )
+        }
+        Box(Modifier.size(dotSize).background(color, CircleShape))
+    }
+}
+
+/** Blinking terminal cursor (oc-amber `.cursor`). Defaults to accent; pass [color] for ink/signal. */
+@Composable
+fun BlinkingCursor(
+    modifier: Modifier = Modifier,
+    color: Color = Color.Unspecified,
+    width: Dp = 8.dp,
+    height: Dp = 18.dp,
+) {
+    val t = LocalAmberTokens.current
+    val c = if (color == Color.Unspecified) t.accent else color
+    val tr = rememberInfiniteTransition(label = "cursor")
+    val on by tr.animateFloat(
+        initialValue = 1f,
+        targetValue = 0f,
+        animationSpec = infiniteRepeatable(
+            animation = keyframes {
+                durationMillis = 1050
+                1f at 0
+                1f at 524
+                0f at 525
+                0f at 1049
+            },
+            repeatMode = RepeatMode.Restart,
+        ),
+        label = "blink",
+    )
+    Box(
+        modifier
+            .size(width, height)
+            .graphicsLayer { alpha = on }
+            .background(c, RoundedCornerShape(1.dp))
+    )
+}
+
+/** 流式生成中的文本 + 闪烁光标（DS `.cursor` 的流式搭档）。
+ *  光标画在文本块右下角而非行内占位——行内占位在 maxLines 截断时会被省略号
+ *  吞掉（长流式反而无光标）；块角光标恒可见，且贴合 terminal 设计语言。 */
+@Composable
+fun StreamingTextWithCursor(
+    text: String,
+    style: TextStyle,
+    color: Color,
+    modifier: Modifier = Modifier,
+    maxLines: Int = 2,
+) {
+    Row(modifier = modifier, verticalAlignment = Alignment.Bottom) {
+        Text(
+            text = text,
+            style = style,
+            color = color,
+            maxLines = maxLines,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        Spacer(modifier = Modifier.width(6.dp))
+        BlinkingCursor(width = 6.dp, height = 14.dp)
+    }
+}
+
+/** Mono uppercase eyebrow prefixed with an accent `//` (oc-amber section label). */
+@Composable
+fun SectionLabel(text: String, modifier: Modifier = Modifier) {
+    val t = LocalAmberTokens.current
+    val type = LocalAmberType.current
+    Row(modifier.semantics { heading() }, verticalAlignment = Alignment.CenterVertically) {
+        Text("//", modifier = Modifier.clearAndSetSemantics {}, style = type.eyebrow, color = t.accent)
+        Text(" " + text.uppercase(), style = type.eyebrow, color = t.ink2)
+    }
+}

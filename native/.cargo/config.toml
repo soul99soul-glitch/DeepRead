@@ -1,0 +1,21 @@
+# Android 16 KB page size compatibility.
+#
+# NDK r27's lld still defaults to `-z max-page-size=4096`, so every .so we
+# cross-compile here ships 4 KB-aligned LOAD segments. 16 KB devices then
+# surface the "此应用不符合 16 KB 对齐要求" dialog at launch. NDK r28 changes
+# the default, but CI and native/README.md pin r27 (see
+# .github/workflows/android-release.yml), so we set the flags explicitly
+# instead of moving the toolchain.
+#
+# common-page-size keeps GNU_RELRO on a 16 KB boundary (NDK r27
+# ANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES equivalent).
+#
+# Only affects aarch64-linux-android cross builds; host `cargo test` keeps the
+# native page size.
+# Gradle also passes these directly to the final `cargo ndk rustc` invocation;
+# target rustflags can otherwise be replaced by environment configuration.
+[target.aarch64-linux-android]
+rustflags = [
+    "-C", "link-arg=-Wl,-z,max-page-size=16384",
+    "-C", "link-arg=-Wl,-z,common-page-size=16384",
+]

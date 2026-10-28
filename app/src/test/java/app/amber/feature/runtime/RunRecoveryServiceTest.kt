@@ -1,0 +1,342 @@
+package app.amber.feature.runtime
+
+import app.amber.ai.core.MessageRole
+import app.amber.ai.core.Tool
+import app.amber.ai.ui.ToolApprovalState
+import app.amber.ai.ui.UIMessage
+import app.amber.ai.ui.UIMessagePart
+import app.amber.core.model.Conversation
+import app.amber.core.model.AMBER_AGENT_ID
+import app.amber.core.model.MessageNode
+import app.amber.feature.tools.ToolEffectClass
+import app.amber.feature.tools.effectClass
+import app.amber.core.sync.core.SyncRestoreWriteGate
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.Json
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import kotlin.uuid.Uuid
+
+/**
+ * P1-02 crash recovery by ledger state: interrupted non-idempotent tools are
+ * never re-executed without confirmation, readOnly/idempotent tools stay
+ * retryable, finished results are replayed, WAITING_USER survives restart.
+ */
+class RunRecoveryServiceTest : DurableRuntimeTestBase() {
+
+    private fun recoveryService() = RunRecoveryService(
+        ledger = ledger,
+        runTerminalStore = runTerminalStore,
+        conversationRepo = conversationRepository(),
+        json = Json,
+    )
+
+    private suspend fun effect(
+        runId: String,
+        toolCallId: String = "call_1",
+        effectClass: ToolEffectClass = ToolEffectClass.NON_IDEMPOTENT_WRITE,
+    ) = ledger.prepare(
+        runId = runId,
+        turnId = 0,
+        toolCallId = toolCallId,
+        toolName = "post_message",
+        input = """{"text":"hello"}""",
+        effectClass = effectClass,
+    )
+
+    private fun conversationWithTool(conversationId: Uuid, tool: UIMessagePart.Tool): Conversation =
+        Conversation(
+            id = conversationId,
+            assistantId = AMBER_AGENT_ID,
+            messageNodes = listOf(
+                MessageNode.of(UIMessage(role = MessageRole.USER, parts = listOf(UIMessagePart.Text("run a tool")))),
+                MessageNode.of(UIMessage(role = MessageRole.ASSISTANT, parts = listOf(tool))),
+            ),
+        )
+
+    @Test
+    fun nonIdempotentStartedEffectEscalatesToOutcomeUnknown() = runBlocking {
+        val conversationId = Uuid.random()
+        runTerminalStore.begin("run_1", conversationId.toString(), null)
+        val effect = effect("run_1")
+        ledger.markStarted(effect.effectId, approvalDigest("run_1", "call_1", effect.argsDigest))
+
+        recoveryService().recover()
+
+        // Run died mid-run → the non-idempotent effect must NOT be silently
+        // retried: the run escalates to OUTCOME_UNKNOWN and waits for the user.
+        val run = runTerminalStore.get("run_1")!!
+        assertEquals(RunTerminalState.OUTCOME_UNKNOWN, run.state)
+        assertNull(run.finishedAtMs)
+        assertEquals("run_1", runTerminalStore.unfinished().single().runId)
+        assertEquals(ToolEffectStatus.OUTCOME_UNKNOWN, ledger.get(effect.effectId)!!.status)
+        assertEquals("interrupted_mid_execution", ledger.get(effect.effectId)!!.errorCategory)
+    }
+
+    @Test
+    fun interruptedScreenAndCommandActionsUseTheirRealClassificationDuringRecovery() = runBlocking {
+        val actions = listOf("screen_click", "terminal_execute").map { name ->
+            val runId = "run_$name"
+            runTerminalStore.begin(runId, Uuid.random().toString(), null)
+            val tool = Tool(name = name, description = name, execute = { emptyList() })
+            val input = if (name == "screen_click") """{"x":100,"y":200}""" else """{"command":"echo hello >> result.txt"}"""
+            val effect = ledger.prepare(
+                runId = runId, turnId = 0, toolCallId = "call_$name", toolName = name,
+                input = input, effectClass = tool.effectClass(input),
+            )
+            ledger.markStarted(effect.effectId, approvalDigest(runId, effect.toolCallId, effect.argsDigest))
+            effect
+        }
+
+        recoveryService().recover()
+
+        actions.forEach { effect ->
+            assertEquals(effect.toolName, ToolEffectStatus.OUTCOME_UNKNOWN, ledger.get(effect.effectId)!!.status)
+            assertEquals(effect.toolName, RunTerminalState.OUTCOME_UNKNOWN, runTerminalStore.get(requireNotNull(effect.runId))!!.state)
+        }
+    }
+
+    @Test
+    fun readOnlyAndIdempotentStartedEffectsStayRetryable() = runBlocking {
+        val conversationId = Uuid.random()
+        runTerminalStore.begin("run_1", conversationId.toString(), null)
+        val readOnly = effect("run_1", toolCallId = "call_read", effectClass = ToolEffectClass.READ_ONLY)
+        ledger.markStarted(readOnly.effectId, approvalDigest("run_1", "call_read", readOnly.argsDigest))
+        val idempotent = effect("run_1", toolCallId = "call_write", effectClass = ToolEffectClass.IDEMPOTENT_WRITE)
+        ledger.markStarted(idempotent.effectId, approvalDigest("run_1", "call_write", idempotent.argsDigest))
+
+        recoveryService().recover()
+
+        // Safe to retry: readOnly retries plainly, idempotentWrite retries
+        // with its idempotency key — neither needs a user decision.
+        assertEquals(ToolEffectStatus.STARTED, ledger.get(readOnly.effectId)!!.status)
+        assertEquals(ToolEffectStatus.STARTED, ledger.get(idempotent.effectId)!!.status)
+        assertEquals(RunTerminalState.INTERRUPTED, runTerminalStore.get("run_1")!!.state)
+    }
+
+    @Test
+    fun preparedEffectIsLeftForApprovalReentry() = runBlocking {
+        val conversationId = Uuid.random()
+        runTerminalStore.begin("run_1", conversationId.toString(), null)
+        val effect = effect("run_1") // PREPARED — approval was still pending
+
+        recoveryService().recover()
+
+        assertEquals(ToolEffectStatus.PREPARED, ledger.get(effect.effectId)!!.status)
+        assertEquals(RunTerminalState.INTERRUPTED, runTerminalStore.get("run_1")!!.state)
+    }
+
+    @Test
+    fun finishedEffectOlderThanRetentionIsReplayedIntoConversationWithoutReExecution() = runBlocking {
+        val conversationId = Uuid.random()
+        runTerminalStore.begin("run_1", conversationId.toString(), null)
+        val effect = effect("run_1")
+        ledger.markStarted(effect.effectId, approvalDigest("run_1", "call_1", effect.argsDigest))
+        ledger.finish(effect.effectId, listOf(UIMessagePart.Text("""{"status":"ok","data":42}""")))
+        database.toolEffectDao().upsert(
+            database.toolEffectDao().getByEffectId(effect.effectId)!!.copy(
+                updatedAtMs = System.currentTimeMillis() - 8L * 24 * 60 * 60 * 1000,
+            )
+        )
+
+        val repo = conversationRepository()
+        val tool = UIMessagePart.Tool(
+            toolCallId = "call_1",
+            toolName = "post_message",
+            input = """{"text":"hello"}""",
+            approvalState = ToolApprovalState.Approved,
+        )
+        repo.insertConversation(conversationWithTool(conversationId, tool))
+
+        recoveryService().recover()
+
+        // The tool result was never written to the conversation (crash after
+        // FINISHED, before message persist) — replay from the ledger.
+        val replayed = repo.getConversationById(conversationId)!!
+        val part = replayed.messageNodes
+            .flatMap { it.messages }
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+            .first { it.toolCallId == "call_1" }
+        assertTrue(part.isExecuted)
+        val text = (part.output.single() as UIMessagePart.Text).text
+        assertTrue(text.contains("\"status\":\"ok\""))
+        assertEquals(ToolEffectStatus.FINISHED, ledger.get(effect.effectId)!!.status)
+        // The replayed result is durable in the conversation — the ledger
+        // replay payload is dropped (M1 retention).
+        assertNull(ledger.get(effect.effectId)!!.resultPayload)
+    }
+
+    @Test
+    fun waitingUserWithStartedEffectStaysPausedAndKeepsRunIdForReconcile() = runBlocking {
+        val conversationId = Uuid.random()
+        runTerminalStore.begin("run_1", conversationId.toString(), null)
+        runTerminalStore.pause("run_1", RunTerminalState.WAITING_USER, PauseReason.TOOL_APPROVAL)
+        val effect = effect("run_1")
+        ledger.markStarted(effect.effectId, approvalDigest("run_1", "call_1", effect.argsDigest))
+
+        recoveryService().recover()
+
+        // The stray STARTED non-idempotent effect escalates to OUTCOME_UNKNOWN,
+        // but the run is PAUSED (never finish()ed), so the SAME runId is still
+        // active and can be resumed after the user reconciles — no minting.
+        assertEquals(ToolEffectStatus.OUTCOME_UNKNOWN, ledger.get(effect.effectId)!!.status)
+        val run = runTerminalStore.get("run_1")!!
+        assertEquals(RunTerminalState.OUTCOME_UNKNOWN, run.state)
+        assertNull(run.finishedAtMs)
+        val active = runTerminalStore.activeForConversation(conversationId.toString())!!
+        assertEquals("run_1", active.runId)
+        // User confirms retry → resume continues the same runId.
+        runTerminalStore.begin(active.runId, conversationId.toString(), null)
+        assertEquals(RunTerminalState.RUNNING, runTerminalStore.get("run_1")!!.state)
+    }
+
+    @Test
+    fun recoverPrunesTerminalEffectsOlderThanRetentionWindow() = runBlocking {
+        val conversationId = Uuid.random()
+        val retentionMs = 7L * 24 * 60 * 60 * 1000
+        // ±1h margins keep the ages deterministic against real-clock drift
+        // between row creation and the cleanup cutoff.
+        val nowMs = System.currentTimeMillis()
+        runTerminalStore.begin("run_old", conversationId.toString(), null)
+        val oldFinished = effect("run_old", toolCallId = "call_old")
+        ledger.markStarted(oldFinished.effectId, approvalDigest("run_old", "call_old", oldFinished.argsDigest))
+        ledger.finish(oldFinished.effectId, listOf(UIMessagePart.Text("""{"status":"ok"}""")))
+        database.toolEffectDao().upsert(
+            database.toolEffectDao().getByEffectId(oldFinished.effectId)!!
+                .copy(updatedAtMs = nowMs - retentionMs - 3_600_000)
+        )
+        runTerminalStore.finish("run_old", RunTerminalState.COMPLETED)
+
+        runTerminalStore.begin("run_recent", conversationId.toString(), null)
+        val recentFinished = effect("run_recent", toolCallId = "call_recent")
+        ledger.markStarted(recentFinished.effectId, approvalDigest("run_recent", "call_recent", recentFinished.argsDigest))
+        ledger.finish(recentFinished.effectId, listOf(UIMessagePart.Text("""{"status":"ok"}""")))
+        database.toolEffectDao().upsert(
+            database.toolEffectDao().getByEffectId(recentFinished.effectId)!!
+                .copy(updatedAtMs = nowMs - retentionMs + 3_600_000)
+        )
+
+        // Non-terminal effects (still actionable) are never pruned by age.
+        val oldUnknown = effect("run_recent", toolCallId = "call_unknown")
+        ledger.markStarted(oldUnknown.effectId, approvalDigest("run_recent", "call_unknown", oldUnknown.argsDigest))
+        ledger.markOutcomeUnknown(oldUnknown.effectId, "interrupted_mid_execution")
+        database.toolEffectDao().upsert(
+            database.toolEffectDao().getByEffectId(oldUnknown.effectId)!!
+                .copy(updatedAtMs = nowMs - retentionMs - 3_600_000)
+        )
+
+        recoveryService().recover()
+
+        // Completed-run effects past the 7-day window are pruned; recent
+        // effects and unfinished-run reconciliation state survive.
+        assertNull(ledger.get(oldFinished.effectId))
+        assertEquals(ToolEffectStatus.FINISHED, ledger.get(recentFinished.effectId)!!.status)
+        assertEquals(ToolEffectStatus.OUTCOME_UNKNOWN, ledger.get(oldUnknown.effectId)!!.status)
+    }
+
+    @Test
+    fun waitingUserRunSurvivesRecoveryForApprovalResume() = runBlocking {
+        val conversationId = Uuid.random()
+        runTerminalStore.begin("run_1", conversationId.toString(), null)
+        runTerminalStore.pause("run_1", RunTerminalState.WAITING_USER, PauseReason.TOOL_APPROVAL)
+
+        recoveryService().recover()
+
+        // WAITING_USER is a pause, not a crash: the approval entry is rebuilt
+        // and approving continues the SAME runId.
+        val run = runTerminalStore.get("run_1")!!
+        assertEquals(RunTerminalState.WAITING_USER, run.state)
+        assertNotNull(runTerminalStore.activeForConversation(conversationId.toString()))
+        assertEquals("run_1", runTerminalStore.activeForConversation(conversationId.toString())!!.runId)
+    }
+
+    @Test
+    fun outcomeUnknownPromptListsEscalatedEffects() = runBlocking {
+        val conversationId = Uuid.random()
+        runTerminalStore.begin("run_1", conversationId.toString(), null)
+        val effect = effect("run_1")
+        ledger.markStarted(effect.effectId, approvalDigest("run_1", "call_1", effect.argsDigest))
+
+        recoveryService().recover()
+
+        val unknown = ledger.listOutcomeUnknown()
+        assertEquals(1, unknown.size)
+        assertEquals(effect.effectId, unknown.single().effectId)
+    }
+
+    @Test
+    fun recoveryStartedBeforeRestoreDropsOldTerminalAndLedgerWrites() = runBlocking {
+        val gate = SyncRestoreWriteGate()
+        val gatedLedger = RoomToolEffectLedger(
+            dao = database.toolEffectDao(),
+            runTerminalDao = database.runTerminalDao(),
+            json = Json,
+            restoreWriteGate = gate,
+        )
+        val gatedTerminal = RoomRunTerminalStore(
+            dao = database.runTerminalDao(),
+            restoreWriteGate = gate,
+        )
+        val conversationId = Uuid.random()
+        gatedTerminal.begin("run_old", conversationId.toString(), null)
+        val started = gatedLedger.prepare(
+            runId = "run_old",
+            turnId = 0,
+            toolCallId = "call_old",
+            toolName = "post_message",
+            input = "{\"text\":\"hello\"}",
+            effectClass = ToolEffectClass.NON_IDEMPOTENT_WRITE,
+        )
+        gatedLedger.markStarted(
+            started.effectId,
+            approvalDigest("run_old", "call_old", started.argsDigest),
+        )
+
+        val unfinishedRead = CompletableDeferred<Unit>()
+        val releaseRead = CompletableDeferred<Unit>()
+        val observingTerminal = object : RunTerminalStore by gatedTerminal {
+            override suspend fun unfinished(): List<RunTerminal> {
+                unfinishedRead.complete(Unit)
+                releaseRead.await()
+                return gatedTerminal.unfinished()
+            }
+        }
+        val service = RunRecoveryService(
+            ledger = gatedLedger,
+            runTerminalStore = observingTerminal,
+            conversationRepo = conversationRepository(gate),
+            json = Json,
+            restoreWriteGate = gate,
+        )
+
+        val recoveryJob = launch { service.recover() }
+        unfinishedRead.await()
+
+        val restoreStarted = CompletableDeferred<Unit>()
+        val releaseRestore = CompletableDeferred<Unit>()
+        val restoreJob = launch {
+            gate.withRestore {
+                restoreStarted.complete(Unit)
+                releaseRestore.await()
+            }
+        }
+        restoreStarted.await()
+        releaseRead.complete(Unit)
+        releaseRestore.complete(Unit)
+        recoveryJob.join()
+        restoreJob.join()
+
+        // Recovery captured epoch 0 before its unfinished-run read. Once the
+        // restore advances the epoch, its old OUTCOME_UNKNOWN/terminal writes
+        // are rejected instead of landing on the imported dataset.
+        assertEquals(RunTerminalState.RUNNING, gatedTerminal.get("run_old")!!.state)
+        assertEquals(ToolEffectStatus.STARTED, gatedLedger.get(started.effectId)!!.status)
+    }
+}

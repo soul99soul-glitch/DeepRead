@@ -1,0 +1,245 @@
+package app.amber.feature.ui.pages.setting
+
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Button
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import app.amber.agent.R
+import app.amber.feature.ui.components.ds.amberCanvas
+import app.amber.core.utils.plus
+import app.amber.feature.miniapp.MiniAppSpeechEngine
+import app.amber.feature.ui.components.nav.BackButton
+import app.amber.feature.ui.components.ui.WorkspaceTopBar
+import app.amber.feature.ui.components.ui.WorkspaceStatusPill
+import app.amber.feature.ui.components.ui.WorkspaceTone
+import app.amber.feature.ui.components.ui.workspaceColors
+import app.amber.feature.ui.theme.LocalAmberType
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import java.util.Locale
+
+/**
+ * W16-C: 独立 TTS 试听页（iOS TTSSettingsView 对齐）。只承诺系统 TTS 试听：
+ * 当前引擎、语速（0.5×–2×，映射到 MiniApp 的 0..1 语速契约）、试听/停止；
+ * 无引擎/初始化失败诚实显示，离页停止。云端 TTS 与聊天朗读不在本页承诺范围。
+ *
+ * 试听操作用单一 Job 串行：启动和朗读中都可点击停止，离开页面停止。
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SettingTtsPage() {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val colors = workspaceColors()
+    val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
+
+    // 页面展示 Android 语义的倍率；MiniAppSpeechEngine 接收 iOS 对齐的
+    // 0..1 语速（0.5 = 正常），所以发送时除以 2。
+    val speeds = remember { listOf(0.5f to "0.5×", 1f to "1×", 1.5f to "1.5×", 2f to "2×") }
+    var speedIndex by remember { mutableStateOf(1) }
+    var speaking by remember { mutableStateOf(false) }
+    var engineError by remember { mutableStateOf<String?>(null) }
+    var checked by remember { mutableStateOf(false) }
+    var busy by remember { mutableStateOf(false) }
+    var speakJob by remember { mutableStateOf<Job?>(null) }
+    // 每个页面实例一个独立 speech owner；离页 close，不与 MiniApp runner 共享。
+    val speechEngine = remember {
+        MiniAppSpeechEngine(
+            context = context,
+            onSpeechFinished = { speaking = false },
+        )
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            speakJob?.cancel()
+            speechEngine.close()
+            speaking = false
+        }
+    }
+
+    Scaffold(
+        topBar = {
+            WorkspaceTopBar(
+                title = stringResource(R.string.setting_page_tts),
+                navigationIcon = { BackButton() },
+                scrollBehavior = scrollBehavior,
+            )
+        },
+        modifier = Modifier
+            .nestedScroll(scrollBehavior.nestedScrollConnection)
+            .amberCanvas(),
+        containerColor = androidx.compose.ui.graphics.Color.Transparent,
+    ) { padding ->
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = padding + PaddingValues(horizontal = SettingPageHorizontalInset, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            item {
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = colors.paper,
+                    border = BorderStroke(1.dp, colors.hairline),
+                ) {
+                    Text(
+                        stringResource(R.string.setting_tts_page_intro),
+                        modifier = Modifier.padding(14.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = colors.muted,
+                    )
+                }
+            }
+            item {
+                SettingCardGroup(title = stringResource(R.string.setting_tts_page_preview_section)) {
+                    item(
+                        headlineContent = { Text(stringResource(R.string.setting_tts_page_system_tts)) },
+                        supportingContent = {
+                            Text(
+                                when {
+                                    engineError != null -> engineError!!
+                                    checked -> stringResource(R.string.setting_tts_page_engine_ready_desc)
+                                    else -> stringResource(R.string.setting_tts_page_engine_unchecked_desc)
+                                }
+                            )
+                        },
+                        trailingContent = {
+                            if (busy && !speaking) {
+                                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                            } else {
+                                WorkspaceStatusPill(
+                                    text = when {
+                                        engineError != null -> stringResource(R.string.setting_tts_page_status_unavailable)
+                                        checked -> stringResource(R.string.setting_tts_page_status_available)
+                                        else -> stringResource(R.string.setting_tts_page_status_unchecked)
+                                    },
+                                    tone = when {
+                                        engineError != null -> WorkspaceTone.Danger
+                                        checked -> WorkspaceTone.Success
+                                        else -> WorkspaceTone.Neutral
+                                    },
+                                )
+                            }
+                        },
+                    )
+                    item(
+                        headlineContent = { Text(stringResource(R.string.setting_tts_page_speech_rate)) },
+                        supportingContent = { Text(stringResource(R.string.setting_tts_page_speech_rate_desc)) },
+                        trailingContent = {
+                            SettingSegmentedChoice(
+                                options = speeds.indices.toList(),
+                                selected = speedIndex,
+                                onSelected = { speedIndex = it },
+                                equalWeight = false,
+                                label = { index ->
+                                    Text(speeds[index].second, style = LocalAmberType.current.meta)
+                                },
+                            )
+                        },
+                    )
+                    rawItem {
+                        val sampleText = stringResource(R.string.setting_tts_page_sample_text)
+                        val engineUnavailable = stringResource(R.string.setting_tts_page_engine_unavailable)
+                        Button(
+                            onClick = {
+                                if (speaking || busy) {
+                                    // 停止覆盖"启动中"与"朗读中"两种状态。
+                                    speakJob?.cancel()
+                                    speakJob = null
+                                    speakJob = scope.launch {
+                                        busy = true
+                                        try {
+                                            runCatching { speechEngine.dispatch("speech.stop", paramsOf()) }
+                                                .onFailure { if (it is CancellationException) throw it }
+                                        } finally {
+                                            speaking = false
+                                            busy = false
+                                        }
+                                    }
+                                } else {
+                                    engineError = null
+                                    // 引擎可能在 speak 返回前回报 onDone，先设置启动状态。
+                                    speaking = true
+                                    busy = true
+                                    speakJob = scope.launch {
+                                        try {
+                                            // speak 返回即引擎接受；引擎不可用/初始化失败会抛错。
+                                            speechEngine.dispatch(
+                                                "speech.speak",
+                                                paramsOf(
+                                                    "text" to sampleText,
+                                                    "language" to Locale.getDefault().toLanguageTag(),
+                                                    "rate" to (speeds[speedIndex].first / 2f),
+                                                ),
+                                            )
+                                            checked = true
+                                        } catch (cancel: CancellationException) {
+                                            throw cancel
+                                        } catch (error: Throwable) {
+                                            speaking = false
+                                            engineError = error.message ?: engineUnavailable
+                                        } finally {
+                                            busy = false
+                                        }
+                                    }
+                                }
+                            },
+                            enabled = !busy || speaking,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(
+                                when {
+                                    speaking -> stringResource(R.string.setting_tts_page_stop_preview)
+                                    busy -> stringResource(R.string.setting_tts_page_processing)
+                                    else -> stringResource(R.string.setting_tts_page_start_preview)
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun paramsOf(vararg pairs: Pair<String, Any>): kotlinx.serialization.json.JsonObject =
+    buildJsonObject {
+        pairs.forEach { (key, value) ->
+            val primitive = when (value) {
+                is Float -> JsonPrimitive(value)
+                is Int -> JsonPrimitive(value)
+                is Boolean -> JsonPrimitive(value)
+                else -> JsonPrimitive(value.toString())
+            }
+            put(key, primitive)
+        }
+    }

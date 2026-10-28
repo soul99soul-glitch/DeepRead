@@ -1,0 +1,144 @@
+package app.amber.core.ai
+
+import android.content.Context
+import app.amber.agent.BuildConfig
+import app.amber.common.android.LogEntry
+import app.amber.common.android.Logging
+import app.amber.core.jev.JevHttpRequest
+import app.amber.core.infra.PreferencesKeys
+import app.amber.core.settings.settingsStore
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
+import okhttp3.Headers
+import okhttp3.HttpUrl
+import okhttp3.Interceptor
+import okhttp3.Response
+import okio.Buffer
+
+internal val sensitiveHttpHeaders = setOf(
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+    "x-auth-token",
+    "x-subscription-token",
+)
+
+private val SENSITIVE_QUERY_PARAMS = setOf(
+    "api_key",
+    "apikey",
+    "key",
+    "token",
+    "access_token",
+    "refresh_token",
+    "client_secret",
+    "code",
+    "sig",
+    "signature",
+)
+
+class RequestLoggingInterceptor(
+    context: Context,
+) : Interceptor {
+    // 跟随设置开关（PreferencesKeys.REQUEST_LOGGING_ENABLED，默认 true）实时切换；
+    // 关闭时直接放行，不再记录请求日志。
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    @Volatile
+    private var enabled = true
+
+    init {
+        scope.launch {
+            context.settingsStore.data
+                .map { it[PreferencesKeys.REQUEST_LOGGING_ENABLED] ?: true }
+                .distinctUntilChanged()
+                .collect { enabled = it }
+        }
+    }
+
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        if (!enabled) return chain.proceed(request)
+
+        val startTime = System.currentTimeMillis()
+
+        val requestHeaders = request.headers.toRedactedMap()
+        // Bodies carry prompts; OAuth token endpoints additionally carry
+        // refresh_token / client_secret form fields. Never log bodies for
+        // auth endpoints in any build, and keep bodies out of release builds.
+        val isAuthEndpoint = request.url.encodedPath.contains("/oauth", ignoreCase = true) ||
+            request.url.encodedPath.contains("/token", ignoreCase = true)
+        // Jev 判断请求携带记忆/任务文本外发内容，即便 DEBUG 构建也不落日志。
+        // 认 transport 打的 tag 而非域名——VERCEL/自定义网关 host 各异，域名判断会漏。
+        val isJevRequest = request.tag(JevHttpRequest::class.java) != null
+        val requestBody = if (BuildConfig.DEBUG && !isAuthEndpoint && !isJevRequest) {
+            request.body?.let { body ->
+                val buffer = Buffer()
+                body.writeTo(buffer)
+                buffer.readUtf8()
+            }
+        } else {
+            null
+        }
+        val url = request.url.redactedString()
+
+        val response: Response
+        var error: String? = null
+
+        try {
+            response = chain.proceed(request)
+        } catch (e: Exception) {
+            error = e.message
+            Logging.logRequest(
+                LogEntry.RequestLog(
+                    tag = "HTTP",
+                    url = url,
+                    method = request.method,
+                    requestHeaders = requestHeaders,
+                    requestBody = requestBody,
+                    error = error
+                )
+            )
+            throw e
+        }
+
+        val durationMs = System.currentTimeMillis() - startTime
+        val responseHeaders = response.headers.toRedactedMap()
+
+        Logging.logRequest(
+            LogEntry.RequestLog(
+                tag = "HTTP",
+                url = url,
+                method = request.method,
+                requestHeaders = requestHeaders,
+                requestBody = requestBody,
+                responseCode = response.code,
+                responseHeaders = responseHeaders,
+                durationMs = durationMs,
+                error = error
+            )
+        )
+
+        return response
+    }
+
+    private fun HttpUrl.redactedString(): String {
+        val sensitive = queryParameterNames.filter { it.lowercase() in SENSITIVE_QUERY_PARAMS }
+        if (sensitive.isEmpty()) return toString()
+        val builder = newBuilder()
+        sensitive.forEach { builder.setQueryParameter(it, "[redacted]") }
+        return builder.build().toString()
+    }
+}
+
+internal fun Headers.toRedactedMap(): Map<String, String> = names().associateWith { name ->
+    if (name.lowercase() in sensitiveHttpHeaders) "[redacted]" else get(name).orEmpty()
+}

@@ -1,0 +1,508 @@
+package app.amber.feature.ui.components.message
+
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Surface
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.isSpecified
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import app.amber.ai.ui.UIMessagePart
+import app.amber.core.model.AssistantAffectScope
+import app.amber.core.model.AssistantRegex
+import app.amber.core.ai.generative.GenerativeWidgetCopy
+import app.amber.core.ai.generative.GenerativeWidgetParser
+import app.amber.core.ai.generative.GenerativeWidgetSegment
+import app.amber.feature.ui.components.richtext.MarkdownBlock
+import app.amber.feature.ui.components.richtext.MarkdownTopLevelBlock
+import app.amber.feature.ui.components.richtext.StreamingSingleTextMarkdown
+import app.amber.feature.ui.components.richtext.topLevelBlockCount
+import app.amber.feature.ui.context.LocalSettings
+import app.amber.feature.ui.theme.LocalAmberTokens
+import app.amber.feature.ui.theme.LocalThemeDesign
+import app.amber.feature.ui.theme.LocalThemePack
+import app.amber.feature.ui.theme.JetbrainsMono
+
+@Composable
+internal fun VirtualizedAssistantText(
+    fullMessageParts: List<UIMessagePart>,
+    part: UIMessagePart.Text,
+    regexes: List<AssistantRegex>,
+    markdownChild: ChatMessageVirtualItem.MarkdownChild?,
+    attachments: List<BlockAttachment> = emptyList(),
+    showAssistantBubble: Boolean,
+    onGenerativeWidgetAction: (String) -> Unit,
+) {
+    val handleClickCitation = rememberClickCitationHandler(fullMessageParts)
+    MessageSelectionContainer(enabled = false) {
+        if (markdownChild != null) {
+            val blockContent: @Composable () -> Unit = {
+                Column {
+                    MarkdownTopLevelBlock(
+                        data = markdownChild.parseResult,
+                        blockIndex = markdownChild.blockIndex,
+                        onClickCitation = handleClickCitation,
+                    )
+                    BlockAttachments(attachments)
+                }
+            }
+            if (showAssistantBubble) {
+                AssistantBubbleSegment(
+                    first = markdownChild.blockIndex == 0,
+                    last = markdownChild.blockIndex == markdownChild.parseResult.topLevelBlockCount() - 1,
+                    content = blockContent,
+                )
+            } else {
+                blockContent()
+            }
+        } else {
+            if (showAssistantBubble) {
+                BoxWithConstraints(
+                    modifier = Modifier.fillMaxWidth(),
+                    contentAlignment = androidx.compose.ui.Alignment.TopStart,
+                ) {
+                    val amberTokens = LocalAmberTokens.current
+                    val themeRadius = themeBubbleRadius()
+                    val themeBorderWidth = themeBubbleBorderWidth()
+                    val assistantBubbleShape = themeRadius?.let { RoundedCornerShape(it) }
+                        ?: RoundedCornerShape(
+                        topStart = 14.dp,
+                        topEnd = 14.dp,
+                        bottomStart = 5.dp,
+                        bottomEnd = 14.dp,
+                    )
+                    Surface(
+                        modifier = Modifier.widthIn(max = maxWidth * 0.86f),
+                        shape = assistantBubbleShape,
+                        color = amberTokens.surface,
+                        contentColor = amberTokens.ink,
+                        tonalElevation = 0.dp,
+                        shadowElevation = 0.dp,
+                        border = if (themeBorderWidth == null) {
+                            BorderStroke(1.dp, amberTokens.line)
+                        } else {
+                            themeBorderWidth.takeIf { it > 0.dp }?.let { BorderStroke(it, amberTokens.line) }
+                        },
+                    ) {
+                        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                            AssistantMarkdownBlockOrWidgets(
+                                content = MessageRenderCache.visualRegexText(
+                                    text = part.text,
+                                    regexes = regexes,
+                                    scope = AssistantAffectScope.ASSISTANT,
+                                ),
+                                streaming = false,
+                                onClickCitation = handleClickCitation,
+                                onGenerativeWidgetAction = onGenerativeWidgetAction,
+                            )
+                        }
+                    }
+                }
+            } else {
+                AssistantMarkdownBlockOrWidgets(
+                    content = MessageRenderCache.visualRegexText(
+                        text = part.text,
+                        regexes = regexes,
+                        scope = AssistantAffectScope.ASSISTANT,
+                    ),
+                    streaming = false,
+                    onClickCitation = handleClickCitation,
+                    onGenerativeWidgetAction = onGenerativeWidgetAction,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun BlockAttachments(attachments: List<BlockAttachment>) {
+    attachments.forEach { attachment ->
+        when (attachment) {
+            is BlockAttachment.SearchImages -> SearchImageGallery(
+                images = attachment.images,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+    }
+}
+
+@Composable
+internal fun AssistantMarkdownBlockOrWidgets(
+    content: String,
+    modifier: Modifier = Modifier,
+    streaming: Boolean,
+    deferStreamingParse: Boolean = false,
+    /**
+     * When non-null AND [streaming] AND this content is plain markdown (no
+     * widget fence / no miniapp payload), the markdown branch renders through
+     * [StreamingSingleTextMarkdown] instead of [MarkdownBlock]: the streaming
+     * phase keeps a single growing Text (no block-tree re-layout), settled
+     * falls back to MarkdownBlock. The lambda captures the RAW part text —
+     * StreamingSingleTextMarkdown applies the assistant visual regex itself.
+     */
+    streamingMarkdownContent: (@Composable () -> Unit)? = null,
+    onClickCitation: (String) -> Unit,
+    onGenerativeWidgetAction: (String) -> Unit,
+    onStreamingVisibleFrame: (() -> Unit)? = null,
+    onStreamingVisualActiveChange: ((Boolean) -> Unit)? = null,
+) {
+    val context = LocalContext.current
+    val generativeWidgetCopy = remember(context) { GenerativeWidgetCopy.from(context) }
+    val generativeUiEnabled = LocalSettings.current.agentRuntime.generativeUi.enabled
+    val canRenderWidget = remember(generativeUiEnabled, content, generativeWidgetCopy) {
+        generativeUiEnabled &&
+            (GenerativeWidgetParser.containsWidgetFence(content) ||
+                GenerativeWidgetParser.containsFullHtmlDeckPayload(
+                    content,
+                    copy = generativeWidgetCopy,
+                ))
+    }
+
+    if (!canRenderWidget && content.looksLikeMiniAppJsonPayload()) {
+        MiniAppStreamingCard(
+            content = content,
+            streaming = streaming,
+            copy = generativeWidgetCopy,
+            modifier = modifier,
+        )
+        return
+    }
+
+    if (!canRenderWidget) {
+        // The slot owns the whole streaming→drain window (the caller keeps it
+        // alive until the pacing buffer settles); `streaming` here already
+        // flipped false at generation end while the tail is still draining.
+        if (streamingMarkdownContent != null) {
+            streamingMarkdownContent()
+            return
+        }
+        MarkdownBlock(
+            content = content,
+            modifier = modifier,
+            // Forward streaming so the tail block of the assistant response fades in
+            // smoothly on each 200ms flush instead of popping. See MarkdownBlock kdoc.
+            streaming = streaming,
+            deferStreamingParse = deferStreamingParse,
+            onStreamingVisibleFrame = onStreamingVisibleFrame,
+            onStreamingVisualActiveChange = onStreamingVisualActiveChange,
+            onClickCitation = onClickCitation,
+        )
+        return
+    }
+
+    val segments = remember(content, streaming, generativeWidgetCopy) {
+        GenerativeWidgetParser.parse(
+            content,
+            streaming = streaming,
+            copy = generativeWidgetCopy,
+        )
+    }
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        val lastSegmentIdx = segments.lastIndex
+        segments.forEachIndexed { index, segment ->
+            key(index) {
+                // Only the trailing segment is still receiving new tokens during
+                // streaming — earlier Text segments have already been frozen by the
+                // widget parser (a closed fence ended them). So only forward
+                // streaming=true to the tail; earlier blocks render statically.
+                // Without this guard each accumulator flush would re-fade every
+                // historical Text segment on every recompose, which reads as the
+                // whole reply "blinking" instead of just the tail growing.
+                val segmentStreaming = streaming && index == lastSegmentIdx
+                var slotSawStreaming by remember { mutableStateOf(false) }
+                if (segmentStreaming ||
+                    segment is GenerativeWidgetSegment.Loading ||
+                    segment is GenerativeWidgetSegment.TaskUiStreaming
+                ) {
+                    slotSawStreaming = true
+                }
+                when (segment) {
+                    is GenerativeWidgetSegment.Text -> MarkdownBlock(
+                        content = segment.content,
+                        streaming = segmentStreaming,
+                        deferStreamingParse = deferStreamingParse && segmentStreaming,
+                        onStreamingVisibleFrame = if (segmentStreaming || onStreamingVisibleFrame != null) {
+                            onStreamingVisibleFrame
+                        } else {
+                            null
+                        },
+                        onStreamingVisualActiveChange = onStreamingVisualActiveChange,
+                        onClickCitation = onClickCitation,
+                    )
+
+                    is GenerativeWidgetSegment.Widget -> GenerativeWidgetCard(
+                        widget = segment,
+                        isStreaming = segmentStreaming || (slotSawStreaming && streaming),
+                        onAction = onGenerativeWidgetAction,
+                    )
+
+                    is GenerativeWidgetSegment.TaskUi -> IntelligentUiCard(
+                        document = segment.document,
+                        cardKey = "msg-task-ui-$index-${segment.document.id}",
+                        isStreaming = segmentStreaming,
+                        wasStreaming = slotSawStreaming,
+                        onActionPrompt = onGenerativeWidgetAction,
+                    )
+
+                    is GenerativeWidgetSegment.TaskUiStreaming -> IntelligentUiStreamingPreviewCard(
+                        preview = segment.preview,
+                    )
+
+                    GenerativeWidgetSegment.Loading -> GenerativeWidgetLoading()
+                }
+            }
+        }
+    }
+}
+
+internal fun String.looksLikeMiniAppJsonPayload(): Boolean {
+    val text = trimStart()
+    if (!text.startsWith("{") && !text.startsWith("```")) return false
+
+    var score = 0
+    if ("\"title\"" in text) score++
+    if ("\"description\"" in text) score++
+    if ("\"html\"" in text || "<html" in text || "<!DOCTYPE html" in text) score += 2
+    if ("\"permissions\"" in text) score++
+    if ("\"category\"" in text) score++
+    return score >= 3
+}
+
+@Composable
+internal fun ReasoningWidgetRescue(
+    steps: List<ThinkingStep>,
+    streaming: Boolean,
+    onGenerativeWidgetAction: (String) -> Unit,
+) {
+    val context = LocalContext.current
+    val generativeWidgetCopy = remember(context) { GenerativeWidgetCopy.from(context) }
+    val generativeUiEnabled = LocalSettings.current.agentRuntime.generativeUi.enabled
+    if (!generativeUiEnabled) return
+
+    val reasoningTexts = remember(steps) {
+        steps.mapNotNull { step ->
+            (step as? ThinkingStep.ReasoningStep)?.reasoning?.reasoning
+        }
+    }
+    val segments = remember(reasoningTexts, streaming, generativeWidgetCopy) {
+        reasoningTexts.flatMap { reasoning ->
+            val widgetSource = reasoning.reasoningWidgetSource() ?: return@flatMap emptyList()
+            GenerativeWidgetParser.parse(
+                widgetSource,
+                streaming = streaming,
+                copy = generativeWidgetCopy,
+            )
+                .filter { segment ->
+                    segment is GenerativeWidgetSegment.Widget ||
+                        segment is GenerativeWidgetSegment.TaskUi ||
+                        segment is GenerativeWidgetSegment.TaskUiStreaming ||
+                        segment is GenerativeWidgetSegment.Loading
+                }
+        }
+    }
+    if (segments.isEmpty()) return
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 32.dp, top = 4.dp, bottom = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        segments.forEachIndexed { index, segment ->
+            key(index) {
+                when (segment) {
+                    is GenerativeWidgetSegment.Widget -> GenerativeWidgetCard(
+                        widget = segment,
+                        isStreaming = streaming,
+                        onAction = onGenerativeWidgetAction,
+                    )
+
+                    is GenerativeWidgetSegment.TaskUi -> IntelligentUiCard(
+                        document = segment.document,
+                        cardKey = "rescue-task-ui-$index-${segment.document.id}",
+                        isStreaming = streaming,
+                        wasStreaming = streaming,
+                        onActionPrompt = onGenerativeWidgetAction,
+                    )
+
+                    is GenerativeWidgetSegment.TaskUiStreaming -> IntelligentUiStreamingPreviewCard(
+                        preview = segment.preview,
+                    )
+
+                    GenerativeWidgetSegment.Loading -> GenerativeWidgetLoading()
+                    is GenerativeWidgetSegment.Text -> Unit
+                }
+            }
+        }
+    }
+}
+
+internal fun String.reasoningWidgetSource(): String? {
+    val marker = Regex("""(?m)^[ \t]*```[ \t]*(?:show-widget|widget|generative-ui|task-ui|task_ui|intelligent-ui|intelligent_ui|adaptive-ui)[^\r\n]*""")
+    val match = marker.findAll(this).lastOrNull() ?: return null
+    return substring(match.range.first).take(24_000)
+}
+
+@Composable
+private fun AssistantBubbleSegment(
+    first: Boolean,
+    last: Boolean,
+    content: @Composable () -> Unit,
+) {
+    val amberTokens = LocalAmberTokens.current
+    val themeRadius = themeBubbleRadius()
+    val radiusDp = themeRadius ?: 14.dp
+    val tailRadiusDp = if (themeRadius == null) 5.dp else minOf(themeRadius, 5.dp)
+    val borderWidth = themeBubbleBorderWidth() ?: 1.dp
+    val shape = RoundedCornerShape(
+        topStart = if (first) radiusDp else 0.dp,
+        topEnd = if (first) radiusDp else 0.dp,
+        bottomStart = if (last) tailRadiusDp else 0.dp,
+        bottomEnd = if (last) radiusDp else 0.dp,
+    )
+    BoxWithConstraints(
+        modifier = Modifier.fillMaxWidth(),
+        contentAlignment = androidx.compose.ui.Alignment.TopStart,
+    ) {
+        Box(
+            modifier = Modifier
+                .widthIn(max = maxWidth * 0.86f)
+                .clip(shape)
+                .background(amberTokens.surface)
+                .drawWithContent {
+                    drawContent()
+                    val stroke = borderWidth.toPx()
+                    if (stroke > 0f) {
+                        val half = stroke / 2f
+                        val radius = minOf(radiusDp.toPx(), size.width / 2f, size.height / 2f)
+                        val tailRadius = minOf(tailRadiusDp.toPx(), radius, size.width / 2f, size.height / 2f)
+                        val right = size.width - half
+                        val bottom = size.height - half
+                        val topInset = if (first) radius else 0f
+                        val bottomStartInset = if (last) tailRadius else 0f
+                        val bottomEndInset = if (last) radius else 0f
+
+                        drawLine(
+                            color = amberTokens.line,
+                            start = Offset(half, topInset),
+                            end = Offset(half, size.height - bottomStartInset),
+                            strokeWidth = stroke,
+                        )
+                        drawLine(
+                            color = amberTokens.line,
+                            start = Offset(right, topInset),
+                            end = Offset(right, size.height - bottomEndInset),
+                            strokeWidth = stroke,
+                        )
+                        if (first) {
+                            drawLine(
+                                color = amberTokens.line,
+                                start = Offset(radius, half),
+                                end = Offset(size.width - radius, half),
+                                strokeWidth = stroke,
+                            )
+                            drawArc(
+                                color = amberTokens.line,
+                                startAngle = 180f,
+                                sweepAngle = 90f,
+                                useCenter = false,
+                                topLeft = Offset(half, half),
+                                size = Size(radius * 2f, radius * 2f),
+                                style = Stroke(stroke),
+                            )
+                            drawArc(
+                                color = amberTokens.line,
+                                startAngle = 270f,
+                                sweepAngle = 90f,
+                                useCenter = false,
+                                topLeft = Offset(size.width - radius * 2f - half, half),
+                                size = Size(radius * 2f, radius * 2f),
+                                style = Stroke(stroke),
+                            )
+                        }
+                        if (last) {
+                            drawLine(
+                                color = amberTokens.line,
+                                start = Offset(tailRadius, bottom),
+                                end = Offset(size.width - radius, bottom),
+                                strokeWidth = stroke,
+                            )
+                            if (tailRadius > 0f) {
+                                drawArc(
+                                    color = amberTokens.line,
+                                    startAngle = 90f,
+                                    sweepAngle = 90f,
+                                    useCenter = false,
+                                    topLeft = Offset(half, size.height - tailRadius * 2f - half),
+                                    size = Size(tailRadius * 2f, tailRadius * 2f),
+                                    style = Stroke(stroke),
+                                )
+                            }
+                            drawArc(
+                                color = amberTokens.line,
+                                startAngle = 0f,
+                                sweepAngle = 90f,
+                                useCenter = false,
+                                topLeft = Offset(size.width - radius * 2f - half, size.height - radius * 2f - half),
+                                size = Size(radius * 2f, radius * 2f),
+                                style = Stroke(stroke),
+                            )
+                        }
+                    }
+                }
+                .padding(
+                    start = 14.dp,
+                    end = 14.dp,
+                    top = if (first) 10.dp else 0.dp,
+                    bottom = if (last) 10.dp else 0.dp,
+                )
+        ) {
+            content()
+        }
+    }
+}
+
+@Composable
+internal fun themeBubbleRadius(): Dp? {
+    val designRadius = LocalThemeDesign.current?.components?.bubbleRadius
+    if (designRadius != null) return designRadius.toFloat().dp
+    val pack = LocalThemePack.current ?: return null
+    return when (pack.bubbleChrome) {
+        "soft" -> 22.dp
+        "crisp" -> 14.dp
+        else -> 18.dp
+    }
+}
+
+@Composable
+internal fun themeBubbleBorderWidth(): Dp? =
+    LocalThemeDesign.current?.components?.borderWidth?.toFloat()?.dp

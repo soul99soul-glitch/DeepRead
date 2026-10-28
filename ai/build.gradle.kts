@@ -1,0 +1,98 @@
+import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
+import java.util.Properties
+
+plugins {
+    alias(libs.plugins.android.library)
+    alias(libs.plugins.kotlin.serialization)
+    alias(libs.plugins.kotlin.compose)
+}
+
+val oauthLocalProperties = Properties().apply {
+    val configFile = rootProject.file("local.properties")
+    if (configFile.exists()) configFile.inputStream().use(::load)
+}
+
+fun oauthBuildValue(property: String, environment: String): String {
+    val value = providers.gradleProperty(property)
+        .orElse(providers.environmentVariable(environment))
+        .getOrElse(oauthLocalProperties.getProperty(property, ""))
+    return "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"")
+        .replace("\n", "\\n").replace("\r", "\\r") + "\""
+}
+
+android {
+    namespace = "app.amber.ai"
+    compileSdk = 36
+
+    defaultConfig {
+        minSdk = 26
+
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        consumerProguardFiles("consumer-rules.pro")
+        buildConfigField("String", "ANTIGRAVITY_OAUTH_CLIENT_ID", oauthBuildValue("antigravityClientId", "ANTIGRAVITY_CLIENT_ID"))
+        buildConfigField("String", "ANTIGRAVITY_OAUTH_CLIENT_SECRET", oauthBuildValue("antigravityClientSecret", "ANTIGRAVITY_CLIENT_SECRET"))
+        buildConfigField("String", "GEMINI_OAUTH_CLIENT_ID", oauthBuildValue("geminiOAuthClientId", "GEMINI_OAUTH_CLIENT_ID"))
+        buildConfigField("String", "GEMINI_OAUTH_CLIENT_SECRET", oauthBuildValue("geminiOAuthClientSecret", "GEMINI_OAUTH_CLIENT_SECRET"))
+//        externalNativeBuild {
+//            cmake {
+//                cppFlags += listOf("-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON")
+//                abiFilters += listOf("arm64-v8a", "x86_64")
+//            }
+//        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_11
+        targetCompatibility = JavaVersion.VERSION_11
+    }
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+//    externalNativeBuild {
+//        cmake {
+//            path = file("src/main/cpp/CMakeLists.txt")
+//            version = "3.22.1"
+//        }
+//    }
+    tasks.withType<KotlinCompile>().configureEach {
+        compilerOptions.optIn.add("kotlin.uuid.ExperimentalUuidApi")
+        compilerOptions.optIn.add("kotlin.time.ExperimentalTime")
+    }
+}
+
+dependencies {
+    implementation(project(":common"))
+
+    // Compose
+    implementation(libs.androidx.core.ktx)
+    implementation(platform(libs.androidx.compose.bom))
+    implementation(libs.androidx.material3)
+
+    // okhttp
+    api(libs.okhttp)
+    api(libs.okhttp.sse)
+    api(libs.okhttp.logging)
+
+    // kotlinx
+    api(libs.kotlinx.serialization.json)
+    api(libs.kotlinx.coroutines.core)
+    api(libs.kotlinx.datetime)
+
+    // tests
+    testImplementation(libs.junit)
+    androidTestImplementation(libs.androidx.junit)
+    androidTestImplementation(libs.androidx.espresso.core)
+}

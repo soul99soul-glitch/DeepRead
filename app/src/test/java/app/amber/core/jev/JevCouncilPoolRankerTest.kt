@@ -1,0 +1,307 @@
+package app.amber.core.jev
+
+import app.amber.ai.provider.Model
+import app.amber.ai.provider.ModelAbility
+import app.amber.ai.provider.OpenAIBrand
+import app.amber.ai.provider.ProviderSetting
+import app.amber.core.settings.Settings
+import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import kotlin.uuid.Uuid
+
+/** 议会池模型调度：active 重排、shadow/低分回退 null、合法池子集校验。 */
+class JevCouncilPoolRankerTest {
+
+    private class ScriptedTransport(private val body: String?) : JevTransport {
+        var calls = 0
+
+        override suspend fun execute(request: JevHttpRequest): JevTransportResponse {
+            calls++
+            val payload = body ?: return JevTransportResponse.Failure("down")
+            return JevTransportResponse.Http(200, payload.toByteArray(), null)
+        }
+    }
+
+    private fun runtime(
+        transport: JevTransport,
+        mode: JevMode,
+        calibration: JevCalibrationStore = JevCalibrationStore.IN_MEMORY,
+        policy: JevPolicy = JevPolicy(),
+    ): JevRuntime {
+        val settings = Settings(
+            jev = JevSetting(
+                enabled = true,
+                purposes = mapOf(JevPurpose.MODEL_ROUTING to mode),
+                dataScopes = setOf(JevDataScope.TASK_TEXT, JevDataScope.TOOL_METADATA),
+            ),
+        )
+        return JevRuntime(
+            coordinator = JevDecisionCoordinator(
+                client = JevClient(transport = transport),
+                apiKeyProvider = { "key" },
+                clock = { 1_000_000L },
+            ),
+            settingsProvider = { settings },
+            calibration = calibration,
+            policy = policy,
+        )
+    }
+
+    private fun settingsWithModels(): Settings {
+        val m1 = Uuid.random()
+        val m2 = Uuid.random()
+        val m3 = Uuid.random()
+        val provider = ProviderSetting.OpenAI(
+            id = Uuid.random(),
+            name = "Test Provider",
+            models = listOf(
+                Model(id = m1, displayName = "Fast Model"),
+                Model(id = m2, displayName = "Vision Model"),
+                Model(id = m3, displayName = "Deep Model"),
+            ),
+            brand = OpenAIBrand.GENERIC,
+        )
+        return Settings(chatModelId = m3, providers = listOf(provider))
+    }
+
+    private fun councilInput(
+        objective: String = "analyze the screenshot for layout issues",
+        context: String = "a mobile screenshot was captured",
+    ) = buildJsonObject {
+        put(
+            "task",
+            buildJsonObject {
+                put("objective", objective)
+                put("context", context)
+            },
+        )
+    }
+
+    /** 局部独立记录器：IN_MEMORY 是进程级单例，会被其他测试的默认 runtime 污染。 */
+    private class FreshCalibration : JevCalibrationStore {
+        val records = mutableListOf<JevCalibrationRecord>()
+        override fun append(record: JevCalibrationRecord) {
+            records += record
+        }
+        override fun readAll(): List<JevCalibrationRecord> = records.toList()
+        override fun clear() = records.clear()
+    }
+
+    @Test
+    fun activeRankingReordersPool() = runTest {
+        val settings = settingsWithModels()
+        val ids = app.amber.feature.modelcouncil.ModelCouncilValidator
+            .defaultPoolModelIds(settings, settings.agentRuntime.modelCouncil)
+        assertEquals(3, ids.size)
+        // Jev 认为第 2、3 个模型适配（第 1 个低分被筛掉），且按分数排序
+        val probabilities = listOf(0.05, 0.9, 0.8)
+        val answer = ids.indices.joinToString(",") { index ->
+            """"${ids[index]}":{"type":"noul","noul":${probabilities[index]}}"""
+        }
+        val transport = ScriptedTransport("""{"model":"jev-test","answers":{$answer}}""")
+        val ranked = JevCouncilPoolRanker(runtime(transport, JevMode.ACTIVE))
+            .rank(councilInput(), settings, settings.agentRuntime.modelCouncil)
+        assertEquals(1, transport.calls)
+        assertEquals(listOf(ids[1], ids[2]), ranked)
+    }
+
+    private fun suitablePoolTransport(settings: Settings): ScriptedTransport {
+        val ids = app.amber.feature.modelcouncil.ModelCouncilValidator
+            .defaultPoolModelIds(settings, settings.agentRuntime.modelCouncil)
+        val answers = ids.joinToString(",") { """"$it":{"type":"noul","noul":0.9}""" }
+        return ScriptedTransport("""{"model":"jev-test","answers":{$answers}}""")
+    }
+
+    @Test
+    fun objectiveBeyondCachePrefixIsEvaluatedAgain() = runTest {
+        val settings = settingsWithModels()
+        val transport = suitablePoolTransport(settings)
+        val ranker = JevCouncilPoolRanker(runtime(transport, JevMode.ACTIVE))
+        val prefix = "shared task background ".repeat(20)
+        val first = councilInput(objective = prefix + "Review image layout.")
+        val second = councilInput(objective = prefix + "Prove the mathematical result.")
+
+        ranker.rank(first, settings, settings.agentRuntime.modelCouncil)
+        ranker.rank(first, settings, settings.agentRuntime.modelCouncil)
+        assertEquals("identical routing inputs should still use the cache", 1, transport.calls)
+        ranker.rank(second, settings, settings.agentRuntime.modelCouncil)
+
+        assertEquals("the objective sent to Jev changed after character 300", 2, transport.calls)
+    }
+
+    @Test
+    fun contextBeyondCachePrefixIsEvaluatedAgain() = runTest {
+        val settings = settingsWithModels()
+        val transport = suitablePoolTransport(settings)
+        val ranker = JevCouncilPoolRanker(runtime(transport, JevMode.ACTIVE))
+        val prefix = "shared context ".repeat(20)
+
+        ranker.rank(councilInput(context = prefix + "Images are required."), settings, settings.agentRuntime.modelCouncil)
+        ranker.rank(councilInput(context = prefix + "Long code reasoning is required."), settings, settings.agentRuntime.modelCouncil)
+
+        assertEquals("the context sent to Jev changed after character 200", 2, transport.calls)
+    }
+
+    @Test
+    fun changedModelCapabilitiesWithSameIdsAreEvaluatedAgain() = runTest {
+        val settings = settingsWithModels()
+        val transport = suitablePoolTransport(settings)
+        val ranker = JevCouncilPoolRanker(runtime(transport, JevMode.ACTIVE))
+        val provider = settings.providers.single() as ProviderSetting.OpenAI
+        val changed = settings.copy(providers = listOf(provider.copy(models = provider.models.map { model ->
+            model.copy(abilities = listOf(ModelAbility.REASONING), contextWindowTokens = 200_000)
+        })))
+
+        ranker.rank(councilInput(), settings, settings.agentRuntime.modelCouncil)
+        ranker.rank(councilInput(), changed, changed.agentRuntime.modelCouncil)
+
+        assertEquals("same model ids do not imply unchanged routing metadata", 2, transport.calls)
+    }
+
+    @Test
+    fun shadowNeverApplies() = runTest {
+        val settings = settingsWithModels()
+        val ids = app.amber.feature.modelcouncil.ModelCouncilValidator
+            .defaultPoolModelIds(settings, settings.agentRuntime.modelCouncil)
+        val answer = ids.joinToString(",") { """"${it}":{"type":"noul","noul":0.9}""" }
+        val transport = ScriptedTransport("""{"model":"jev-test","answers":{$answer}}""")
+        val ranked = JevCouncilPoolRanker(runtime(transport, JevMode.SHADOW))
+            .rank(councilInput(), settings, settings.agentRuntime.modelCouncil)
+        assertNull(ranked)
+        assertEquals(1, transport.calls)
+    }
+
+    @Test
+    fun transportFailureReturnsNull() = runTest {
+        val settings = settingsWithModels()
+        val ranked = JevCouncilPoolRanker(runtime(ScriptedTransport(null), JevMode.ACTIVE))
+            .rank(councilInput(), settings, settings.agentRuntime.modelCouncil)
+        assertNull(ranked)
+    }
+
+    @Test
+    fun blankObjectiveShortCircuits() = runTest {
+        val settings = settingsWithModels()
+        val transport = ScriptedTransport("""{"answers":{}}""")
+        val ranked = JevCouncilPoolRanker(runtime(transport, JevMode.ACTIVE))
+            .rank(councilInput(objective = " "), settings, settings.agentRuntime.modelCouncil)
+        assertNull(ranked)
+        assertEquals(0, transport.calls)
+    }
+
+    @Test
+    fun fewerThanTwoSuitableReturnsNull() = runTest {
+        val settings = settingsWithModels()
+        val ids = app.amber.feature.modelcouncil.ModelCouncilValidator
+            .defaultPoolModelIds(settings, settings.agentRuntime.modelCouncil)
+        // 只有 1 个过阈值 → 议会至少两席，回退原轮转
+        val answer = ids.joinToString(",") { """"${it}":{"type":"noul","noul":${if (it == ids[0]) 0.9 else 0.05}}""" }
+        val transport = ScriptedTransport("""{"model":"jev-test","answers":{$answer}}""")
+        val ranked = JevCouncilPoolRanker(runtime(transport, JevMode.ACTIVE))
+            .rank(councilInput(), settings, settings.agentRuntime.modelCouncil)
+        assertNull(ranked)
+        assertTrue(transport.calls >= 1)
+    }
+
+    @Test
+    fun shadowAppendsCalibrationRecordWithoutApplying() = runTest {
+        val settings = settingsWithModels()
+        val ids = app.amber.feature.modelcouncil.ModelCouncilValidator
+            .defaultPoolModelIds(settings, settings.agentRuntime.modelCouncil)
+        val probabilities = listOf(0.6, 0.9, 0.7)
+        val answer = ids.indices.joinToString(",") { index ->
+            """"${ids[index]}":{"type":"noul","noul":${probabilities[index]}}"""
+        }
+        val calibration = FreshCalibration()
+        val transport = ScriptedTransport("""{"model":"jev-test","answers":{$answer}}""")
+        val ranked = JevCouncilPoolRanker(runtime(transport, JevMode.SHADOW, calibration = calibration))
+            .rank(councilInput(), settings, settings.agentRuntime.modelCouncil)
+        assertNull(ranked)
+        val records = calibration.records
+        assertEquals(1, records.size)
+        val record = records.first()
+        assertEquals(JevPurpose.MODEL_ROUTING, record.purpose)
+        assertEquals(JevMode.SHADOW, record.mode)
+        assertEquals(3, record.scores.size)
+        assertEquals(ids[0].toString(), record.incumbentTop1)
+        assertEquals(ids[1].toString(), record.jevTop1)
+        assertEquals(0.3, record.threshold, 0.0)
+    }
+
+    @Test
+    fun activeAllBelowThresholdRecordsAbstain() = runTest {
+        val settings = settingsWithModels()
+        val ids = app.amber.feature.modelcouncil.ModelCouncilValidator
+            .defaultPoolModelIds(settings, settings.agentRuntime.modelCouncil)
+        val answer = ids.joinToString(",") { """"${it}":{"type":"noul","noul":0.05}""" }
+        val calibration = FreshCalibration()
+        val transport = ScriptedTransport("""{"model":"jev-test","answers":{$answer}}""")
+        val ranked = JevCouncilPoolRanker(runtime(transport, JevMode.ACTIVE, calibration = calibration))
+            .rank(councilInput(), settings, settings.agentRuntime.modelCouncil)
+        assertNull(ranked)
+        val record = calibration.records.single()
+        assertNull(record.jevTop1)
+        assertEquals(ids[0].toString(), record.incumbentTop1)
+    }
+
+    @Test
+    fun staleEvaluationRecordsNothing() = runTest {
+        // 传输层在调用中途改配置（收紧 scopes）→ decide 返回 stale，
+        // 适配器不得落校准记录也不得应用排序。
+        var liveSettings = settingsWithModels()
+        val ids = app.amber.feature.modelcouncil.ModelCouncilValidator
+            .defaultPoolModelIds(liveSettings, liveSettings.agentRuntime.modelCouncil)
+        val answer = ids.joinToString(",") { """"${it}":{"type":"noul","noul":0.9}""" }
+        val calibration = FreshCalibration()
+        val transport = object : JevTransport {
+            override suspend fun execute(request: JevHttpRequest): JevTransportResponse {
+                liveSettings = liveSettings.copy(jev = liveSettings.jev.copy(dataScopes = emptySet()))
+                return JevTransportResponse.Http(200, """{"model":"jev-test","answers":{$answer}}""".toByteArray(), null)
+            }
+        }
+        val settings = Settings(
+            jev = JevSetting(
+                enabled = true,
+                purposes = mapOf(JevPurpose.MODEL_ROUTING to JevMode.ACTIVE),
+                dataScopes = setOf(JevDataScope.TASK_TEXT, JevDataScope.TOOL_METADATA),
+            ),
+        )
+        val runtime = JevRuntime(
+            coordinator = JevDecisionCoordinator(
+                client = JevClient(transport = transport),
+                apiKeyProvider = { "key" },
+                clock = { 1_000_000L },
+            ),
+            settingsProvider = { liveSettings },
+            calibration = calibration,
+        )
+        val ranked = JevCouncilPoolRanker(runtime)
+            .rank(councilInput(), settings, settings.agentRuntime.modelCouncil)
+        assertNull(ranked)
+        assertTrue(calibration.records.isEmpty())
+    }
+
+    @Test
+    fun raisedPolicyThresholdAppliesAndRecords() = runTest {
+        val settings = settingsWithModels()
+        val ids = app.amber.feature.modelcouncil.ModelCouncilValidator
+            .defaultPoolModelIds(settings, settings.agentRuntime.modelCouncil)
+        // 0.9 在默认阈值下过筛，收紧到 0.95 后全部弃权：验证阈值真正来自 policy。
+        val answer = ids.joinToString(",") { """"${it}":{"type":"noul","noul":0.9}""" }
+        val calibration = FreshCalibration()
+        val transport = ScriptedTransport("""{"model":"jev-test","answers":{$answer}}""")
+        val policy = JevPolicy(modelRoutingMinSuitability = 0.95)
+        val ranked = JevCouncilPoolRanker(
+            runtime(transport, JevMode.ACTIVE, calibration = calibration, policy = policy),
+        ).rank(councilInput(), settings, settings.agentRuntime.modelCouncil)
+        assertNull(ranked)
+        val record = calibration.records.single()
+        assertEquals(0.95, record.threshold, 0.0)
+        assertNull(record.jevTop1)
+    }
+}

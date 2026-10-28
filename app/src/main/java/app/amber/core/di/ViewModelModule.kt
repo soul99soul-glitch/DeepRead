@@ -1,0 +1,102 @@
+package app.amber.core.di
+
+import app.amber.core.infra.AppScope
+import app.amber.core.settings.prefs.SettingsAggregator
+import app.amber.feature.ui.components.ai.SubAgentDockState
+import app.amber.feature.ui.components.ai.SubAgentDockLocalizer
+import app.amber.feature.ui.pages.backup.BackupVM
+import app.amber.feature.ui.pages.chat.ChatDrawerVM
+import app.amber.feature.ui.pages.chat.ChatVM
+import app.amber.feature.ui.pages.councilroom.CouncilRoomVM
+import app.amber.feature.ui.pages.debug.DebugVM
+import app.amber.feature.ui.pages.developer.DeveloperVM
+import app.amber.feature.ui.pages.favorite.FavoriteVM
+import app.amber.feature.ui.pages.search.SearchVM
+import app.amber.feature.ui.pages.sessionhome.HomeCouncilRoomCreator
+import app.amber.feature.ui.pages.sessionhome.SessionHomeVM
+import app.amber.feature.ui.pages.history.HistoryVM
+import app.amber.feature.ui.pages.profile.ProfileVM
+import app.amber.feature.ui.pages.stats.StatsVM
+import app.amber.feature.ui.pages.extensions.PromptVM
+import app.amber.feature.ui.pages.extensions.QuickMessagesVM
+import app.amber.feature.ui.pages.extensions.SkillDetailVM
+import app.amber.feature.ui.pages.extensions.SkillsVM
+import app.amber.feature.ui.pages.live.LiveCompanionVM
+import app.amber.feature.ui.pages.setting.SettingAgentMemoryVM
+import app.amber.feature.ui.pages.setting.SettingCapabilityPermissionsVM
+import app.amber.feature.ui.pages.setting.SettingVM
+import app.amber.feature.ui.pages.setting.StorageVM
+import app.amber.feature.ui.pages.share.handler.ShareHandlerVM
+import app.amber.feature.ui.pages.synara.SynaraConnectionStore
+import app.amber.feature.ui.pages.synara.SynaraVM
+import app.amber.feature.ui.pages.zcode.ZCodeUrlStore
+import org.koin.android.ext.koin.androidContext
+import org.koin.core.module.dsl.viewModel
+import org.koin.core.module.dsl.viewModelOf
+import org.koin.dsl.module
+
+val viewModelModule = module {
+    single { SubAgentDockLocalizer(settingsStore = get(), providerCatalog = get(), json = get()) }
+    single(createdAtStart = true) {
+        SubAgentDockState(get(), get(), get<AppScope>(), get<SettingsAggregator>())
+    }
+    viewModel<ChatVM> { params ->
+        ChatVM(
+            id = params.get(),
+            context = get(),
+            settingsStore = get(),
+            conversationRepo = get(),
+            chatService = get(),
+            analytics = get(),
+            eventBus = get(),
+            filesManager = get(),
+            favoriteRepository = get(),
+            contextRepository = get(),
+            conversationDraftStore = get(),
+            startSuggestionGenerator = get(),
+        )
+    }
+    viewModelOf(::ChatDrawerVM)
+    factory {
+        HomeCouncilRoomCreator(
+            settingsStore = get(),
+            conversationRepo = get(),
+            roomManager = get(),
+            restoreWriteGate = get(),
+        )
+    }
+    viewModelOf(::SessionHomeVM)
+    viewModel<CouncilRoomVM> { params ->
+        CouncilRoomVM(
+            conversationId = params.get(),
+            manager = get(),
+            settingsStore = get(),
+            context = androidContext(),
+        )
+    }
+    viewModelOf(::SettingVM)
+    viewModelOf(::SettingAgentMemoryVM)
+    viewModelOf(::SettingCapabilityPermissionsVM)
+    viewModelOf(::DebugVM)
+    viewModelOf(::HistoryVM)
+    viewModelOf(::LiveCompanionVM)
+    single { SynaraConnectionStore(androidContext()) }
+    viewModel { SynaraVM(store = get()) }
+    single { ZCodeUrlStore(androidContext()) }
+    viewModel<ShareHandlerVM> {
+        ShareHandlerVM(
+            text = it.get(),
+        )
+    }
+    viewModelOf(::BackupVM)
+    viewModelOf(::StorageVM)
+    viewModelOf(::DeveloperVM)
+    viewModelOf(::PromptVM)
+    viewModelOf(::QuickMessagesVM)
+    viewModelOf(::SkillsVM)
+    viewModelOf(::SkillDetailVM)
+    viewModelOf(::FavoriteVM)
+    viewModelOf(::SearchVM)
+    viewModelOf(::StatsVM)
+    viewModelOf(::ProfileVM)
+}

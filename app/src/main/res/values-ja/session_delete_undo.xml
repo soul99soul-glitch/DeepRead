@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <plurals name="session_home_deleted_count">
+        <item quantity="other">会話を%d件削除しました</item>
+    </plurals>
+    <string name="session_home_undo">元に戻す</string>
+    <plurals name="session_home_undo_seconds">
+        <item quantity="other">あと%d秒間取り消せます</item>
+    </plurals>
+    <string name="session_home_delete_failed_restored">会話を削除できませんでした。リストに復元しました。</string>
+    <string name="session_home_delete_cleanup_failed">会話は削除されましたが、一部のデータを整理できませんでした。</string>
+    <string name="session_home_delete_unverified">削除を確認できません。アプリを再起動して会話を確認してください。</string>
+</resources>

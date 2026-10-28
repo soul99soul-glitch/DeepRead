@@ -1,0 +1,1487 @@
+// AmberAgent WebMount — bootstrap JS bridge.
+// Assembled with private site/network factories by WebMountBridgeBootstrap.
+//
+// Re-injected after every navigation by the Kotlin side (the JS context
+// resets on each load). Provides a single entry point `__amberWm_call`
+// that dispatches RPC requests from Kotlin to local handlers and resolves
+// via the `AmberWM` interface (Kotlin-bound via addJavascriptInterface).
+//
+// Phase 1 M1.3.1 handlers: `state`. Subsequent milestones extend the
+// switch below with `extract`, `wait`, `click`, `type`, `eval`, etc.
+
+(function () {
+  if (window.__amberWmReady) return;
+  window.__amberWmReady = true;
+  window.__amberWmDocumentStart = window.__amberWmDocumentStart === true || document.readyState === 'loading';
+  // Refs are opaque handles to this JS realm. Include a realm token so a ref
+  // from a prior document cannot alias a freshly numbered ref after reload.
+  window.__amberWmRealmId = window.__amberWmRealmId || Math.random().toString(36).substring(2, 10);
+  window.__amberWmSnapshotSeq = window.__amberWmSnapshotSeq || 0;
+  window.__amberWmSnapshot = window.__amberWmSnapshot || { id: 0, entries: {} };
+
+  function safeJson(v) {
+    try { return JSON.stringify(v); }
+    catch (e) { return JSON.stringify({ __error: 'unserializable' }); }
+  }
+
+  function getViewport() {
+    return {
+      w: window.innerWidth | 0,
+      h: window.innerHeight | 0,
+      dpr: window.devicePixelRatio || 1,
+    };
+  }
+
+  function redactedUrl(url) {
+    try {
+      var u = new URL(String(url || ''), location.href);
+      var out = u.protocol + '//' + u.host + u.pathname;
+      var keys = [];
+      u.searchParams.forEach(function (_, key) {
+        if (keys.indexOf(key) < 0) keys.push(key);
+      });
+      if (keys.length > 0) {
+        out += '?' + keys.map(function (key) {
+          return encodeURIComponent(key) + '=<redacted>';
+        }).join('&');
+      }
+      return out;
+    } catch (_) {
+      return String(url || '').split('#')[0].split('?')[0];
+    }
+  }
+
+  function snapshotState() {
+    return {
+      url: redactedUrl(location.href),
+      title: document.title || '',
+      ready_state: document.readyState,
+      viewport: getViewport(),
+      scroll: {
+        x: window.scrollX | 0,
+        y: window.scrollY | 0,
+        max_y: (document.documentElement.scrollHeight - window.innerHeight) | 0,
+      },
+    };
+  }
+
+  function hashString(s) {
+    var h = 2166136261;
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24);
+    }
+    return (h >>> 0).toString(16);
+  }
+
+  function semanticText(maxChars) {
+    var raw = (document.body && (document.body.innerText || document.body.textContent)) || '';
+    return raw.replace(/\s+/g, ' ').trim().substring(0, maxChars || 4000);
+  }
+
+  function isContentEditableElement(el) {
+    if (!el) return false;
+    if (el.isContentEditable === true) return true;
+    var attr = el.getAttribute && el.getAttribute('contenteditable');
+    return attr != null && String(attr).toLowerCase() !== 'false';
+  }
+
+  function editableText(el) {
+    return el && el.textContent ? String(el.textContent) : '';
+  }
+
+  function editableName(el) {
+    if (!el || !el.getAttribute) return '';
+    var aria = el.getAttribute('aria-label');
+    if (aria) return String(aria).trim();
+    var labelled = el.getAttribute('aria-labelledby');
+    if (labelled) {
+      var ref = document.getElementById(labelled);
+      if (ref) return (ref.innerText || ref.textContent || '').trim();
+    }
+    var placeholder = el.getAttribute('placeholder');
+    if (placeholder) return String(placeholder).trim();
+    var testId = el.getAttribute('data-testid');
+    return testId ? String(testId).trim() : '';
+  }
+
+  function interactiveState(el) {
+    var tag = (el.tagName || '').toLowerCase();
+    var state = [];
+    if (tag === 'input' || tag === 'textarea' || tag === 'select') {
+      var value = '';
+      try { value = el.value == null ? '' : String(el.value); } catch (_) {}
+      state.push('value_hash=' + hashString(value));
+      if (tag === 'input' && (el.type === 'checkbox' || el.type === 'radio')) {
+        state.push('checked=' + (!!el.checked));
+      }
+      if (tag === 'select') state.push('selected_index=' + (el.selectedIndex | 0));
+    }
+    if (isContentEditableElement(el)) {
+      state.push('value_hash=' + hashString(editableText(el)));
+    }
+    state.push('disabled=' + isDisabled(el));
+    state.push('readonly=' + isReadOnly(el));
+    return state.join(',');
+  }
+
+  function semanticState(args) {
+    args = args || {};
+    var text = semanticText(args.text_fingerprint_chars || 60000);
+    var interactive = Array.prototype.slice.call(document.querySelectorAll(
+      'a[href],button,input,select,textarea,[role=button],[role=link],[role=tab],[role=menuitem],[role=textbox],[contenteditable="true"],[onclick]'
+    )).filter(isVisible);
+    var main = snapshotState();
+    main.snapshot_id = window.__amberWmSnapshot ? window.__amberWmSnapshot.id : null;
+    var signalSeq = window.__amberWmNetSignalSeq || 0;
+    var fpParts = [
+      location.href,
+      document.title || '',
+      document.readyState,
+      text,
+      interactive.slice(0, 300).map(function (el) {
+        return [roleOf(el), accessibleName(el, 80), nodePath(el), interactiveState(el)].join(':');
+      }).join('|'),
+      window.scrollX | 0,
+      window.scrollY | 0,
+      args.ignore_network_signal === true ? 0 : signalSeq,
+    ];
+    main.semantic_fingerprint = hashString(fpParts.join('\n'));
+    main.main_text_chars = ((document.body && (document.body.innerText || document.body.textContent)) || '').length;
+    main.visible_text_sample = text.substring(0, args.text_sample_chars || 1200);
+    main.interactive_count = interactive.length;
+    main.network_signal_seq = signalSeq;
+    main.network_pending = window.__amberWmNetPending || 0;
+    main.network_coverage = window.__amberWmDocumentStart ? 'document_start' : 'page_finished';
+    return main;
+  }
+
+  // Console capture — buffer recent messages so wm_state can return a tail.
+  if (!window.__amberWmConsole) {
+    window.__amberWmConsole = [];
+    var BUF_MAX = 64;
+    ['log', 'info', 'warn', 'error', 'debug'].forEach(function (level) {
+      var orig = console[level].bind(console);
+      console[level] = function () {
+        try {
+          var parts = [];
+          for (var i = 0; i < arguments.length; i++) {
+            var a = arguments[i];
+            parts.push(typeof a === 'string' ? a : safeJson(a));
+          }
+          window.__amberWmConsole.push({ level: level, msg: parts.join(' '), ts: Date.now() });
+          if (window.__amberWmConsole.length > BUF_MAX) {
+            window.__amberWmConsole.splice(0, window.__amberWmConsole.length - BUF_MAX);
+          }
+        } catch (_) { /* ignore */ }
+        return orig.apply(this, arguments);
+      };
+    });
+  }
+
+  function consoleTail(n) {
+    var max = Math.max(0, Math.min(n || 16, window.__amberWmConsole.length));
+    return window.__amberWmConsole.slice(window.__amberWmConsole.length - max);
+  }
+
+  // --------------------------------------------------------------- selectors
+
+  /**
+   * Resolve a selector string into a NodeList. Supports:
+   *   - "css:..."  or "...":   document.querySelectorAll(...)
+   *   - "text=..."             elements whose .innerText / .textContent
+   *                            contains the substring (case-insensitive)
+   *   - "xpath=..."            XPath via document.evaluate(...)
+   * Returns an Array (not live).
+   */
+  function resolveSelector(sel) {
+    if (!sel || typeof sel !== 'string') return [];
+    if (sel.indexOf('xpath=') === 0) {
+      var xp = sel.substring(6);
+      var out = [];
+      var snap = document.evaluate(xp, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+      for (var i = 0; i < snap.snapshotLength; i++) out.push(snap.snapshotItem(i));
+      return out;
+    }
+    if (sel.indexOf('text=') === 0) {
+      var needle = sel.substring(5).toLowerCase();
+      var all = Array.prototype.slice.call(document.querySelectorAll('a,button,input,[role=button],[role=link],label,h1,h2,h3,h4,li,p,span,div'));
+      var matches = all.filter(function (el) {
+        var t = (el.innerText || el.textContent || '').toLowerCase();
+        return t.indexOf(needle) >= 0;
+      });
+      // Ancestor containers often contain the same text as their button/link
+      // child. Prefer actionable matches, then keep the deepest match so a
+      // text selector cannot silently click a non-interactive wrapper.
+      var actionable = matches.filter(isActionableTarget);
+      var preferred = actionable.length > 0 ? actionable : matches;
+      return preferred.filter(function (el) {
+        return !preferred.some(function (other) {
+          return other !== el && el.contains && el.contains(other);
+        });
+      });
+    }
+    var css = sel.indexOf('css:') === 0 ? sel.substring(4) : sel;
+    try { return Array.prototype.slice.call(document.querySelectorAll(css)); }
+    catch (e) { return []; }
+  }
+
+  function isActionableTarget(el) {
+    if (!el) return false;
+    var tag = (el.tagName || '').toLowerCase();
+    if (tag === 'a' || tag === 'button' || tag === 'input' || tag === 'select' || tag === 'textarea' || tag === 'label') return true;
+    var role = el.getAttribute && el.getAttribute('role');
+    if (role === 'button' || role === 'link' || role === 'tab' || role === 'menuitem') return true;
+    return !!(el.getAttribute && el.getAttribute('onclick'));
+  }
+
+  function isVisible(el) {
+    if (!el || el.nodeType !== 1) return false;
+    var r = el.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) return false;
+    var cs = window.getComputedStyle(el);
+    if (cs.visibility === 'hidden' || cs.display === 'none' || parseFloat(cs.opacity || '1') === 0) return false;
+    return true;
+  }
+
+  function roleOf(el) {
+    var r = el.getAttribute && el.getAttribute('role');
+    if (r) return r;
+    switch ((el.tagName || '').toLowerCase()) {
+      case 'a': return 'link';
+      case 'button': return 'button';
+      case 'input': return el.type ? ('input:' + el.type) : 'input';
+      case 'select': return 'combobox';
+      case 'textarea': return 'textbox';
+      case 'h1': case 'h2': case 'h3': case 'h4': case 'h5': case 'h6': return 'heading';
+      default: return null;
+    }
+  }
+
+  function accessibleName(el) {
+    if (!el) return null;
+    var aria = el.getAttribute && el.getAttribute('aria-label');
+    if (aria) return aria.trim();
+    var labelled = el.getAttribute && el.getAttribute('aria-labelledby');
+    if (labelled) {
+      var ref = document.getElementById(labelled);
+      if (ref) return (ref.innerText || ref.textContent || '').trim();
+    }
+    // Native form labels are part of the accessible name even without ARIA.
+    // HTMLInputElement/HTMLTextAreaElement/HTMLSelectElement expose the
+    // associated labels through the standard `labels` property.
+    try {
+      var labels = el.labels;
+      if (labels && labels.length) {
+        var labelText = [];
+        for (var i = 0; i < labels.length; i++) {
+          var text = (labels[i].innerText || labels[i].textContent || '').trim();
+          if (text) labelText.push(text);
+        }
+        if (labelText.length) return labelText.join(' ');
+      }
+    } catch (_) { /* ignore unsupported/non-form elements */ }
+    var alt = el.getAttribute && el.getAttribute('alt');
+    if (alt) return alt.trim();
+    var title = el.getAttribute && el.getAttribute('title');
+    if (title) return title.trim();
+    if (el.tagName === 'INPUT' && el.placeholder) return el.placeholder.trim();
+    var text = (el.innerText || el.textContent || '').trim();
+    if (text.length > 0 && text.length < 200) return text;
+    return null;
+  }
+
+  function isDisabled(el) {
+    if (!el) return false;
+    if (el.disabled === true) return true;
+    if (el.getAttribute && String(el.getAttribute('aria-disabled') || '').toLowerCase() === 'true') return true;
+    try { return !!(el.matches && el.matches(':disabled')); }
+    catch (_) { return false; }
+  }
+
+  function isReadOnly(el) {
+    if (!el) return false;
+    if (el.readOnly === true) return true;
+    return !!(el.getAttribute && String(el.getAttribute('aria-readonly') || '').toLowerCase() === 'true');
+  }
+
+  function rectOf(el) {
+    var r = el.getBoundingClientRect();
+    return [r.left | 0, r.top | 0, r.width | 0, r.height | 0];
+  }
+
+  function nodePath(el) {
+    // Cheap CSS path with standards-compliant nth-of-type indexes.
+    // Capped at 6 segments to keep snapshot output small.
+    var parts = [];
+    var cur = el;
+    while (cur && cur.nodeType === 1 && parts.length < 6) {
+      var tag = cur.tagName ? cur.tagName.toLowerCase() : '#';
+      var parent = cur.parentElement;
+      if (parent) {
+        var sibs = Array.prototype.filter.call(parent.children, function (c) { return c.tagName === cur.tagName; });
+        if (sibs.length > 1) {
+          tag += ':nth-of-type(' + (sibs.indexOf(cur) + 1) + ')';
+        }
+      }
+      parts.unshift(tag);
+      cur = cur.parentElement;
+    }
+    return parts.join('>');
+  }
+
+  function textPreview(el) {
+    var t = (el && (el.innerText || el.textContent) || '').replace(/\s+/g, ' ').trim();
+    return t.length > 120 ? t.substring(0, 120) : t;
+  }
+
+  function fingerprintOf(el) {
+    var r = rectOf(el);
+    var href = el && el.tagName === 'A' ? redactedUrl(el.href || '') : '';
+    var inputType = el && el.tagName === 'INPUT' ? (el.type || '') : '';
+    // A contenteditable draft is user data, and it changes on every edit.
+    // Keep its ref identity tied to stable author-provided metadata instead
+    // of putting the draft into the returned fingerprint.
+    var editable = isContentEditableElement(el);
+    var name = editable ? editableName(el) : (accessibleName(el) || '');
+    var text = editable ? '' : textPreview(el);
+    return {
+      key: [
+        (el.tagName || '').toLowerCase(),
+        roleOf(el) || '',
+        name,
+        text,
+        href,
+        inputType,
+      ].join('|'),
+      rect_bucket: [
+        Math.round((r[0] || 0) / 16),
+        Math.round((r[1] || 0) / 16),
+        Math.round((r[2] || 0) / 16),
+        Math.round((r[3] || 0) / 16),
+      ].join(','),
+    };
+  }
+
+  function startSnapshot() {
+    var id = ++window.__amberWmSnapshotSeq;
+    window.__amberWmSnapshot = { id: id, entries: {} };
+    return id;
+  }
+
+  function rememberSnapshotNode(el, node, forcedRef) {
+    var snapshot = window.__amberWmSnapshot;
+    var ref = forcedRef != null
+      ? String(forcedRef)
+      : 'wmref_' + window.__amberWmRealmId + '_' + snapshot.id + '_' + (Object.keys(snapshot.entries).length + 1);
+    var fp = fingerprintOf(el);
+    node.ref = ref;
+    node.css = node.path;
+    node.fingerprint = fp;
+    snapshot.entries[ref] = {
+      el: el,
+      css: node.css,
+      fingerprint: fp,
+      summary: {
+        ref: ref,
+        tag: node.tag,
+        role: node.role,
+        name: node.name,
+        text: node.text,
+        rect: node.rect,
+        visible: node.visible,
+        css: node.css,
+        fingerprint: fp,
+      },
+    };
+    return node;
+  }
+
+  function targetError(code, message, hint, candidates) {
+    return {
+      ok: false,
+      error: {
+        code: code,
+        message: message,
+        hint: hint || null,
+        candidates: (candidates || []).slice(0, 5),
+      },
+    };
+  }
+
+  function candidateSummary(el, ref) {
+    var node = describeNode(el, { text: true });
+    if (ref) node.ref = ref;
+    node.css = node.path;
+    node.fingerprint = fingerprintOf(el);
+    return node;
+  }
+
+  function candidateSummaryNoText(el, ref) {
+    var node = describeNode(el, { text: false });
+    if (ref) node.ref = ref;
+    node.css = node.path;
+    node.fingerprint = fingerprintOf(el);
+    return node;
+  }
+
+  function sameFingerprint(a, b, requireRect) {
+    return a && b && a.key === b.key && (!requireRect || a.rect_bucket === b.rect_bucket);
+  }
+
+  function findByFingerprint(fingerprint, visibleOnly) {
+    if (!fingerprint || !fingerprint.key) return [];
+    var selector = 'a[href],button,input,select,textarea,[role=button],[role=link],[role=tab],[role=menuitem],[role=textbox],[contenteditable="true"],[onclick],label,h1,h2,h3,h4,li,p,span,div';
+    var all = Array.prototype.slice.call(document.querySelectorAll(selector));
+    return all.filter(function (el) {
+      if (visibleOnly && !isVisible(el)) return false;
+      return sameFingerprint(fingerprintOf(el), fingerprint, true);
+    });
+  }
+
+  function resolveSelectorTarget(selector, visibleOnly, opts, matchLevel) {
+    var candidates = resolveSelector(selector);
+    if (visibleOnly) candidates = candidates.filter(isVisible);
+    if (candidates.length === 0) {
+      return targetError('target_not_found', 'no element matched: ' + selector, 'Use wm_extract(mode="interactive") to inspect visible refs.');
+    }
+    if (candidates.length > 1 && opts.requireUnique === true) {
+      return targetError('ambiguous_target', 'selector matched multiple elements: ' + selector, 'Use a returned ref instead of a broad selector.', candidates.map(function (el) { return candidateSummary(el); }));
+    }
+    return { ok: true, el: candidates[0], matches_n: candidates.length, match_level: matchLevel };
+  }
+
+  function resolveTarget(args, opts) {
+    opts = opts || {};
+    var visibleOnly = opts.visibleOnly !== false && args.visible_only !== false;
+    var allowFingerprintFallback = opts.allowFingerprintFallback !== false;
+    var requireStableRect = opts.requireStableRect === true;
+    var target = args.target != null ? String(args.target) : null;
+    var selector = args.selector;
+    var candidates;
+
+    // Snapshot refs are currently compact numeric strings. They are opaque
+    // identities, not CSS selectors; accepting one without its snapshot id
+    // would let an old ref fall through to a newly-created entry (or to a
+    // selector lookup) after refs are reused. Legacy CSS/text/xpath selectors
+    // remain available through `selector`.
+    if (target && /^\d+$/.test(target) && args.snapshot_id == null) {
+      return targetError(
+        'missing_snapshot',
+        'snapshot_id is required when target is a snapshot ref: ' + target,
+        'Run wm_extract again and pass both the returned ref and snapshot_id.',
+      );
+    }
+
+    // A ref is only meaningful in the snapshot that produced it. Without this
+    // check a refreshed snapshot can reuse ref "1" and silently send the
+    // action to a different element. Selectors remain a deliberate fallback;
+    // ref based actions must carry the snapshot id returned by wm_extract.
+    if (target && args.snapshot_id != null) {
+      var requestedSnapshotId = String(args.snapshot_id);
+      var currentSnapshotId = window.__amberWmSnapshot
+        ? String(window.__amberWmSnapshot.id)
+        : null;
+      if (currentSnapshotId !== requestedSnapshotId) {
+        return targetError(
+          'stale_target',
+          'target ref belongs to an expired snapshot: ' + requestedSnapshotId,
+          'Run wm_extract again and use the new ref with its snapshot_id.',
+        );
+      }
+    }
+
+    if (target && window.__amberWmSnapshot && window.__amberWmSnapshot.entries[target]) {
+      var entry = window.__amberWmSnapshot.entries[target];
+      if (entry.el && entry.el.isConnected && (!visibleOnly || isVisible(entry.el)) && sameFingerprint(fingerprintOf(entry.el), entry.fingerprint, requireStableRect)) {
+        return { ok: true, el: entry.el, matches_n: 1, match_level: 'exact_ref', ref: target };
+      }
+      candidates = entry.css ? resolveSelector(entry.css).filter(function (el) {
+        return (!visibleOnly || isVisible(el)) && sameFingerprint(fingerprintOf(el), entry.fingerprint, requireStableRect);
+      }) : [];
+      if (candidates.length === 1) {
+        return { ok: true, el: candidates[0], matches_n: 1, match_level: 'css', ref: target };
+      }
+      if (allowFingerprintFallback) {
+        candidates = findByFingerprint(entry.fingerprint, visibleOnly);
+        if (candidates.length === 1) {
+          return { ok: true, el: candidates[0], matches_n: 1, match_level: 'fingerprint', ref: target };
+        }
+        if (candidates.length > 1) {
+          return targetError('ambiguous_target', 'target ref matched multiple elements after DOM changed', 'Run wm_extract again and use the new ref.', candidates.map(function (el) { return candidateSummary(el); }));
+        }
+      }
+      if (selector) {
+        var fallback = resolveSelectorTarget(selector, visibleOnly, opts, 'selector_fallback');
+        if (fallback.ok) fallback.ref = target;
+        return fallback;
+      }
+      return targetError('target_not_found', 'target ref is no longer available: ' + target, 'Run wm_extract again and use the new ref.', entry.summary ? [entry.summary] : []);
+    }
+
+    var sel = selector || target;
+    if (!sel) return targetError('missing_target', 'target or selector is required', 'Call wm_extract first, then pass a returned ref as target.');
+    return resolveSelectorTarget(sel, visibleOnly, opts, selector ? 'selector' : 'target_selector');
+  }
+
+  // --------------------------------------------------------------- extract
+
+  function describeNode(el, opts) {
+    var editable = isContentEditableElement(el);
+    var node = {
+      tag: (el.tagName || '').toLowerCase(),
+      path: nodePath(el),
+      role: roleOf(el),
+      name: editable ? (editableName(el) || null) : accessibleName(el),
+      rect: rectOf(el),
+      visible: isVisible(el),
+    };
+    if (el.tagName === 'A' && el.href) node.href = redactedUrl(el.href);
+    if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') {
+      var rawValue = '';
+      try { rawValue = el.value || ''; } catch (_) {}
+      node.value_chars = rawValue.length;
+      if (el.type) node.input_type = el.type;
+      if (el.tagName === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio')) {
+        node.checked = !!el.checked;
+      }
+      if (el.tagName === 'SELECT') {
+        node.selected_index = el.selectedIndex;
+        node.option_count = el.options ? el.options.length : 0;
+      }
+      if (el.disabled) node.disabled = true;
+    }
+    if (editable) {
+      node.value_chars = editableText(el).length;
+      if (isDisabled(el)) node.disabled = true;
+      if (isReadOnly(el)) node.readonly = true;
+    } else if (opts && opts.text !== false) {
+      var t = (el.innerText || el.textContent || '').trim();
+      if (t.length > 0) node.text = t.length > 240 ? (t.substring(0, 240) + '…') : t;
+    }
+    return node;
+  }
+
+  function extractReadable(args) {
+    var maxChars = (args.max_chars | 0) || 4000;
+    var maxLinks = (args.max_links | 0) || 20;
+    var raw = (document.body && document.body.innerText) || '';
+    var text = raw.length > maxChars ? raw.substring(0, maxChars) : raw;
+    var anchors = Array.prototype.slice.call(document.querySelectorAll('a[href]'));
+    var seen = {};
+    var links = [];
+    for (var i = 0; i < anchors.length && links.length < maxLinks; i++) {
+      var a = anchors[i];
+      var href = a.href;
+      if (!href || seen[href]) continue;
+      seen[href] = true;
+      var label = accessibleName(a);
+      if (!label) continue;
+      links.push({ href: redactedUrl(href), text: label });
+    }
+    return {
+      mode: 'readable',
+      url: redactedUrl(location.href),
+      title: document.title || '',
+      text: text,
+      text_chars: text.length,
+      truncated: raw.length > maxChars,
+      total_chars: raw.length,
+      links: links,
+      total_links: anchors.length,
+    };
+  }
+
+  function extractInteractive(args) {
+    var maxNodes = Math.min(((args.max_nodes | 0) || 200), 1000);
+    var selector = 'a[href],button,input,select,textarea,[role=button],[role=link],[role=tab],[role=menuitem],[role=textbox],[contenteditable="true"],[onclick]';
+    var els = Array.prototype.slice.call(document.querySelectorAll(selector));
+    var visible = args.visible_only !== false;
+    var nodes = [];
+    var snapshotId = args.snapshot_id && window.__amberWmSnapshot && window.__amberWmSnapshot.id === args.snapshot_id
+      ? args.snapshot_id
+      : startSnapshot();
+    for (var i = 0; i < els.length && nodes.length < maxNodes; i++) {
+      var el = els[i];
+      if (visible && !isVisible(el)) continue;
+      nodes.push(rememberSnapshotNode(el, describeNode(el, { text: true })));
+    }
+    return {
+      mode: 'interactive',
+      snapshot_id: snapshotId,
+      url: redactedUrl(location.href),
+      title: document.title || '',
+      nodes: nodes,
+      truncated: nodes.length >= maxNodes && els.length > maxNodes,
+      total_candidates: els.length,
+    };
+  }
+
+  function extractSnapshot(args) {
+    var maxNodes = Math.min(((args.max_nodes | 0) || 1000), 4000);
+    var rootSel = args.root_selector;
+    var root = document.body;
+    if (rootSel) {
+      var matched = resolveSelector(rootSel);
+      if (matched.length > 0) root = matched[0];
+    }
+    var visible = args.visible_only !== false;
+    var nodes = [];
+    var walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, null, false);
+    var cur = walker.currentNode;
+    var snapshotId = startSnapshot();
+    while (cur && nodes.length < maxNodes) {
+      if (!visible || isVisible(cur)) {
+        var role = roleOf(cur);
+        var hasName = accessibleName(cur);
+        // Only keep semantically interesting nodes when not in role/name mode.
+        if (role || hasName || cur === root) {
+          nodes.push(rememberSnapshotNode(cur, describeNode(cur, { text: true })));
+        }
+      }
+      cur = walker.nextNode();
+    }
+    return {
+      mode: 'snapshot',
+      snapshot_id: snapshotId,
+      url: redactedUrl(location.href),
+      title: document.title || '',
+      viewport: getViewport(),
+      root_selector: rootSel || 'body',
+      nodes: nodes,
+      truncated: nodes.length >= maxNodes,
+    };
+  }
+
+  function extractHtml(args) {
+    var sel = args.selector;
+    var maxChars = ((args.max_chars | 0) || 60000);
+    var target = sel ? (resolveSelector(sel)[0] || null) : document.documentElement;
+    if (!target) return { mode: 'html', error: 'no element matched: ' + sel };
+    var html = target.outerHTML || '';
+    var truncated = html.length > maxChars;
+    return {
+      mode: 'html',
+      url: redactedUrl(location.href),
+      selector: sel || ':root',
+      html: truncated ? html.substring(0, maxChars) : html,
+      total_chars: html.length,
+      truncated: truncated,
+    };
+  }
+
+  // --------------------------------------------------------------- visual
+
+  function nearestText(el) {
+    var node = el;
+    for (var i = 0; node && i < 3; i++, node = node.parentElement) {
+      var t = cleanText(node.innerText || node.textContent || '', 220);
+      if (t) return t;
+    }
+    return '';
+  }
+
+  function backgroundImageUrl(el) {
+    try {
+      var bg = getComputedStyle(el).backgroundImage || '';
+      if (!bg || bg === 'none') return '';
+      var m = bg.match(/url\(["']?([^"')]+)["']?\)/);
+      return m ? m[1] : '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function visualCandidate(el, source, ref) {
+    var node = describeNode(el, { text: false });
+    node.ref = ref || node.ref;
+    node.source = source;
+    node.alt = (el.getAttribute && (el.getAttribute('alt') || el.getAttribute('title') || el.getAttribute('aria-label'))) || '';
+    node.near_text = nearestText(el);
+    if (el.tagName === 'IMG' && el.currentSrc) node.src_host = safeHost(el.currentSrc);
+    if (source === 'background') node.background_host = safeHost(backgroundImageUrl(el));
+    if (el.tagName === 'IFRAME') {
+      node.frame_host = safeHost(el.src || '');
+      node.cross_origin = !canReadFrame(el);
+    }
+    return node;
+  }
+
+  function safeHost(url) {
+    try { return new URL(url, location.href).host; }
+    catch (_) { return ''; }
+  }
+
+  function absoluteUrl(url) {
+    try { return new URL(String(url || ''), location.href).href; }
+    catch (_) { return String(url || ''); }
+  }
+
+  function canReadFrame(frame) {
+    try {
+      return !!(frame.contentWindow && frame.contentWindow.document && frame.contentWindow.document.body);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function extractVisualSnapshot(args) {
+    args = args || {};
+    var requestedMax = args.max_candidates == null ? 30 : (args.max_candidates | 0);
+    var maxCandidates = Math.min(Math.max(requestedMax, 0), 120);
+    var nodes = [];
+    var snapshotId = args.snapshot_id && window.__amberWmSnapshot && window.__amberWmSnapshot.id === args.snapshot_id
+      ? args.snapshot_id
+      : startSnapshot();
+    var selector = 'img,canvas,svg,video,iframe,picture,[style*="background-image"]';
+    var els = Array.prototype.slice.call(document.querySelectorAll(selector));
+    for (var i = 0; i < els.length && nodes.length < maxCandidates; i++) {
+      var el = els[i];
+      if (!isElementInViewport(el)) continue;
+      var tag = (el.tagName || '').toLowerCase();
+      var source = tag;
+      if (tag !== 'img' && tag !== 'canvas' && tag !== 'svg' && tag !== 'video' && tag !== 'iframe') {
+        if (!backgroundImageUrl(el)) continue;
+        source = 'background';
+      }
+      var remembered = rememberSnapshotNode(el, visualCandidate(el, source));
+      nodes.push(remembered);
+    }
+    return {
+      mode: 'visual_snapshot',
+      snapshot_id: snapshotId,
+      url: redactedUrl(location.href),
+      title: document.title || '',
+      viewport: getViewport(),
+      candidates: nodes,
+      truncated: nodes.length >= maxCandidates && els.length > nodes.length,
+      total_candidates: els.length,
+      blind_spots: nodes.filter(function (n) { return n.source === 'canvas' || n.cross_origin === true; }).length,
+    };
+  }
+
+  function targetRegion(args) {
+    var resolved = resolveTarget(args, { requireUnique: true, allowFingerprintFallback: false, requireStableRect: true });
+    if (!resolved.ok) return resolved;
+    return {
+      ok: true,
+      target: candidateSummary(resolved.el, resolved.ref),
+      rect: rectOf(resolved.el),
+      matches_n: resolved.matches_n,
+      match_level: resolved.match_level,
+    };
+  }
+
+  function restoreSnapshotRefs(args) {
+    args = args || {};
+    var snapshotId = startSnapshot();
+    var restored = 0;
+    var missing = 0;
+    function restoreList(nodes) {
+      if (!Array.isArray(nodes)) return;
+      for (var i = 0; i < nodes.length; i++) {
+        var node = nodes[i] || {};
+        if (!node.ref || !node.css) {
+          missing++;
+          continue;
+        }
+        var matches = resolveSelector(node.css).filter(isVisible);
+        var expected = node.fingerprint || null;
+        var chosen = null;
+        for (var j = 0; j < matches.length; j++) {
+          if (!expected || sameFingerprint(fingerprintOf(matches[j]), expected, true)) {
+            chosen = matches[j];
+            break;
+          }
+        }
+        if (chosen) {
+          rememberSnapshotNode(chosen, describeNode(chosen, { text: true }), node.ref);
+          restored++;
+        } else {
+          missing++;
+        }
+      }
+    }
+    restoreList(args.interactive && args.interactive.nodes);
+    restoreList(args.visual && args.visual.candidates);
+    return {
+      ok: true,
+      snapshot_id: snapshotId,
+      restored: restored,
+      missing: missing,
+    };
+  }
+
+  function observePage(args) {
+    args = args || {};
+    var maxText = Math.min(((args.max_text_chars | 0) || 12000), 60000);
+    var maxNodes = Math.min(((args.max_nodes | 0) || 80), 300);
+    var requestedVisual = args.max_visual_candidates == null ? 30 : (args.max_visual_candidates | 0);
+    var maxVisual = Math.min(Math.max(requestedVisual, 0), 120);
+    var snapshotId = startSnapshot();
+    return {
+      mode: 'observe',
+      refs_shared: true,
+      page: semanticState({ text_sample_chars: Math.min(maxText, 2000) }),
+      readable: extractReadable({ max_chars: maxText, max_links: 40 }),
+      interactive: extractInteractive({ max_nodes: maxNodes, visible_only: true, snapshot_id: snapshotId }),
+      visual: extractVisualSnapshot({ max_candidates: maxVisual, snapshot_id: snapshotId }),
+    };
+  }
+
+  // Site snapshots share the core realm/snapshot owner and visual text helpers.
+  function cleanText(s, max) {
+    var t = String(s || '').replace(/\u00a0/g, ' ').replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+    max = max || 2000;
+    return t.length > max ? (t.substring(0, max) + '…') : t;
+  }
+
+  function isElementInViewport(el) {
+    if (!isVisible(el)) return false;
+    var r = el.getBoundingClientRect();
+    return r.bottom >= 0 && r.top <= window.innerHeight && r.right >= 0 && r.left <= window.innerWidth;
+  }
+
+  var feishuSnapshot = createFeishuSnapshot(rectOf, nodePath, startSnapshot, redactedUrl, cleanText, isElementInViewport);
+
+  // --------------------------------------------------------------- wait
+
+  function waitForSelector(sel, timeoutMs, visibleOnly, reqId) {
+    var deadline = Date.now() + timeoutMs;
+    function check() {
+      var matched = resolveSelector(sel);
+      if (visibleOnly) matched = matched.filter(isVisible);
+      if (matched.length > 0) {
+        AmberWM.resolve(reqId, safeJson({
+          waited_ms: timeoutMs - (deadline - Date.now()),
+          matched: matched.length,
+          first_path: nodePath(matched[0]),
+        }));
+        return;
+      }
+      if (Date.now() >= deadline) {
+        AmberWM.reject(reqId, 'wait timed out after ' + timeoutMs + 'ms for selector: ' + sel);
+        return;
+      }
+      setTimeout(check, 100);
+    }
+    check();
+  }
+
+  function waitForReadyState(target, timeoutMs, reqId) {
+    var deadline = Date.now() + timeoutMs;
+    function check() {
+      if (document.readyState === target ||
+          (target === 'complete' && document.readyState === 'complete') ||
+          (target === 'interactive' && (document.readyState === 'interactive' || document.readyState === 'complete'))) {
+        AmberWM.resolve(reqId, safeJson({ waited_ms: timeoutMs - (deadline - Date.now()), ready_state: document.readyState }));
+        return;
+      }
+      if (Date.now() >= deadline) {
+        AmberWM.reject(reqId, 'wait timed out, readyState=' + document.readyState);
+        return;
+      }
+      setTimeout(check, 100);
+    }
+    check();
+  }
+
+  function waitForSemanticIdle(args, reqId) {
+    var timeoutMs = (args.timeout_ms | 0) || 10000;
+    var stableMs = Math.max(250, Math.min((args.stable_ms | 0) || 700, 3000));
+    var deadline = Date.now() + timeoutMs;
+    var requireNetworkIdle = args.until === 'network_idle';
+    var ignoreNetworkSignal = args.until === 'dom_stable';
+    var lastFingerprint = null;
+    var stableSince = 0;
+    function check() {
+      var stateArgs = {};
+      for (var k in args) if (Object.prototype.hasOwnProperty.call(args, k)) stateArgs[k] = args[k];
+      stateArgs.ignore_network_signal = ignoreNetworkSignal;
+      var state = semanticState(stateArgs);
+      var readyEnough = document.readyState === 'interactive' || document.readyState === 'complete';
+      var networkReady = !requireNetworkIdle || (state.network_pending | 0) === 0;
+      if (readyEnough && networkReady && state.semantic_fingerprint === lastFingerprint) {
+        if (!stableSince) stableSince = Date.now();
+        if (Date.now() - stableSince >= stableMs) {
+          state.waited_ms = timeoutMs - (deadline - Date.now());
+          state.stable_ms = Date.now() - stableSince;
+          state.ok = true;
+          AmberWM.resolve(reqId, safeJson(state));
+          return;
+        }
+      } else {
+        lastFingerprint = state.semantic_fingerprint;
+        stableSince = readyEnough && networkReady ? Date.now() : 0;
+      }
+      if (Date.now() >= deadline) {
+        state.ok = false;
+        state.timeout = true;
+        state.fallback_reason = 'semantic_idle_timeout';
+        AmberWM.resolve(reqId, safeJson(state));
+        return;
+      }
+      setTimeout(check, 120);
+    }
+    check();
+  }
+
+  // --------------------------------------------------------------- mutations
+
+  function dispatchMouseEvent(el, type) {
+    var r = el.getBoundingClientRect();
+    var x = r.left + r.width / 2;
+    var y = r.top + r.height / 2;
+    var ev = new MouseEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      button: 0,
+      clientX: x,
+      clientY: y,
+    });
+    el.dispatchEvent(ev);
+  }
+
+  function performClick(args) {
+    var resolved = resolveTarget(args, { allowFingerprintFallback: false, requireStableRect: true });
+    if (!resolved.ok) return resolved;
+    var target = resolved.el;
+    if (isDisabled(target)) {
+      return targetError('target_disabled', 'element is disabled', 'Choose an enabled control from wm_extract(mode="interactive").', [candidateSummary(target, resolved.ref)]);
+    }
+    if (args.visible_only !== false && !isVisible(target)) {
+      // Try scrollIntoView once.
+      if (target.scrollIntoView) target.scrollIntoView({ block: 'center', inline: 'center' });
+      if (!isVisible(target)) return targetError('target_not_visible', 'element is not visible', 'Run wm_scroll on the same target or call wm_extract again.');
+    }
+    if (target.focus) try { target.focus(); } catch (_) {}
+    dispatchMouseEvent(target, 'mousedown');
+    dispatchMouseEvent(target, 'mouseup');
+    // .click() handles default action (e.g. form submit, anchor navigation).
+    try { target.click(); } catch (_) {}
+    return {
+      ok: true,
+      target: candidateSummary(target, resolved.ref),
+      matches_n: resolved.matches_n,
+      match_level: resolved.match_level,
+      url: redactedUrl(location.href),
+    };
+  }
+
+  function performTap(args) {
+    if (args.snapshot_id != null) {
+      var currentSnapshotId = window.__amberWmSnapshot
+        ? String(window.__amberWmSnapshot.id)
+        : null;
+      if (currentSnapshotId !== String(args.snapshot_id)) {
+        return targetError(
+          'stale_target',
+          'coordinate target belongs to an expired snapshot: ' + args.snapshot_id,
+          'Run wm_visual_snapshot or wm_observe again and use the new snapshot_id.',
+        );
+      }
+    }
+    var x = args.x | 0;
+    var y = args.y | 0;
+    var target = document.elementFromPoint(x, y);
+    if (!target) return targetError('target_not_found', 'no element at viewport coordinate', 'Use wm_visual_snapshot or wm_observe to inspect visible regions.');
+    if (isDisabled(target)) {
+      return targetError('target_disabled', 'element is disabled', 'Choose an enabled control from wm_extract(mode="interactive").', [candidateSummary(target)]);
+    }
+    if (target.focus) try { target.focus(); } catch (_) {}
+    dispatchMouseEvent(target, 'mousedown');
+    dispatchMouseEvent(target, 'mouseup');
+    try { target.click(); } catch (_) {}
+    return {
+      ok: true,
+      x: x,
+      y: y,
+      target: candidateSummary(target),
+      url: redactedUrl(location.href),
+    };
+  }
+
+  function editableSelection(el) {
+    var selection = window.getSelection && window.getSelection();
+    if (selection && selection.rangeCount > 0) {
+      var current = selection.getRangeAt(0);
+      if (el.contains(current.startContainer) && el.contains(current.endContainer)) {
+        return current.cloneRange();
+      }
+    }
+    var range = document.createRange();
+    range.selectNodeContents(el);
+    range.collapse(false);
+    return range;
+  }
+
+  function setEditableSelection(range) {
+    var selection = window.getSelection && window.getSelection();
+    if (!selection) return;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    // Lexical listens for the public document selectionchange event to map
+    // the DOM caret back to its editor selection before beforeinput arrives.
+    try { document.dispatchEvent(new Event('selectionchange')); } catch (_) {}
+  }
+
+  function dispatchEditingEvent(el, type, inputType, data) {
+    var init = {
+      bubbles: true,
+      cancelable: type === 'beforeinput',
+      inputType: inputType,
+      data: data == null ? null : String(data),
+    };
+    var InputEventCtor = window.InputEvent;
+    if (typeof InputEventCtor === 'function') {
+      try { return el.dispatchEvent(new InputEventCtor(type, init)); }
+      catch (_) { /* fall through to a regular event for older WebViews */ }
+    }
+    var ev = new Event(type, { bubbles: true, cancelable: init.cancelable });
+    try { Object.defineProperty(ev, 'inputType', { configurable: true, value: inputType }); } catch (_) {}
+    try { Object.defineProperty(ev, 'data', { configurable: true, value: init.data }); } catch (_) {}
+    return el.dispatchEvent(ev);
+  }
+
+  function insertEditableRange(el, text) {
+    var range = editableSelection(el);
+    range.deleteContents();
+    if (text) {
+      var node = document.createTextNode(text);
+      range.insertNode(node);
+      range.setStartAfter(node);
+    }
+    range.collapse(true);
+    setEditableSelection(range);
+  }
+
+  function performEditableType(el, text, clear) {
+    var inputType = text ? 'insertText' : 'deleteContentBackward';
+    // Preserve wm_type's existing append semantics. `clear=true` selects the
+    // editor contents first, allowing the browser/Lexical to replace the
+    // existing paragraphs without flattening their DOM.
+    var range = document.createRange();
+    range.selectNodeContents(el);
+    if (!clear) range.collapse(false);
+    setEditableSelection(range);
+    if (!text && !clear) return { ok: true, handled: false };
+
+    // Use one public beforeinput/input route. Lexical consumes beforeinput and
+    // updates its own state; React contenteditables fall through to a DOM
+    // Range mutation followed by input. Do not combine this with a native
+    // editing command: Android WebView can let both it and Lexical's
+    // beforeinput handler apply the same edit.
+    var beforeInput = dispatchEditingEvent(el, 'beforeinput', inputType, text || null);
+    if (beforeInput) {
+      insertEditableRange(el, text);
+      dispatchEditingEvent(el, 'input', inputType, text || null);
+    }
+    return { ok: true, handled: true };
+  }
+
+  function performType(args) {
+    var text = args.text;
+    if (typeof text !== 'string') throw new Error('type requires text string');
+    var resolved = resolveTarget(args, { requireUnique: true, allowFingerprintFallback: false, requireStableRect: true });
+    if (!resolved.ok) return resolved;
+    var el = resolved.el;
+    if (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA' && !isContentEditableElement(el)) {
+      return targetError('target_not_editable', 'element is not editable', 'Use wm_extract(mode="interactive") and choose an input, textarea, or contenteditable node.', [candidateSummary(el, resolved.ref)]);
+    }
+    if (isDisabled(el)) {
+      return targetError('target_disabled', 'element is disabled', 'Choose an enabled input from wm_extract(mode="interactive").', [candidateSummary(el, resolved.ref)]);
+    }
+    if (isReadOnly(el)) {
+      return targetError('target_readonly', 'element is read-only', 'Choose an editable input or omit readonly state before typing.', [candidateSummary(el, resolved.ref)]);
+    }
+    if (el.focus) try { el.focus(); } catch (_) {}
+    var clear = args.clear === true;
+    if (isContentEditableElement(el)) {
+      performEditableType(el, text, clear);
+    } else {
+      // Frameworks such as React wrap the instance value setter to track
+      // programmatic writes. Use the native setter so the input event below
+      // observes a changed value and updates the controlled state.
+      var prototype = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(prototype, 'value').set.call(el, (clear ? '' : (el.value || '')) + text);
+      // Fire input/change so frameworks observe the new native-control value.
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    if (args.press_enter === true) {
+      var k = new KeyboardEvent('keydown', { bubbles: true, key: 'Enter', code: 'Enter', keyCode: 13, which: 13 });
+      el.dispatchEvent(k);
+    }
+    return {
+      ok: true,
+      target: candidateSummaryNoText(el, resolved.ref),
+      matches_n: resolved.matches_n,
+      match_level: resolved.match_level,
+      value_chars: (isContentEditableElement(el) ? editableText(el) : (el.value || '')).length,
+    };
+  }
+
+  function performGet(args) {
+    var resolved = resolveTarget(args, { requireUnique: true });
+    if (!resolved.ok) return resolved;
+    var el = resolved.el;
+    var kind = args.kind || 'text';
+    var value = null;
+    if (kind === 'text') {
+      value = el.innerText || el.textContent || '';
+    } else if (kind === 'value') {
+      value = isContentEditableElement(el) ? editableText(el) : (el.value || '');
+    } else if (kind === 'html') {
+      value = el.outerHTML || '';
+    } else if (kind === 'attr') {
+      var attr = args.attr_name;
+      if (typeof attr !== 'string' || attr.length === 0) {
+        return targetError('missing_attr_name', 'kind=attr requires attr_name', 'Pass attr_name, for example "href" or "aria-label".');
+      }
+      value = el.getAttribute(attr);
+    } else {
+      return targetError('invalid_kind', 'unknown wm_get kind: ' + kind, 'Use text, value, attr, or html.');
+    }
+    var maxChars = Math.min(((args.max_chars | 0) || 20000), 100000);
+    var text = value == null ? null : String(value);
+    return {
+      ok: true,
+      kind: kind,
+      value: text == null ? null : text.substring(0, maxChars),
+      total_chars: text == null ? 0 : text.length,
+      truncated: text != null && text.length > maxChars,
+      target: candidateSummary(el, resolved.ref),
+      matches_n: resolved.matches_n,
+      match_level: resolved.match_level,
+    };
+  }
+
+  function performEval(args) {
+    var expr = args.expression;
+    if (typeof expr !== 'string') throw new Error('eval requires expression string');
+    // Two passes:
+    //  1. Try wrapping as a single expression: `return (expr)`. Fast path
+    //     for one-liners like `document.title` or `1+2`.
+    //  2. Fall back to multi-statement: just `new Function(expr)`. This
+    //     returns undefined unless the script contains its own `return`;
+    //     we surface that as a note so the agent knows why result is null.
+    var result;
+    var multiStatement = false;
+    try {
+      var fn1 = new Function('return (' + expr + ');');
+      result = fn1();
+    } catch (_) {
+      multiStatement = true;
+      var fn2 = new Function(expr);  // may throw — propagated.
+      result = fn2();
+    }
+    var serialized;
+    try { serialized = JSON.parse(JSON.stringify(result === undefined ? null : result)); }
+    catch (_) { serialized = String(result); }
+    var payload = { ok: true, result: serialized, multi_statement: multiStatement };
+    if (multiStatement && result === undefined) {
+      payload.note = 'Multi-statement script ran but had no explicit return. Wrap in (() => { /* ... */ return value; })() to capture a value.';
+    }
+    return payload;
+  }
+
+  var performFetchReplay = createWebMountNetwork(absoluteUrl, redactedUrl, safeJson);
+
+  // --------------------------------------------------------------- navigation
+
+  function performScroll(args) {
+    if (args.target || args.selector) {
+      var resolved = resolveTarget(args, { allowFingerprintFallback: false, requireStableRect: true });
+      if (!resolved.ok) return resolved;
+      var target = resolved.el;
+      if (target.scrollIntoView) target.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' });
+      return {
+        ok: true,
+        mode: 'into_view',
+        target: candidateSummary(target, resolved.ref),
+        matches_n: resolved.matches_n,
+        match_level: resolved.match_level,
+        after: { y: window.scrollY | 0 },
+      };
+    }
+    if (args.to) {
+      var to = args.to;
+      if (to === 'top') { window.scrollTo(0, 0); }
+      else if (to === 'bottom') { window.scrollTo(0, document.documentElement.scrollHeight | 0); }
+      else if (typeof to === 'object' && to !== null) {
+        window.scrollTo((to.x | 0), (to.y | 0));
+      } else {
+        throw new Error("scroll.to must be 'top' | 'bottom' | {x, y}");
+      }
+      return { ok: true, mode: 'to', after: { x: window.scrollX | 0, y: window.scrollY | 0 } };
+    }
+    if (args.by) {
+      var by = args.by;
+      if (!Array.isArray(by) || by.length !== 2) throw new Error('scroll.by must be [dx, dy]');
+      window.scrollBy((by[0] | 0), (by[1] | 0));
+      return { ok: true, mode: 'by', after: { x: window.scrollX | 0, y: window.scrollY | 0 } };
+    }
+    throw new Error('scroll requires selector | to | by');
+  }
+
+  function performHistory(direction) {
+    var before = redactedUrl(location.href);
+    if (direction === 'back') window.history.back();
+    else if (direction === 'forward') window.history.forward();
+    else throw new Error('history requires direction=back|forward');
+    return { ok: true, direction: direction, before_url: before };
+  }
+
+  function performKeys(args) {
+    var key = args.key;
+    if (typeof key !== 'string') throw new Error('keys requires key string');
+    var target = document.activeElement || document.body;
+    var resolved = null;
+    if (args.target || args.selector) {
+      resolved = resolveTarget(args, { allowFingerprintFallback: false, requireStableRect: true });
+      if (!resolved.ok) return resolved;
+      target = resolved.el;
+      if (target.focus) try { target.focus(); } catch (_) {}
+    }
+    var mods = args.modifiers || {};
+    var init = {
+      bubbles: true,
+      cancelable: true,
+      key: key,
+      code: keyToCode(key),
+      keyCode: keyToCode(key, true),
+      ctrlKey: !!mods.ctrl,
+      shiftKey: !!mods.shift,
+      altKey: !!mods.alt,
+      metaKey: !!mods.meta,
+    };
+    target.dispatchEvent(new KeyboardEvent('keydown', init));
+    target.dispatchEvent(new KeyboardEvent('keypress', init));
+    target.dispatchEvent(new KeyboardEvent('keyup', init));
+    return {
+      ok: true,
+      key: key,
+      target: candidateSummary(target, resolved && resolved.ref),
+      matches_n: resolved ? resolved.matches_n : 1,
+      match_level: resolved ? resolved.match_level : 'active_element',
+    };
+  }
+
+  function keyToCode(key, numeric) {
+    var map = {
+      Enter: numeric ? 13 : 'Enter',
+      Escape: numeric ? 27 : 'Escape',
+      Tab: numeric ? 9 : 'Tab',
+      Backspace: numeric ? 8 : 'Backspace',
+      Delete: numeric ? 46 : 'Delete',
+      ArrowUp: numeric ? 38 : 'ArrowUp',
+      ArrowDown: numeric ? 40 : 'ArrowDown',
+      ArrowLeft: numeric ? 37 : 'ArrowLeft',
+      ArrowRight: numeric ? 39 : 'ArrowRight',
+      Home: numeric ? 36 : 'Home',
+      End: numeric ? 35 : 'End',
+      PageUp: numeric ? 33 : 'PageUp',
+      PageDown: numeric ? 34 : 'PageDown',
+      ' ': numeric ? 32 : 'Space',
+      Space: numeric ? 32 : 'Space',
+    };
+    if (map.hasOwnProperty(key)) return map[key];
+    if (numeric) return key.length === 1 ? key.charCodeAt(0) : 0;
+    // For single characters, return 'Key<X>' code conventionally.
+    return key.length === 1 ? 'Key' + key.toUpperCase() : key;
+  }
+
+  function performSelect(args) {
+    var resolved = resolveTarget(args, { requireUnique: true, allowFingerprintFallback: false, requireStableRect: true });
+    if (!resolved.ok) return resolved;
+    var el = resolved.el;
+    if (el.tagName !== 'SELECT') return targetError('target_not_select', 'target is not a <select>', 'Use wm_extract(mode="interactive") and choose a select node.', [candidateSummary(el, resolved.ref)]);
+    if (isDisabled(el)) {
+      return targetError('target_disabled', 'select is disabled', 'Choose an enabled select from wm_extract(mode="interactive").', [candidateSummary(el, resolved.ref)]);
+    }
+    var value = args.value;
+    if (typeof value !== 'string') throw new Error('select requires value string');
+    var found = false;
+    for (var i = 0; i < el.options.length; i++) {
+      if (el.options[i].value === value || el.options[i].text === value) {
+        if (el.options[i].disabled || (el.options[i].parentElement && el.options[i].parentElement.disabled)) {
+          return targetError('option_disabled', 'option is disabled: ' + value, 'Choose an enabled option from the select.', [candidateSummary(el, resolved.ref)]);
+        }
+        el.selectedIndex = i;
+        found = true;
+        break;
+      }
+    }
+    if (!found) return targetError('option_not_found', 'no option matched: ' + value, 'Read the select options with wm_get(kind="html") and pass the option value or text.');
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return {
+      ok: true,
+      selected_index: el.selectedIndex,
+      value: el.value,
+      target: candidateSummary(el, resolved.ref),
+      matches_n: resolved.matches_n,
+      match_level: resolved.match_level,
+    };
+  }
+
+  function performFind(args) {
+    var needle = args.text;
+    if (typeof needle !== 'string' || needle.length === 0) throw new Error('find requires non-empty text');
+    var caseSensitive = args.case_sensitive === true;
+    var max = Math.min(((args.max | 0) || 20), 100);
+    var query = caseSensitive ? needle : needle.toLowerCase();
+    var matches = [];
+    // Walk text nodes — bail out early at `max` matches.
+    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+    var node = walker.nextNode();
+    while (node && matches.length < max) {
+      var text = node.nodeValue || '';
+      var hay = caseSensitive ? text : text.toLowerCase();
+      if (hay.indexOf(query) >= 0) {
+        var el = node.parentElement;
+        if (el && isVisible(el)) {
+          matches.push({
+            path: nodePath(el),
+            css: nodePath(el),
+            rect: rectOf(el),
+            text_preview: text.replace(/\s+/g, ' ').trim().substring(0, 120),
+          });
+        }
+      }
+      node = walker.nextNode();
+    }
+    return { ok: true, matches: matches, total_returned: matches.length };
+  }
+
+  // Keep all ZCode ticket state in one adapter instance behind the ready guard.
+  var zcode = createZCodeProtocol({
+    roleOf: roleOf,
+    rectOf: rectOf,
+    isVisible: isVisible,
+    nodePath: nodePath,
+    describeNode: describeNode,
+    rememberSnapshotNode: rememberSnapshotNode,
+    isContentEditableElement: isContentEditableElement,
+    editableText: editableText,
+    observePage: observePage,
+    startSnapshot: startSnapshot,
+    snapshotState: snapshotState,
+    resolveTarget: resolveTarget,
+    performType: performType,
+    isDisabled: isDisabled,
+    isReadOnly: isReadOnly,
+    performClick: performClick,
+  });
+
+  function actionResult(fn) {
+    try { return fn(); }
+    catch (e) {
+      return targetError('action_failed', String(e && e.message || e), 'Inspect the page with wm_extract and retry with a returned ref.');
+    }
+  }
+
+  // --------------------------------------------------------------- dispatch
+
+  window.__amberWm_call = function (method, argsJson, reqId) {
+    var args = {};
+    try { if (argsJson) args = JSON.parse(argsJson); }
+    catch (e) {
+      AmberWM.reject(reqId, 'invalid args JSON: ' + (e && e.message));
+      return;
+    }
+    try {
+      switch (method) {
+        case 'state': {
+          var includeConsole = args.include_console !== false;
+          var tail = args.console_tail | 0 || 16;
+          var payload = snapshotState();
+          payload.snapshot_id = window.__amberWmSnapshot ? window.__amberWmSnapshot.id : null;
+          if (includeConsole) payload.console_tail = consoleTail(tail);
+          AmberWM.resolve(reqId, safeJson(payload));
+          return;
+        }
+        case 'semantic_state':
+          AmberWM.resolve(reqId, safeJson(semanticState(args)));
+          return;
+        case 'observe':
+          AmberWM.resolve(reqId, safeJson(observePage(args)));
+          return;
+        case 'visual_snapshot':
+          AmberWM.resolve(reqId, safeJson(extractVisualSnapshot(args)));
+          return;
+        case 'restore_snapshot_refs':
+          AmberWM.resolve(reqId, safeJson(restoreSnapshotRefs(args)));
+          return;
+        case 'target_region':
+          AmberWM.resolve(reqId, safeJson(targetRegion(args)));
+          return;
+        case 'extract': {
+          var mode = args.mode || 'readable';
+          var payload;
+          switch (mode) {
+            case 'readable':    payload = extractReadable(args); break;
+            case 'interactive': payload = extractInteractive(args); break;
+            case 'snapshot':    payload = extractSnapshot(args); break;
+            case 'html':        payload = extractHtml(args); break;
+            default:
+              AmberWM.reject(reqId, 'unknown extract mode: ' + mode);
+              return;
+          }
+          AmberWM.resolve(reqId, safeJson(payload));
+          return;
+        }
+        case 'wait': {
+          var until = args.until || 'selector';
+          var timeout = (args.timeout_ms | 0) || 10000;
+          if (until === 'selector') {
+            if (!args.value) { AmberWM.reject(reqId, 'wait selector requires value'); return; }
+            waitForSelector(args.value, timeout, args.visible_only !== false, reqId);
+            return;
+          }
+          if (until === 'ready_state') {
+            waitForReadyState(args.value || 'complete', timeout, reqId);
+            return;
+          }
+          if (until === 'semantic_idle' || until === 'dom_stable' || until === 'network_idle') {
+            waitForSemanticIdle(args, reqId);
+            return;
+          }
+          AmberWM.reject(reqId, 'unknown wait kind: ' + until);
+          return;
+        }
+        case 'click':    AmberWM.resolve(reqId, safeJson(actionResult(function () { return performClick(args); }))); return;
+        case 'tap':      AmberWM.resolve(reqId, safeJson(actionResult(function () { return performTap(args); }))); return;
+        case 'type':     AmberWM.resolve(reqId, safeJson(actionResult(function () { return performType(args); }))); return;
+        case 'zcode_read':
+          AmberWM.resolve(reqId, safeJson(actionResult(function () { return zcode.read(args); })));
+          return;
+        case 'zcode_prepare':
+          AmberWM.resolve(reqId, safeJson(actionResult(function () { return zcode.prepare(args); })));
+          return;
+        case 'zcode_send':
+          AmberWM.resolve(reqId, safeJson(actionResult(function () { return zcode.send(args); })));
+          return;
+        case 'get':      AmberWM.resolve(reqId, safeJson(actionResult(function () { return performGet(args); }))); return;
+        case 'feishu_snapshot':
+          AmberWM.resolve(reqId, safeJson(actionResult(function () { return feishuSnapshot(args); })));
+          return;
+        case 'eval':     AmberWM.resolve(reqId, safeJson(performEval(args))); return;
+        case 'scroll':   AmberWM.resolve(reqId, safeJson(actionResult(function () { return performScroll(args); }))); return;
+        case 'back':     AmberWM.resolve(reqId, safeJson(performHistory('back'))); return;
+        case 'forward':  AmberWM.resolve(reqId, safeJson(performHistory('forward'))); return;
+        case 'keys':     AmberWM.resolve(reqId, safeJson(actionResult(function () { return performKeys(args); }))); return;
+        case 'select':   AmberWM.resolve(reqId, safeJson(actionResult(function () { return performSelect(args); }))); return;
+        case 'find':     AmberWM.resolve(reqId, safeJson(performFind(args))); return;
+        case 'fetch_replay':
+          performFetchReplay(args, reqId);
+          return;
+        default:
+          AmberWM.reject(reqId, 'unknown method: ' + method);
+      }
+    } catch (e) {
+      AmberWM.reject(reqId, String(e && e.message || e));
+    }
+  };
+})();

@@ -1,0 +1,72 @@
+package app.amber.feature.chat.impl
+
+import app.amber.ai.ui.UIMessage
+import app.amber.ai.ui.UIMessagePart
+import app.amber.ai.ui.canResumeToolExecution
+import app.amber.feature.chat.api.StreamToolState
+import app.amber.feature.chat.api.ToolStateSnapshot
+import java.security.MessageDigest
+
+/**
+ * Total streamed character count of the message's generated content.
+ * Used as the 512-char coalescing signal for stream checkpoints.
+ */
+fun UIMessage.streamContentLength(): Long {
+    var total = 0L
+    parts.forEach { part ->
+        when (part) {
+            is UIMessagePart.Text -> total += part.text.length
+            is UIMessagePart.Reasoning -> total += part.reasoning.length
+            is UIMessagePart.Tool -> total += part.toolName.length + part.input.length
+            else -> Unit
+        }
+    }
+    return total
+}
+
+/**
+ * Stable content hash of the message parts. Deterministic across process
+ * restarts so recovery can compare the persisted tail against the last
+ * checkpoint and detect a stale (partially lost) tail.
+ */
+fun UIMessage.streamPartsHash(): String {
+    val canonical = StringBuilder()
+    parts.forEach { part ->
+        when (part) {
+            is UIMessagePart.Text -> canonical.append("t|").append(part.text)
+            is UIMessagePart.Reasoning -> canonical.append("r|").append(part.reasoning)
+            is UIMessagePart.Tool -> canonical
+                .append("c|").append(part.toolCallId)
+                .append('|').append(part.toolName)
+                .append('|').append(part.input)
+                .append('|').append(part.approvalState::class.simpleName)
+                .append('|').append(part.output.size)
+            is UIMessagePart.Image -> canonical.append("i|").append(part.url)
+            else -> canonical.append(part::class.simpleName).append('|')
+        }
+        canonical.append('\u0000')
+    }
+    val digest = MessageDigest.getInstance("SHA-256")
+        .digest(canonical.toString().toByteArray(Charsets.UTF_8))
+    return buildString(32) {
+        for (i in 0 until 16) {
+            val b = digest[i].toInt() and 0xff
+            if (b < 0x10) append('0')
+            append(b.toString(16))
+        }
+    }
+}
+
+/** Snapshot of every tool call's lifecycle state on the streaming tail. */
+fun UIMessage.toolStateSnapshots(): List<ToolStateSnapshot> = getTools().map { tool ->
+    ToolStateSnapshot(
+        toolCallId = tool.toolCallId,
+        toolName = tool.toolName,
+        state = when {
+            tool.isExecuted -> StreamToolState.EXECUTED
+            tool.isPending -> StreamToolState.PENDING_APPROVAL
+            tool.approvalState.canResumeToolExecution() -> StreamToolState.RESUMABLE
+            else -> StreamToolState.STREAMING
+        },
+    )
+}

@@ -1,0 +1,554 @@
+package app.amber.feature.runtime
+
+import app.amber.ai.core.Tool
+import app.amber.ai.ui.ToolApprovalState
+import app.amber.ai.ui.UIMessagePart
+import androidx.datastore.preferences.core.PreferenceDataStoreFactory
+import app.amber.core.agent.runtime.AgentEventPayload
+import app.amber.core.agent.runtime.AgentEventWriter
+import app.amber.core.agent.runtime.ToolLifecycleEvent
+import app.amber.core.ai.GenerationRetrySetting
+import app.amber.feature.tools.effectClass
+import app.amber.feature.tools.ToolEffectClass
+import app.amber.feature.tools.ToolRisk
+import app.amber.feature.tools.ToolRegistry
+import app.amber.feature.tools.invocationPolicy
+import java.io.File
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * P1-02 dispatcher write-ahead: PREPARED → STARTED → FINISHED / FAILED,
+ * OUTCOME_UNKNOWN blocking, structured denial, idempotency support.
+ */
+class AgentToolDispatcherLedgerTest : DurableRuntimeTestBase() {
+
+    private val dispatcher = AgentToolDispatcher(
+        json = Json { ignoreUnknownKeys = true },
+        permissionDecisionResolver = PermissionDecisionResolver(),
+    )
+
+    private fun context(runId: String = "run_1") = ToolLedgerContext(
+        runId = runId,
+        turnId = 0,
+        ledger = ledger,
+        messagePersistenceCursor = "msg_1",
+    )
+
+    private fun toolCall(
+        toolCallId: String = "call_1",
+        toolName: String = "post_message",
+        input: String = """{"text":"hello"}""",
+        approvalState: ToolApprovalState = ToolApprovalState.Approved,
+    ) = UIMessagePart.Tool(
+        toolCallId = toolCallId,
+        toolName = toolName,
+        input = input,
+        approvalState = approvalState,
+    )
+
+    private fun toolDef(name: String, execute: suspend (JsonElement) -> List<UIMessagePart>): Tool =
+        Tool(name = name, description = "", execute = execute)
+
+    private fun approvalStore(): CapabilityPermissionStore {
+        val dataStore = PreferenceDataStoreFactory.create(
+            scope = kotlinx.coroutines.CoroutineScope(
+                kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO
+            )
+        ) {
+            File.createTempFile("approval-history", ".preferences_pb")
+        }
+        return CapabilityPermissionStore(dataStore)
+    }
+
+    @Test
+    fun successfulExecutionWritesPreparedStartedFinished() = runBlocking {
+        var executions = 0
+        val result = dispatcher.execute(
+            tool = toolCall(),
+            toolDef = toolDef("post_message") {
+                executions++
+                listOf(UIMessagePart.Text("""{"status":"ok"}"""))
+            },
+            autoApproveTools = false,
+            ledgerContext = context(),
+        )!!
+
+        assertEquals(1, executions)
+        val text = (result.output.single() as UIMessagePart.Text).text
+        assertTrue(text.contains("""{"status":"ok"}"""))
+
+        val effect = ledger.getByToolCallId("call_1")!!
+        assertEquals(ToolEffectStatus.FINISHED, effect.status)
+        assertEquals("post_message", effect.toolName)
+        assertNotNull(effect.argsDigest)
+        assertNotNull(effect.approvalDigest)
+        assertNotNull(effect.resultPayload)
+    }
+
+    @Test
+    fun failureIsRecordedWithErrorCategory() = runBlocking {
+        val result = dispatcher.execute(
+            tool = toolCall(),
+            toolDef = toolDef("post_message") { error("boom") },
+            autoApproveTools = false,
+            ledgerContext = context(),
+        )!!
+
+        val text = (result.output.single() as UIMessagePart.Text).text
+        assertTrue(text.contains("\"status\":\"failed\""))
+        val effect = ledger.getByToolCallId("call_1")!!
+        assertEquals(ToolEffectStatus.FAILED, effect.status)
+        assertNotNull(effect.errorCategory)
+    }
+
+    @Test
+    fun cancellationLeavesEffectStarted() = runBlocking {
+        val result = runCatching {
+            dispatcher.execute(
+                tool = toolCall(),
+                toolDef = toolDef("post_message") { throw CancellationException("stopped") },
+                autoApproveTools = false,
+                ledgerContext = context(),
+            )
+        }
+        assertTrue(result.exceptionOrNull() is CancellationException)
+        val effect = ledger.getByToolCallId("call_1")!!
+        assertEquals(ToolEffectStatus.STARTED, effect.status)
+        assertNull(effect.finishedAtMs)
+    }
+
+    @Test
+    fun interruptedWebMountWritesRequireReconciliationButSignedReadsStayRetryable() = runBlocking {
+        val calls = listOf(
+            toolCall(toolCallId = "eval", toolName = "wm_eval", input = """{"expression":"submit()"}"""),
+            toolCall(toolCallId = "remove", toolName = "wm_site_remove", input = """{"site_id":"github"}"""),
+            toolCall(toolCallId = "post", toolName = "wm_signed_fetch", input = """{"method":"POST"}"""),
+            toolCall(toolCallId = "get", toolName = "wm_signed_fetch", input = """{"method":"GET"}"""),
+        )
+        calls.forEach { call ->
+            val result = runCatching {
+                dispatcher.execute(
+                    tool = call,
+                    toolDef = toolDef(call.toolName) { throw CancellationException("stopped after dispatch") },
+                    autoApproveTools = false,
+                    ledgerContext = context(),
+                )
+            }
+            assertTrue(result.exceptionOrNull() is CancellationException)
+        }
+
+        val recovery = RunRecoveryService(
+            ledger = ledger,
+            runTerminalStore = runTerminalStore,
+            conversationRepo = conversationRepository(),
+            json = Json,
+        )
+        assertTrue(recovery.reconcileStartedEffects("run_1"))
+        calls.take(3).forEach { call ->
+            val effect = ledger.getByToolCallId(call.toolCallId)!!
+            assertEquals(ToolEffectClass.NON_IDEMPOTENT_WRITE, effect.effectClass)
+            assertEquals(ToolEffectStatus.OUTCOME_UNKNOWN, effect.status)
+        }
+        val read = ledger.getByToolCallId("get")!!
+        assertEquals(ToolEffectClass.READ_ONLY, read.effectClass)
+        assertEquals(ToolEffectStatus.STARTED, read.status)
+    }
+
+    @Test
+    fun userDenialRecordsApprovalDeniedAndStructuredRejection() = runBlocking {
+        // The generation coordinator prepares the effect before the approval card.
+        val effect = ledger.prepare(
+            runId = "run_1",
+            turnId = 0,
+            toolCallId = "call_1",
+            toolName = "post_message",
+            input = """{"text":"hello"}""",
+            effectClass = app.amber.feature.tools.ToolEffectClass.NON_IDEMPOTENT_WRITE,
+        )
+        val result = dispatcher.execute(
+            tool = toolCall(approvalState = ToolApprovalState.Denied("用户拒绝")),
+            toolDef = toolDef("post_message") { listOf(UIMessagePart.Text("must not run")) },
+            autoApproveTools = false,
+            ledgerContext = context(),
+        )!!
+
+        // 结构化拒绝结果交给模型
+        val text = (result.output.single() as UIMessagePart.Text).text
+        assertTrue(text.contains("\"status\":\"denied\""))
+        assertTrue(text.contains("用户拒绝"))
+        val recorded = ledger.get(effect.effectId)!!
+        assertEquals(ToolEffectStatus.FAILED, recorded.status)
+        assertEquals("approval_denied", recorded.errorCategory)
+    }
+
+    @Test
+    fun outcomeUnknownEffectIsNotReExecuted() = runBlocking {
+        // Crash mid-execution: STARTED without FINISHED, recovered to
+        // OUTCOME_UNKNOWN (simulating what RunRecoveryService does).
+        val effect = ledger.prepare(
+            runId = "run_1",
+            turnId = 0,
+            toolCallId = "call_1",
+            toolName = "post_message",
+            input = """{"text":"hello"}""",
+            effectClass = app.amber.feature.tools.ToolEffectClass.NON_IDEMPOTENT_WRITE,
+        )
+        ledger.markStarted(effect.effectId, approvalDigest("run_1", "call_1", effect.argsDigest))
+        ledger.markOutcomeUnknown(effect.effectId, "interrupted_mid_execution")
+
+        var executions = 0
+        val result = dispatcher.execute(
+            tool = toolCall(),
+            toolDef = toolDef("post_message") {
+                executions++
+                listOf(UIMessagePart.Text("""{"status":"ok"}"""))
+            },
+            autoApproveTools = false,
+            ledgerContext = context(),
+        )!!
+
+        // The non-idempotent tool must NOT run again without user confirmation.
+        assertEquals(0, executions)
+        val text = (result.output.single() as UIMessagePart.Text).text
+        assertTrue(text.contains("\"status\":\"outcome_unknown\""))
+        assertEquals(ToolEffectStatus.OUTCOME_UNKNOWN, ledger.get(effect.effectId)!!.status)
+    }
+
+    @Test
+    fun reconciledEffectExecutesAfterUserConfirmsRetry() = runBlocking {
+        val effect = ledger.prepare(
+            runId = "run_1",
+            turnId = 0,
+            toolCallId = "call_1",
+            toolName = "post_message",
+            input = """{"text":"hello"}""",
+            effectClass = app.amber.feature.tools.ToolEffectClass.NON_IDEMPOTENT_WRITE,
+        )
+        ledger.markStarted(effect.effectId, approvalDigest("run_1", "call_1", effect.argsDigest))
+        ledger.markOutcomeUnknown(effect.effectId, "interrupted_mid_execution")
+        ledger.reconcile(effect.effectId, retry = true)
+
+        var executions = 0
+        val result = dispatcher.execute(
+            tool = toolCall(),
+            toolDef = toolDef("post_message") {
+                executions++
+                listOf(UIMessagePart.Text("""{"status":"ok"}"""))
+            },
+            autoApproveTools = false,
+            ledgerContext = context(),
+        )!!
+        assertEquals(1, executions)
+        assertEquals(ToolEffectStatus.FINISHED, ledger.get(effect.effectId)!!.status)
+        val text = (result.output.single() as UIMessagePart.Text).text
+        assertTrue(text.contains("""{"status":"ok"}"""))
+    }
+
+    @Test
+    fun abandonedEffectIsBlockedEvenIfResubmitted() = runBlocking {
+        val effect = ledger.prepare(
+            runId = "run_1",
+            turnId = 0,
+            toolCallId = "call_1",
+            toolName = "post_message",
+            input = """{"text":"hello"}""",
+            effectClass = app.amber.feature.tools.ToolEffectClass.NON_IDEMPOTENT_WRITE,
+        )
+        ledger.markStarted(effect.effectId, approvalDigest("run_1", "call_1", effect.argsDigest))
+        ledger.markOutcomeUnknown(effect.effectId, "interrupted_mid_execution")
+        ledger.reconcile(effect.effectId, retry = false, abandonOutput = listOf(UIMessagePart.Text("{}")))
+
+        var executions = 0
+        val result = dispatcher.execute(
+            tool = toolCall(),
+            toolDef = toolDef("post_message") {
+                executions++
+                listOf(UIMessagePart.Text("""{"status":"ok"}"""))
+            },
+            autoApproveTools = false,
+            ledgerContext = context(),
+        )!!
+        assertEquals(0, executions)
+        val text = (result.output.single() as UIMessagePart.Text).text
+        assertTrue(text.contains("\"status\":\"abandoned\""))
+    }
+
+    @Test
+    fun approvedCallWithChangedArgsIsBlockedOnTheDurablePath() = runBlocking {
+        val store = approvalStore()
+        store.recordApproval(
+            ApprovalHistoryEntry.approved(
+                capability = null,
+                toolName = "post_message",
+                runId = "run_1",
+                toolCallId = "call_1",
+                effectId = null,
+                argsDigest = argsDigest("""{"text":"hello"}"""),
+                source = "user",
+            )
+        )
+
+        var executions = 0
+        val result = dispatcher.execute(
+            tool = toolCall(input = """{"text":"changed"}"""),
+            toolDef = toolDef("post_message") {
+                executions++
+                listOf(UIMessagePart.Text("must not run"))
+            },
+            autoApproveTools = false,
+            ledgerContext = context(),
+            approvalHistory = store,
+        )!!
+
+        // The effect is prepared (write-ahead) but the stale approval must
+        // block execution with the structured result.
+        assertEquals(0, executions)
+        val text = (result.output.single() as UIMessagePart.Text).text
+        assertTrue("expected approval_stale but was: $text", text.contains("\"status\":\"approval_stale\""))
+        assertTrue(text.contains("\"effect_id\""))
+        val effect = ledger.getByToolCallId("call_1")!!
+        assertEquals(ToolEffectStatus.PREPARED, effect.status)
+    }
+
+    @Test
+    fun readOnlyToolIsClassifiedReadOnlyAndIdempotentToolGetsIdempotencyKey() = runBlocking {
+        val readOnly = Tool(name = "file_read", description = "", execute = { emptyList() }).effectClass()
+        assertEquals(app.amber.feature.tools.ToolEffectClass.READ_ONLY, readOnly)
+
+        val zcodeRead = Tool(name = "wm_zcode_read", description = "", execute = { emptyList() })
+        assertEquals(ToolEffectClass.READ_ONLY, zcodeRead.effectClass())
+        assertEquals(
+            "webmount:session-1",
+            zcodeRead.invocationPolicy("""{"session_id":"session-1"}""").parallelGroup,
+        )
+        assertEquals(
+            180_000,
+            ToolRegistry.from(listOf(zcodeRead)).metadataFor("wm_zcode_read")?.outputBudgetChars,
+        )
+
+        val idempotent = Tool(name = "file_write", description = "", execute = { emptyList() })
+            .effectClass("""{"path":"a.txt","content":"x","append":false}""")
+        assertEquals(app.amber.feature.tools.ToolEffectClass.IDEMPOTENT_WRITE, idempotent)
+
+        val unknown = Tool(name = "post_message", description = "", execute = { emptyList() }).effectClass()
+        assertEquals(app.amber.feature.tools.ToolEffectClass.NON_IDEMPOTENT_WRITE, unknown)
+
+        val zcodeAsk = Tool(
+            name = "wm_zcode_ask",
+            description = "",
+            needsApproval = true,
+            allowsAutoApproval = false,
+            mandatoryApproval = true,
+            execute = { emptyList() },
+        )
+        assertEquals(ToolEffectClass.NON_IDEMPOTENT_WRITE, zcodeAsk.effectClass())
+        val askPolicy = zcodeAsk.invocationPolicy("""{"session_id":"session-1"}""")
+        assertTrue(askPolicy.mutates)
+        assertEquals(ToolRisk.High, askPolicy.risk)
+        assertTrue(askPolicy.needsApproval)
+        assertFalse(askPolicy.autoApprovable)
+        assertFalse(askPolicy.concurrencySafe)
+        assertEquals("webmount:session-1", askPolicy.parallelGroup)
+
+        // EffectId is the idempotency key for idempotent writes.
+        val result = dispatcher.execute(
+            tool = toolCall(toolName = "file_write", input = """{"path":"a.txt","content":"x"}"""),
+            toolDef = toolDef("file_write") { listOf(UIMessagePart.Text("""{"status":"ok"}""")) },
+            autoApproveTools = false,
+            ledgerContext = context(),
+        )!!
+        assertNotNull(result)
+        val effect = ledger.getByToolCallId("call_1")!!
+        assertEquals(app.amber.feature.tools.ToolEffectClass.IDEMPOTENT_WRITE, effect.effectClass)
+    }
+
+    @Test
+    fun generateImageIsNonIdempotentButKeepsExistingApprovalContract() {
+        val tool = Tool(name = "generate_image", description = "", execute = { emptyList() })
+
+        assertEquals(ToolEffectClass.NON_IDEMPOTENT_WRITE, tool.effectClass())
+
+        val policy = tool.invocationPolicy("{}")
+        assertFalse(policy.concurrencySafe)
+        assertNull(policy.parallelGroup)
+        // Classification must not turn the existing auto-approved image tool
+        // into an extra user-approval gate.
+        assertFalse(policy.mutates)
+        assertFalse(policy.needsApproval)
+        assertTrue(policy.autoApprovable)
+    }
+
+    // ── Step 3: tool lifecycle protocol events, aligned with the ledger ──
+
+    private class RecordingEventWriter : AgentEventWriter {
+        val committed = mutableListOf<AgentEventPayload.Final>()
+        override fun emit(transient: AgentEventPayload.Transient) {}
+        override suspend fun commit(final: AgentEventPayload.Final) {
+            committed += final
+        }
+        override suspend fun flush() {}
+        override suspend fun commitError(throwable: Throwable, recoverable: Boolean) {}
+    }
+
+    private fun RecordingEventWriter.lifecycleEvents(): List<ToolLifecycleEvent> =
+        committed.filterIsInstance<ToolLifecycleEvent>()
+
+    @Test
+    fun successfulExecutionEmitsTheFullLifecycleAlignedWithTheLedger() = runBlocking {
+        val events = RecordingEventWriter()
+        dispatcher.execute(
+            tool = toolCall(),
+            toolDef = toolDef("post_message") { listOf(UIMessagePart.Text("""{"status":"ok"}""")) },
+            autoApproveTools = false,
+            ledgerContext = context().copy(events = events),
+        )
+
+        val effect = ledger.getByToolCallId("call_1")!!
+        val emitted = events.lifecycleEvents()
+        // No kernel write-ahead here: the dispatcher self-prepares and must
+        // emit the Prepared itself (nested recipe steps rely on this).
+        assertEquals(
+            listOf("Prepared", "Started", "Finished"),
+            emitted.map { it::class.simpleName },
+        )
+        val prepared = emitted[0] as ToolLifecycleEvent.Prepared
+        assertEquals(effect.effectId, prepared.effectId)
+        assertEquals("call_1", prepared.toolCallId)
+        assertEquals("post_message", prepared.toolName)
+        assertEquals(effect.argsDigest, prepared.argsDigest)
+        val started = emitted[1] as ToolLifecycleEvent.Started
+        assertEquals(effect.effectId, started.effectId)
+        assertEquals("call_1", started.toolCallId)
+        assertEquals("post_message", started.toolName)
+        assertEquals(effect.approvalDigest, started.approvalDigest)
+        val finished = emitted[2] as ToolLifecycleEvent.Finished
+        assertEquals(effect.effectId, finished.effectId)
+        assertEquals(ToolLifecycleEvent.Finished.Status.FINISHED, finished.status)
+        assertNull(finished.errorCategory)
+    }
+
+    @Test
+    fun kernelWriteAheadEffectDoesNotGetADuplicatePrepared() = runBlocking {
+        // The kernel prepares (and announces) the effect before dispatch;
+        // the dispatcher's idempotent re-prepare must not emit a second one.
+        ledger.prepare(
+            runId = "run_1",
+            turnId = 0,
+            toolCallId = "call_1",
+            toolName = "post_message",
+            input = """{"text":"hello"}""",
+            effectClass = app.amber.feature.tools.ToolEffectClass.NON_IDEMPOTENT_WRITE,
+        )
+        val events = RecordingEventWriter()
+        dispatcher.execute(
+            tool = toolCall(),
+            toolDef = toolDef("post_message") { listOf(UIMessagePart.Text("""{"status":"ok"}""")) },
+            autoApproveTools = false,
+            ledgerContext = context().copy(events = events),
+        )
+
+        val emitted = events.lifecycleEvents()
+        assertEquals(listOf("Started", "Finished"), emitted.map { it::class.simpleName })
+    }
+
+    @Test
+    fun failedExecutionEmitsFinishedFailedWithTheLedgerCategory() = runBlocking {
+        val events = RecordingEventWriter()
+        dispatcher.execute(
+            tool = toolCall(),
+            toolDef = toolDef("post_message") { error("boom") },
+            autoApproveTools = false,
+            ledgerContext = context().copy(events = events),
+        )
+
+        val effect = ledger.getByToolCallId("call_1")!!
+        val emitted = events.lifecycleEvents()
+        assertEquals(listOf("Prepared", "Started", "Finished"), emitted.map { it::class.simpleName })
+        val finished = emitted[2] as ToolLifecycleEvent.Finished
+        assertEquals(effect.effectId, finished.effectId)
+        assertEquals(ToolLifecycleEvent.Finished.Status.FAILED, finished.status)
+        assertEquals(effect.errorCategory, finished.errorCategory)
+    }
+
+    @Test
+    fun userDenialEmitsFinishedDeniedWithoutStarted() = runBlocking {
+        ledger.prepare(
+            runId = "run_1",
+            turnId = 0,
+            toolCallId = "call_1",
+            toolName = "post_message",
+            input = """{"text":"hello"}""",
+            effectClass = app.amber.feature.tools.ToolEffectClass.NON_IDEMPOTENT_WRITE,
+        )
+        val events = RecordingEventWriter()
+        dispatcher.execute(
+            tool = toolCall(approvalState = ToolApprovalState.Denied("用户拒绝")),
+            toolDef = toolDef("post_message") { listOf(UIMessagePart.Text("must not run")) },
+            autoApproveTools = false,
+            ledgerContext = context().copy(events = events),
+        )
+
+        val effect = ledger.getByToolCallId("call_1")!!
+        val emitted = events.lifecycleEvents()
+        assertEquals(listOf("Finished"), emitted.map { it::class.simpleName })
+        val finished = emitted.single() as ToolLifecycleEvent.Finished
+        assertEquals(effect.effectId, finished.effectId)
+        assertEquals(ToolLifecycleEvent.Finished.Status.DENIED, finished.status)
+        assertEquals("approval_denied", finished.errorCategory)
+    }
+
+    @Test
+    fun answeredApprovalEmitsFinishedWithoutStarted() = runBlocking {
+        ledger.prepare(
+            runId = "run_1",
+            turnId = 0,
+            toolCallId = "call_1",
+            toolName = "post_message",
+            input = """{"text":"hello"}""",
+            effectClass = app.amber.feature.tools.ToolEffectClass.NON_IDEMPOTENT_WRITE,
+        )
+        val events = RecordingEventWriter()
+        dispatcher.execute(
+            tool = toolCall(approvalState = ToolApprovalState.Answered("用户的回答")),
+            toolDef = toolDef("post_message") { listOf(UIMessagePart.Text("must not run")) },
+            autoApproveTools = false,
+            ledgerContext = context().copy(events = events),
+        )
+
+        val effect = ledger.getByToolCallId("call_1")!!
+        val emitted = events.lifecycleEvents()
+        assertEquals(listOf("Finished"), emitted.map { it::class.simpleName })
+        val finished = emitted.single() as ToolLifecycleEvent.Finished
+        assertEquals(effect.effectId, finished.effectId)
+        assertEquals(ToolLifecycleEvent.Finished.Status.FINISHED, finished.status)
+    }
+
+    @Test
+    fun cancellationEmitsNothingAfterStarted() = runBlocking {
+        val events = RecordingEventWriter()
+        runCatching {
+            dispatcher.execute(
+                tool = toolCall(),
+                toolDef = toolDef("post_message") { throw CancellationException("stopped") },
+                autoApproveTools = false,
+                ledgerContext = context().copy(events = events),
+            )
+        }
+
+        // The effect stays STARTED and recovery classifies it — a Finished
+        // event here would lie about an outcome nobody knows.
+        val emitted = events.lifecycleEvents()
+        assertEquals(listOf("Prepared", "Started"), emitted.map { it::class.simpleName })
+    }
+}

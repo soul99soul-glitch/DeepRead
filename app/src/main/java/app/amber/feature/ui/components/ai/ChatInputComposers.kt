@@ -1,0 +1,761 @@
+package app.amber.feature.ui.components.ai
+
+import android.net.Uri
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.content.MediaType
+import androidx.compose.foundation.content.ReceiveContentListener
+import androidx.compose.foundation.content.consume
+import androidx.compose.foundation.content.contentReceiver
+import androidx.compose.foundation.content.hasMediaType
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.input.TextFieldLineLimits
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalMinimumInteractiveComponentSize
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import com.composables.icons.lucide.Lucide
+import com.composables.icons.lucide.Maximize
+import app.amber.agent.R
+import app.amber.feature.ui.subagent.AppSubAgentDisplayLocalizer
+import app.amber.core.settings.getAmberQuickMessages
+import app.amber.core.files.FilesManager
+import app.amber.core.files.SkillManager
+import app.amber.core.files.SkillMetadata
+import app.amber.core.model.QuickMessage
+import app.amber.feature.webmount.core.WebMountManager
+import app.amber.feature.ui.components.ui.workspaceColors
+import app.amber.feature.ui.context.LocalSettings
+import app.amber.feature.ui.hooks.ChatInputAttachmentKind
+import app.amber.feature.ui.hooks.ChatInputState
+import app.amber.core.utils.appLocale
+import app.amber.feature.ui.theme.LocalAmberTokens
+import app.amber.feature.ui.theme.LocalAmberType
+import org.koin.compose.koinInject
+
+/** Text editing, cursor/focus, discard and mention UI for the shared composer. */
+
+private const val MAX_MENTIONS = 9
+private const val SLASH_COMMAND_PANEL_EXIT_MS = 130
+private const val MENTION_PANEL_EXIT_MS = 100
+
+@Composable
+internal fun TextInputRow(
+    state: ChatInputState,
+    onSendMessage: () -> Unit,
+    onUsageClick: () -> Unit,
+    onCompactContext: () -> Unit,
+    modifier: Modifier = Modifier,
+    minimalChrome: Boolean = false,
+    hidePlaceholder: Boolean = false,
+    // Kept for the shared composer call contract; reasoning level lives in the model menu.
+    onUpdateSettings: ((app.amber.core.settings.Settings) -> Unit)? = null,
+    onImportAttachment: ((Uri, ChatInputAttachmentKind) -> Unit)? = null,
+    onImportTextFile: ((String) -> Unit)? = null,
+) {
+    val settings = LocalSettings.current
+    val context = LocalContext.current
+    val appLocale = context.appLocale()
+    val localeTag = context.resources.configuration.locales.toLanguageTags()
+    val displayLocalizer = remember(localeTag) { AppSubAgentDisplayLocalizer(context) }
+    val filesManager: FilesManager = koinInject()
+    val skillManager: SkillManager = koinInject()
+    val webMountManager: WebMountManager = koinInject()
+    val webMountEnabled by webMountManager.globalEnabledFlow.collectAsStateWithLifecycle()
+    val workspace = workspaceColors()
+    val amberTokens = LocalAmberTokens.current
+    val amberType = LocalAmberType.current
+    val slashCommandLabels = SlashCommandLabels(
+        clearDescription = stringResource(R.string.chat_input_slash_clear_description),
+        compactDescription = stringResource(R.string.chat_input_slash_compact_description),
+        deepReadDescription = stringResource(R.string.chat_input_slash_deep_read_description),
+        subAgentDescription = stringResource(R.string.chat_input_slash_subagent_description),
+        usageDescription = stringResource(R.string.chat_input_slash_usage_description),
+        skillFallbackDescription = stringResource(R.string.chat_input_skill_description_fallback),
+    )
+    val councilMentionDescription = stringResource(R.string.chat_input_mention_council_description)
+    val quickMessages = remember(settings.quickMessages, webMountEnabled) {
+        settings.getAmberQuickMessages().filterNot { quickMessage ->
+            !webMountEnabled && quickMessage.title.equals("webmount", ignoreCase = true)
+        }
+    }
+    val enabledSkills by produceState(
+        initialValue = emptyList<SkillMetadata>(),
+        key1 = settings.enabledSkills,
+        key2 = skillManager,
+        key3 = localeTag,
+    ) {
+        value = if (settings.enabledSkills.isEmpty()) {
+            emptyList()
+        } else {
+            withContext(Dispatchers.IO) {
+                skillManager.listSkills()
+                    .filter { skill -> skill.name in settings.enabledSkills }
+                    .sortedBy { skill -> skill.name.lowercase(appLocale) }
+            }
+        }
+    }
+
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        var isFocused by remember { mutableStateOf(false) }
+        var isFullScreen by remember { mutableStateOf(false) }
+        val scope = rememberCoroutineScope()
+        fun discardInput() {
+            val files = state.drainAttachmentFilesForDiscard()
+            state.clearInput()
+            if (files.isNotEmpty()) {
+                filesManager.deleteChatFiles(files)
+            }
+        }
+        val slashQuery = state.textContent.text.toString().slashCommandQuery()
+        val allSlashCommands = remember(
+            quickMessages,
+            enabledSkills,
+            slashCommandLabels,
+            settings.agentRuntime.subAgent.enabled,
+            settings.agentRuntime.subAgent.mode,
+            settings.agentRuntime.modelCouncil.enabled,
+        ) {
+            buildSlashCommandItems(
+                quickMessages = quickMessages,
+                enabledSkills = enabledSkills,
+                subAgentEnabled = settings.agentRuntime.subAgent.enabled,
+                subAgentMode = settings.agentRuntime.subAgent.mode,
+                labels = slashCommandLabels,
+            )
+        }
+        val slashCommands = remember(allSlashCommands, slashQuery) {
+            slashQuery?.let { query ->
+                filterSlashCommandItems(allSlashCommands, query)
+            }.orEmpty()
+        }
+        val receiveContentListener = remember(
+            settings.displaySetting.pasteLongTextAsFile,
+            settings.displaySetting.pasteLongTextThreshold,
+            filesManager,
+            scope,
+            state,
+            onImportAttachment,
+            onImportTextFile,
+        ) {
+            ReceiveContentListener { transferableContent ->
+                when {
+                    transferableContent.hasMediaType(MediaType.Image) -> {
+                        transferableContent.consume { item ->
+                            val uri = item.uri
+                            if (uri != null) {
+                                onImportAttachment?.invoke(uri, ChatInputAttachmentKind.IMAGE)
+                                    ?: scope.launch {
+                                        state.addImages(
+                                            filesManager.createChatFilesByContents(
+                                                listOf(uri)
+                                            )
+                                        )
+                                    }
+                            }
+                            uri != null
+                        }
+                    }
+
+                    settings.displaySetting.pasteLongTextAsFile && transferableContent.hasMediaType(MediaType.Text) -> {
+                        transferableContent.consume { item ->
+                            val text = item.text?.toString()
+                            if (text != null && text.length > settings.displaySetting.pasteLongTextThreshold) {
+                                onImportTextFile?.invoke(text)
+                                    ?: scope.launch {
+                                        val document = filesManager.createChatTextFile(text)
+                                        state.addFiles(listOf(document))
+                                    }
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    }
+
+                    else -> transferableContent
+                }
+            }
+        }
+        // V3: 修两处:
+        //   1) 用 Popup 让 panel 浮在 TextField 上方, 不占布局空间 → 不再顶起 composer.
+        //   2) 去掉 isFocused 条件 — 点 "/" 按钮 append 了斜杠但 TextField 没获焦, 之前 panel 不弹.
+        //      只要 text 开头是 "/" 就显示 panel.
+        val slashVisible = slashQuery != null
+        var slashPanelMounted by remember { mutableStateOf(false) }
+        var retainedSlashCommands by remember { mutableStateOf<List<SlashCommandItem>>(emptyList()) }
+        var retainedHasAnySlashCommand by remember { mutableStateOf(false) }
+        LaunchedEffect(slashVisible) {
+            if (slashVisible) {
+                slashPanelMounted = true
+            } else if (slashPanelMounted) {
+                delay(SLASH_COMMAND_PANEL_EXIT_MS.toLong())
+                slashPanelMounted = false
+            }
+        }
+        LaunchedEffect(slashVisible, slashCommands, allSlashCommands) {
+            if (slashVisible) {
+                retainedSlashCommands = slashCommands
+                retainedHasAnySlashCommand = allSlashCommands.isNotEmpty()
+            }
+        }
+        if (slashPanelMounted) {
+            androidx.compose.ui.window.Popup(
+                properties = androidx.compose.ui.window.PopupProperties(focusable = false),
+                popupPositionProvider = rememberInputPanelPopupPositionProvider(),
+            ) {
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = slashVisible,
+                    enter = androidx.compose.animation.fadeIn(
+                        animationSpec = androidx.compose.animation.core.tween(120)
+                    ) + androidx.compose.animation.slideInVertically(
+                        animationSpec = androidx.compose.animation.core.tween(
+                            durationMillis = 180,
+                            easing = androidx.compose.animation.core.FastOutSlowInEasing,
+                        ),
+                        initialOffsetY = { it / 12 },
+                    ) + androidx.compose.animation.scaleIn(
+                        animationSpec = androidx.compose.animation.core.tween(
+                            durationMillis = 180,
+                            easing = androidx.compose.animation.core.FastOutSlowInEasing,
+                        ),
+                        initialScale = 0.98f,
+                        transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0.85f, 1f),
+                    ),
+                    exit = androidx.compose.animation.fadeOut(
+                        animationSpec = androidx.compose.animation.core.tween(SLASH_COMMAND_PANEL_EXIT_MS)
+                    ) + androidx.compose.animation.slideOutVertically(
+                        animationSpec = androidx.compose.animation.core.tween(
+                            durationMillis = SLASH_COMMAND_PANEL_EXIT_MS,
+                            easing = androidx.compose.animation.core.FastOutSlowInEasing,
+                        ),
+                        targetOffsetY = { it / 16 },
+                    ) + androidx.compose.animation.scaleOut(
+                        animationSpec = androidx.compose.animation.core.tween(
+                            durationMillis = SLASH_COMMAND_PANEL_EXIT_MS,
+                            easing = androidx.compose.animation.core.FastOutSlowInEasing,
+                        ),
+                        targetScale = 0.985f,
+                        transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0.85f, 1f),
+                    ),
+                ) {
+                    SlashCommandPanel(
+                        commands = retainedSlashCommands,
+                        hasAnyCommand = retainedHasAnySlashCommand,
+                        onSelect = { command ->
+                            when (val action = command.action) {
+                                SlashCommandAction.ClearInput -> discardInput()
+                                SlashCommandAction.CompactContext -> {
+                                    discardInput()
+                                    onCompactContext()
+                                }
+                                is SlashCommandAction.InsertText -> state.setMessageText(action.text)
+                                SlashCommandAction.OpenUsage -> {
+                                    discardInput()
+                                    onUsageClick()
+                                }
+                            }
+                        },
+                    )
+                }
+            }
+        }
+        // @role mention: subagents and Model Council share the same lightweight picker.
+        // Detection result is
+        // memoized on (text, selection) so we don't walk the string on every recomposition.
+        // Slash command takes precedence — a leading `/` shouldn't double-pop a mention panel.
+        val mentionEnabled = settings.agentRuntime.subAgent.enabled || settings.agentRuntime.modelCouncil.enabled
+        val mentionTextSnapshot = state.textContent.text.toString()
+        val mentionSelection = state.textContent.selection
+        val mentionState = remember(mentionEnabled, slashQuery, mentionTextSnapshot, mentionSelection) {
+            if (!mentionEnabled || slashQuery != null) null
+            else detectMentionContextFor(mentionTextSnapshot, mentionSelection.start)
+        }
+        val mentionVisible = isFocused && mentionState != null
+        val mentionMatches = mentionState?.takeIf { mentionVisible }?.let { activeMention ->
+            remember(
+                settings.agentRuntime.subAgent.enabled,
+                settings.agentRuntime.subAgent.mode,
+                settings.agentRuntime.subAgent.customDefinitions,
+                settings.agentRuntime.modelCouncil.enabled,
+                councilMentionDescription,
+                localeTag,
+                activeMention.query,
+            ) {
+                filterMentionRoleItems(
+                    items = buildMentionRoleItems(
+                        subAgentEnabled = settings.agentRuntime.subAgent.enabled,
+                        modelCouncilEnabled = settings.agentRuntime.modelCouncil.enabled,
+                        subAgentMode = settings.agentRuntime.subAgent.mode,
+                        customSubAgents = settings.agentRuntime.subAgent.customDefinitions,
+                        councilDescription = councilMentionDescription,
+                        displayLocalizer = displayLocalizer,
+                    ),
+                    query = activeMention.query,
+                )
+            }
+        } ?: emptyList()
+        var mentionPanelMounted by remember { mutableStateOf(false) }
+        var retainedMentionMatches by remember { mutableStateOf<List<MentionRoleItem>>(emptyList()) }
+        var retainedMentionState by remember { mutableStateOf<MentionContext?>(null) }
+        LaunchedEffect(mentionVisible) {
+            if (mentionVisible) {
+                mentionPanelMounted = true
+            } else if (mentionPanelMounted) {
+                delay(MENTION_PANEL_EXIT_MS.toLong())
+                mentionPanelMounted = false
+            }
+        }
+        LaunchedEffect(mentionVisible, mentionMatches, mentionState) {
+            if (mentionVisible) {
+                retainedMentionMatches = mentionMatches
+                retainedMentionState = mentionState
+            }
+        }
+        if (mentionPanelMounted) {
+            androidx.compose.ui.window.Popup(
+                properties = androidx.compose.ui.window.PopupProperties(focusable = false),
+                popupPositionProvider = rememberInputPanelPopupPositionProvider(),
+            ) {
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = mentionVisible,
+                    enter = androidx.compose.animation.fadeIn(
+                        animationSpec = androidx.compose.animation.core.tween(120)
+                    ) + androidx.compose.animation.slideInVertically(
+                        animationSpec = androidx.compose.animation.core.tween(
+                            durationMillis = 180,
+                            easing = androidx.compose.animation.core.FastOutSlowInEasing,
+                        ),
+                        initialOffsetY = { it / 12 },
+                    ) + androidx.compose.animation.scaleIn(
+                        animationSpec = androidx.compose.animation.core.tween(
+                            durationMillis = 180,
+                            easing = androidx.compose.animation.core.FastOutSlowInEasing,
+                        ),
+                        initialScale = 0.98f,
+                        transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0.85f, 1f),
+                    ),
+                    exit = androidx.compose.animation.fadeOut(
+                        animationSpec = androidx.compose.animation.core.tween(MENTION_PANEL_EXIT_MS)
+                    ) + androidx.compose.animation.slideOutVertically(
+                        animationSpec = androidx.compose.animation.core.tween(
+                            durationMillis = MENTION_PANEL_EXIT_MS,
+                            easing = androidx.compose.animation.core.FastOutSlowInEasing,
+                        ),
+                        targetOffsetY = { it / 16 },
+                    ) + androidx.compose.animation.scaleOut(
+                        animationSpec = androidx.compose.animation.core.tween(
+                            durationMillis = MENTION_PANEL_EXIT_MS,
+                            easing = androidx.compose.animation.core.FastOutSlowInEasing,
+                        ),
+                        targetScale = 0.985f,
+                        transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0.85f, 1f),
+                    ),
+                ) {
+                    MentionPanel(
+                        roles = retainedMentionMatches,
+                        onSelect = { role ->
+                            retainedMentionState?.let { activeMention ->
+                                state.replaceMention(activeMention, role.id)
+                            }
+                        },
+                    )
+                }
+            }
+        }
+        // In the graphite composer (minimalChrome) the field lives inside a 26dp `surface-2`
+        // pill that already supplies the visual chrome + horizontal inset, so we drop M3's
+        // 48dp interactive floor and trim the content padding to keep the single-line pill
+        // height aligned with the flanking 46dp [+] / send circles.
+        CompositionLocalProvider(
+            LocalMinimumInteractiveComponentSize provides
+                if (minimalChrome) 0.dp else LocalMinimumInteractiveComponentSize.current
+        ) {
+        TextField(
+            state = state.textContent,
+            modifier = Modifier
+                .fillMaxWidth()
+                // Graphite 修：Material3 TextField 内部写死 MinHeight=56dp（无视 contentPadding /
+                // LocalMinimumInteractiveComponentSize）。这里只需传入一个「非零」minHeight 即可绕过
+                // 那道 56dp 地板——真实高度由内容决定（单行≈42dp，对称 padding 使文字在其内居中），
+                // 再由外层 pill 的 heightIn(min=46)+CenterVertically 把它在 46dp 内整体居中、与 [+]/send 齐平。
+                .then(if (minimalChrome) Modifier.heightIn(min = 1.dp) else Modifier)
+                .contentReceiver(receiveContentListener)
+                .onFocusChanged {
+                    isFocused = it.isFocused
+                },
+            contentPadding = if (minimalChrome) {
+                // 单行高度压到 ≤46dp，让外层 pill 的 heightIn(min=46) 钳到 46dp，与两侧圆按钮齐平
+                PaddingValues(horizontal = 0.dp, vertical = 9.dp)
+            } else {
+                TextFieldDefaults.contentPaddingWithoutLabel()
+            },
+            shape = if (minimalChrome) RoundedCornerShape(0.dp) else RoundedCornerShape(8.dp),
+            textStyle = amberType.body,
+            placeholder = {
+                if (!hidePlaceholder) {
+                    Text(
+                        text = if (minimalChrome) {
+                            stringResource(R.string.chat_input_compose_placeholder)
+                        } else {
+                            stringResource(R.string.chat_input_placeholder)
+                        },
+                        color = if (minimalChrome) amberTokens.ink3 else workspace.faint,
+                    )
+                }
+            },
+            lineLimits = TextFieldLineLimits.MultiLine(maxHeightInLines = 5),
+            keyboardOptions = KeyboardOptions(
+                imeAction = if (settings.displaySetting.sendOnEnter) ImeAction.Send else ImeAction.Default
+            ),
+            onKeyboardAction = {
+                if (settings.displaySetting.sendOnEnter && !state.isEmpty()) {
+                    onSendMessage()
+                }
+            },
+            colors = TextFieldDefaults.colors().copy(
+                unfocusedIndicatorColor = Color.Transparent,
+                focusedIndicatorColor = Color.Transparent,
+                focusedContainerColor = if (minimalChrome) Color.Transparent else workspace.paper,
+                unfocusedContainerColor = if (minimalChrome) Color.Transparent else workspace.paper,
+                focusedTextColor = if (minimalChrome) amberTokens.ink else workspace.ink,
+                unfocusedTextColor = if (minimalChrome) amberTokens.ink else workspace.ink,
+                focusedPlaceholderColor = if (minimalChrome) amberTokens.ink3 else workspace.faint,
+                unfocusedPlaceholderColor = if (minimalChrome) amberTokens.ink3 else workspace.faint,
+            ),
+            trailingIcon = if (isFocused && !minimalChrome) {
+                {
+                    IconButton(
+                        onClick = {
+                            isFullScreen = !isFullScreen
+                        },
+                    ) {
+                        Icon(
+                            Lucide.Maximize,
+                            contentDescription = stringResource(R.string.chat_input_fullscreen_editor),
+                        )
+                    }
+                }
+            } else {
+                null
+            },
+            leadingIcon = if (minimalChrome) {
+                null
+            } else if (quickMessages.isNotEmpty()) {
+                {
+                    QuickMessageButton(quickMessages = quickMessages, state = state)
+                }
+            } else {
+                {
+                    SlashCommandLeadingMark()
+                }
+            },
+        )
+        }
+        if (isFullScreen) {
+            FullScreenEditor(state = state) {
+                isFullScreen = false
+            }
+        }
+    }
+}
+
+/**
+ * Beside the session list the chat is the window's trailing pane, so panels centre over that pane
+ * instead of the whole window.
+ */
+@Composable
+private fun rememberInputPanelPopupPositionProvider(): androidx.compose.ui.window.PopupPositionProvider {
+    val twoPane = app.amber.feature.ui.adaptive.LocalTwoPaneLayout.current
+    val density = androidx.compose.ui.platform.LocalDensity.current
+    val layoutDirection = androidx.compose.ui.platform.LocalLayoutDirection.current
+    val endInsetPx = WindowInsets.safeDrawing.let {
+        if (layoutDirection == androidx.compose.ui.unit.LayoutDirection.Ltr) it.getRight(density, layoutDirection)
+        else it.getLeft(density, layoutDirection)
+    }
+    val paneCenterFromEndPx = twoPane?.let { endInsetPx + with(density) { it.detailWidth.roundToPx() } / 2 }
+    return remember(paneCenterFromEndPx) { inputPanelPopupPositionProvider(paneCenterFromEndPx) }
+}
+
+private fun inputPanelPopupPositionProvider(
+    paneCenterFromEndPx: Int?,
+    gapPx: Int = 8,
+): androidx.compose.ui.window.PopupPositionProvider = object : androidx.compose.ui.window.PopupPositionProvider {
+    override fun calculatePosition(
+        anchorBounds: androidx.compose.ui.unit.IntRect,
+        windowSize: androidx.compose.ui.unit.IntSize,
+        layoutDirection: androidx.compose.ui.unit.LayoutDirection,
+        popupContentSize: androidx.compose.ui.unit.IntSize,
+    ): androidx.compose.ui.unit.IntOffset {
+        val x = when {
+            paneCenterFromEndPx == null -> (windowSize.width - popupContentSize.width) / 2
+            layoutDirection == androidx.compose.ui.unit.LayoutDirection.Ltr ->
+                windowSize.width - paneCenterFromEndPx - popupContentSize.width / 2
+            else -> paneCenterFromEndPx - popupContentSize.width / 2
+        }.coerceAtLeast(0)
+        val y = (anchorBounds.top - popupContentSize.height - gapPx).coerceAtLeast(0)
+        return androidx.compose.ui.unit.IntOffset(x, y)
+    }
+}
+
+/**
+ * Composer-wide panel: the composer insets its pill 16dp from each edge of the pane, or of the
+ * reading column when the pane is wider than it.
+ */
+@Composable
+internal fun inputPanelWidth(): androidx.compose.ui.unit.Dp {
+    val readingWidth = app.amber.feature.ui.adaptive.ChatReadingWidth
+    app.amber.feature.ui.adaptive.LocalTwoPaneLayout.current?.let {
+        return minOf(it.detailWidth, readingWidth) - 32.dp
+    }
+    val screenWidth = androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp.dp
+    // Phone: unchanged legacy width.
+    return if (screenWidth > readingWidth) readingWidth - 32.dp else screenWidth - 24.dp
+}
+
+@Composable
+private fun QuickMessageButton(
+    quickMessages: List<QuickMessage>,
+    state: ChatInputState,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val quickMessagesLabel = stringResource(R.string.quick_messages_page_title)
+    val unnamedQuickMessage = stringResource(R.string.extension_content_unnamed)
+    IconButton(
+        modifier = Modifier.semantics(mergeDescendants = true) {
+            contentDescription = quickMessagesLabel
+        },
+        onClick = {
+            expanded = !expanded
+        }) {
+        SlashCommandLeadingMark()
+        // Notion-like dropdown: each entry is a Row of [leading "/" chip + Column(title,
+        // optional content preview)] instead of the old plain Column of two unspaced
+        // Text lines. Hairline dividers between entries; min width bumped to 260dp so
+        // the title doesn't get clipped to a noun fragment.
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+            modifier = Modifier
+                .widthIn(min = 260.dp, max = 360.dp)
+        ) {
+            quickMessages.forEachIndexed { index, quickMessage ->
+                if (index > 0) {
+                    HorizontalDivider(
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f),
+                        thickness = 1.dp,
+                        modifier = Modifier.padding(horizontal = 8.dp),
+                    )
+                }
+                Surface(
+                    onClick = {
+                        state.appendText(quickMessage.content)
+                        expanded = false
+                    },
+                    color = Color.Transparent,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        SlashCommandLeadingMark()
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            Text(
+                                text = quickMessage.title.ifBlank { unnamedQuickMessage },
+                                style = MaterialTheme.typography.titleSmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            if (quickMessage.content.isNotBlank()) {
+                                Text(
+                                    text = quickMessage.content,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** Position of an active `@xxx` mention context: the `@` index and the partial query after it. */
+private data class MentionContext(val atIndex: Int, val query: String)
+
+/**
+ * Pure variant: detect whether [cursor] is inside an `@xxx` token in [text]. Walks backwards
+ * until it hits an `@` (preceded by start-of-text or whitespace, to avoid emails/handles inside
+ * other text) or any whitespace (= not in mention context).
+ */
+private fun detectMentionContextFor(text: String, cursor: Int): MentionContext? {
+    val safeCursor = cursor.coerceIn(0, text.length)
+    if (safeCursor == 0) return null
+    var i = safeCursor - 1
+    while (i >= 0) {
+        val ch = text[i]
+        if (ch == '@') {
+            if (i == 0 || text[i - 1].isWhitespace()) {
+                return MentionContext(atIndex = i, query = text.substring(i + 1, safeCursor))
+            }
+            return null
+        }
+        if (ch.isWhitespace()) return null
+        i--
+    }
+    return null
+}
+
+/** Replace `@<query>` (under the current cursor) with `@<roleId> ` and place the cursor after it. */
+private fun ChatInputState.replaceMention(context: MentionContext, roleId: String) {
+    textContent.edit {
+        val replaceEnd = context.atIndex + 1 + context.query.length
+        replace(context.atIndex, replaceEnd, "@$roleId ")
+    }
+}
+
+@Composable
+private fun MentionPanel(
+    roles: List<MentionRoleItem>,
+    onSelect: (MentionRoleItem) -> Unit,
+) {
+    val workspace = workspaceColors()
+    val chatTheme = app.amber.feature.ui.pages.chat.LocalChatTheme.current
+    val panelWidth = inputPanelWidth()
+    val panelShape = RoundedCornerShape(14.dp)
+    Surface(
+        modifier = Modifier
+            .width(panelWidth)
+            .shadow(
+                elevation = 8.dp,
+                shape = panelShape,
+                clip = false,
+                ambientColor = Color.Transparent,
+                spotColor = Color.Transparent,
+            ),
+        shape = panelShape,
+        tonalElevation = 0.dp,
+        shadowElevation = 0.dp,
+        color = chatTheme.surface,
+        border = BorderStroke(1.dp, chatTheme.surfaceEdge),
+    ) {
+        Column(modifier = Modifier.padding(vertical = 4.dp)) {
+            if (roles.isEmpty()) {
+                SlashCommandEmptyRow(text = stringResource(R.string.chat_input_mention_no_match))
+            } else {
+                val shown = roles.take(MAX_MENTIONS)
+                shown.forEachIndexed { index, role ->
+                    MentionRow(role = role, onClick = { onSelect(role) })
+                    if (index < shown.lastIndex) {
+                        HorizontalDivider(
+                            modifier = Modifier.padding(start = 58.dp),
+                            color = workspace.hairline,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MentionRow(
+    role: MentionRoleItem,
+    onClick: () -> Unit,
+) {
+    val workspace = workspaceColors()
+    Surface(
+        onClick = onClick,
+        color = Color.Transparent,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Surface(
+                modifier = Modifier.size(30.dp),
+                shape = RoundedCornerShape(6.dp),
+                color = workspace.row,
+                contentColor = workspace.muted,
+                border = BorderStroke(1.dp, workspace.hairline),
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Text(text = "@", style = MaterialTheme.typography.titleMedium)
+                }
+            }
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "@${role.id}",
+                    style = MaterialTheme.typography.titleSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = role.description,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = workspace.muted,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
+}

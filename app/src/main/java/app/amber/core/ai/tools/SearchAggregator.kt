@@ -1,0 +1,477 @@
+package app.amber.core.ai.tools
+
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
+import app.amber.core.settings.Settings
+import app.amber.core.utils.toLocalString
+import app.amber.search.SearchCommonOptions
+import app.amber.search.SearchResult
+import app.amber.search.SearchService
+import app.amber.search.SearchServiceOptions
+import app.amber.search.ZhipuSearchService
+import java.net.URI
+import java.time.LocalDate
+import java.util.Locale
+import kotlin.uuid.Uuid
+
+internal object SearchAggregator {
+    private const val MAX_PARALLEL_SERVICES = 3
+    private const val MAX_ANSWER_LENGTH = 4_000
+    private val allowedTopics = setOf("general", "news", "finance")
+    private val allowedTimeRanges = setOf("day", "week", "month", "year", "any")
+
+    suspend fun search(
+        settings: Settings,
+        params: JsonObject,
+        executor: SearchExecutor? = null,
+        locale: Locale = Locale.getDefault(),
+    ): JsonObject = coroutineScope {
+        val query = params.string("query") ?: params.string("q") ?: error("query is required")
+        val topic = params.string("topic")?.takeIf { it in allowedTopics } ?: "general"
+        val explicitTimeRange = params.string("time_range")?.takeIf { it in allowedTimeRanges }
+        val timeRange = explicitTimeRange ?: if (topic == "news") "week" else "any"
+        val recencyDays = params.int("recency_days")?.coerceIn(1, 366)
+        val maxResults = params.int("max_results")
+            ?.coerceIn(1, 30)
+            ?: settings.searchCommonOptions.resultSize.coerceIn(1, 30)
+        val requestedServices = params.serviceSelectors()
+        val candidates = enabledServices(settings, requestedServices).take(MAX_PARALLEL_SERVICES)
+
+        if (candidates.isEmpty()) {
+            return@coroutineScope buildJsonObject {
+                put("status", "error")
+                put("error", "No enabled search services are available. Enable at least one search service in Search Service settings.")
+                put("items", JsonArray(emptyList()))
+                put("answers", JsonArray(emptyList()))
+                put("sources", JsonArray(emptyList()))
+            }
+        }
+
+        val perServiceSize = (maxResults + candidates.size - 1) / candidates.size + 3
+        val calls = candidates.mapIndexed { sourceIndex, options ->
+            async {
+                val serviceName = options.serviceName()
+                val serviceParams = buildServiceParams(
+                    query = query,
+                    topic = topic,
+                    timeRange = timeRange,
+                    recencyDays = recencyDays,
+                    options = options,
+                    locale = locale,
+                )
+                val result = runCatching {
+                    val commonOptions = settings.searchCommonOptions.copy(
+                        resultSize = perServiceSize.coerceIn(1, 20),
+                    )
+                    executor?.invoke(options, serviceParams, commonOptions)
+                        ?: executeServiceSearch(options, serviceParams, commonOptions, locale)
+                }.getOrElse { Result.failure(it) }
+                SearchSourceResult(
+                    options = options,
+                    sourceIndex = sourceIndex,
+                    serviceName = serviceName,
+                    params = serviceParams,
+                    result = result,
+                )
+            }
+        }.map { it.await() }
+
+        val items = mergeResults(
+            results = calls,
+            query = query,
+            topic = topic,
+            timeRange = timeRange,
+        ).take(maxResults)
+        val answers = collectAnswers(calls)
+
+        buildJsonObject {
+            put("status", when {
+                items.isNotEmpty() -> "ok"
+                answers.isNotEmpty() && calls.any { it.result.isFailure } -> "partial"
+                answers.isNotEmpty() -> "ok"
+                else -> "empty"
+            })
+            put("query", query)
+            put("topic", topic)
+            put("time_range", timeRange)
+            recencyDays?.let { put("recency_days", it) }
+            put("service_count", candidates.size)
+            // Global image budget: max 5 images across all items in one response.
+            var imagesBudget = 5
+            put("items", buildJsonArray {
+                items.forEachIndexed { index, item ->
+                    val emittedImages = item.images.distinct().take(imagesBudget.coerceIn(0, 5)).size
+                    add(item.toJson(index + 1, maxImages = imagesBudget))
+                    imagesBudget = (imagesBudget - emittedImages).coerceAtLeast(0)
+                }
+            })
+            put("answers", answers)
+            // Aggregate all unique images across items into a top-level block
+            // so the LLM can't miss them buried inside individual items.
+            val allImages = items.flatMap { it.images }.distinct().take(5)
+            put("total_images", allImages.size)
+            if (allImages.isNotEmpty()) {
+                put(
+                    "image_instruction",
+                    searchImageInstruction(allImages.size, locale),
+                )
+            }
+            put("sources", buildJsonArray {
+                calls.forEach { source ->
+                    add(source.toJson())
+                }
+            })
+        }
+    }
+
+    fun enabledServices(
+        settings: Settings,
+        requestedServices: List<String> = emptyList(),
+    ): List<SearchServiceOptions> {
+        val enabledIds = settings.searchEnabledServiceIds.toSet()
+        val enabled = settings.searchServices.filter { it.id in enabledIds }
+        if (requestedServices.isEmpty()) return enabled
+
+        val selectors = requestedServices.map { it.trim().lowercase(Locale.ROOT) }.filter { it.isNotBlank() }
+        if (selectors.isEmpty()) return enabled
+        return enabled.filter { options ->
+            selectors.any { selector -> options.matchesSelector(selector) }
+        }
+    }
+
+    fun buildServiceParams(
+        query: String,
+        topic: String,
+        timeRange: String,
+        recencyDays: Int?,
+        options: SearchServiceOptions,
+        locale: Locale = Locale.getDefault(),
+    ): JsonObject {
+        val enhancedQuery = if (options is SearchServiceOptions.TavilyOptions) {
+            query
+        } else {
+            enhanceQuery(query, topic, timeRange, recencyDays, locale)
+        }
+        val effectiveQuery = if (
+            options is SearchServiceOptions.ZhipuOptions && enhancedQuery.length > ZhipuSearchService.MAX_QUERY_LENGTH
+        ) {
+            // Keep the caller's query intact; the adapter validates oversized originals.
+            query
+        } else {
+            enhancedQuery
+        }
+        return buildJsonObject {
+            put("query", effectiveQuery)
+            if (options.supportsNativeTopic()) {
+                put("topic", topic)
+            }
+            if (options is SearchServiceOptions.TavilyOptions) {
+                if (timeRange in allowedTimeRanges && timeRange != "any") {
+                    put("time_range", timeRange)
+                }
+                recencyDays?.let { put("recency_days", it) }
+            }
+            if (options is SearchServiceOptions.FirecrawlOptions && topic == "news") {
+                put("sources", JsonArray(listOf(JsonPrimitive("news"), JsonPrimitive("web"))))
+            }
+        }
+    }
+
+    fun canonicalizeUrl(url: String): String {
+        return runCatching {
+            val uri = URI(url.trim())
+            val scheme = (uri.scheme ?: "https").lowercase(Locale.ROOT)
+            val host = (uri.host ?: "").lowercase(Locale.ROOT).removePrefix("www.")
+            val path = (uri.rawPath ?: "").trimEnd('/').ifBlank { "/" }
+            val query = uri.rawQuery
+                ?.split("&")
+                ?.filter { part ->
+                    val key = part.substringBefore("=").lowercase(Locale.ROOT)
+                    key !in setOf("fbclid", "gclid", "igshid", "mc_cid", "mc_eid") &&
+                            !key.startsWith("utm_")
+                }
+                ?.sorted()
+                ?.joinToString("&")
+                ?.takeIf { it.isNotBlank() }
+            buildString {
+                append(scheme).append("://").append(host)
+                if (uri.port != -1) append(':').append(uri.port)
+                append(path)
+                if (query != null) append('?').append(query)
+            }
+        }.getOrElse {
+            url.trim().lowercase(Locale.ROOT)
+        }
+    }
+
+    fun normalizedTitle(title: String): String {
+        return title.lowercase(Locale.ROOT)
+            .replace(Regex("[\\p{Punct}\\s]+"), "")
+            .take(80)
+    }
+
+    private fun collectAnswers(results: List<SearchSourceResult>): JsonArray = buildJsonArray {
+        val seen = mutableSetOf<Pair<String, String>>()
+        results.forEach { source ->
+            val answer = source.result.getOrNull()?.answer?.trim()?.takeIf { it.isNotEmpty() }
+                ?: return@forEach
+            val serviceId = source.options.id.toString()
+            if (!seen.add(serviceId to answer)) return@forEach
+            add(buildJsonObject {
+                put("answer", answer.take(MAX_ANSWER_LENGTH))
+                put("source_service", source.serviceName)
+                put("service_id", serviceId)
+                put("query", source.params["query"] ?: JsonNull)
+            })
+        }
+    }
+
+    private fun mergeResults(
+        results: List<SearchSourceResult>,
+        query: String,
+        topic: String,
+        timeRange: String,
+    ): List<AggregatedSearchItem> {
+        val byKey = LinkedHashMap<String, AggregatedSearchItem>()
+        val queryTokens = query.lowercase(Locale.ROOT)
+            .split(Regex("\\s+"))
+            .filter { it.length >= 2 }
+            .take(8)
+
+        results.forEach { source ->
+            val result = source.result.getOrNull() ?: return@forEach
+            result.items.forEachIndexed { index, item ->
+                val canonical = canonicalizeUrl(item.url)
+                val titleKey = source.domain(item.url) + "|" + normalizedTitle(item.title)
+                val key = if (item.url.isNotBlank()) canonical else titleKey
+                val existing = byKey[key]
+                if (existing == null) {
+                    val sourceBoost = (results.size - source.sourceIndex) * 10
+                    val hitBoost = queryTokens.count { token ->
+                        item.title.lowercase(Locale.ROOT).contains(token) ||
+                                item.text.lowercase(Locale.ROOT).contains(token)
+                    } * 3
+                    val freshnessBoost = if (topic == "news" && timeRange != "any") 8 else 0
+                    byKey[key] = AggregatedSearchItem(
+                        title = item.title,
+                        url = item.url,
+                        text = item.text,
+                        sourceService = source.serviceName,
+                        sourceServices = linkedSetOf(source.serviceName),
+                        sourceRank = index + 1,
+                        duplicateCount = 1,
+                        score = sourceBoost + hitBoost + freshnessBoost - index,
+                        publishedAt = item.publishedAt,
+                        images = item.images.take(5),
+                    )
+                } else {
+                    existing.sourceServices.add(source.serviceName)
+                    existing.duplicateCount += 1
+                    existing.score += 8
+                    if (item.text.length > existing.text.length) {
+                        existing.text = item.text
+                    }
+                    if (existing.publishedAt.isNullOrBlank() && !item.publishedAt.isNullOrBlank()) {
+                        existing.publishedAt = item.publishedAt
+                    }
+                    // Merge images from duplicate sources, rebuild list to stay immutable-safe
+                    if (item.images.isNotEmpty() && existing.images.size < 5) {
+                        val merged = (existing.images + item.images).distinct().take(5)
+                        existing.images = merged
+                    }
+                }
+            }
+        }
+        return byKey.values.sortedWith(
+            compareByDescending<AggregatedSearchItem> { it.score }
+                .thenByDescending { it.duplicateCount }
+                .thenBy { it.sourceRank }
+        )
+    }
+
+    private fun enhanceQuery(
+        query: String,
+        topic: String,
+        timeRange: String,
+        recencyDays: Int?,
+        locale: Locale,
+    ): String {
+        val today = LocalDate.now().toLocalString(true, locale)
+        val rangeText = when {
+            recencyDays != null -> "last $recencyDays days"
+            timeRange == "day" -> "today $today"
+            timeRange == "week" -> "this week $today"
+            timeRange == "month" -> "this month $today"
+            timeRange == "year" -> "this year $today"
+            else -> null
+        }
+        return listOfNotNull(
+            query,
+            if (topic == "news") "news" else null,
+            rangeText,
+        ).joinToString(" ")
+    }
+
+    private suspend fun executeServiceSearch(
+        options: SearchServiceOptions,
+        params: JsonObject,
+        commonOptions: SearchCommonOptions,
+        locale: Locale,
+    ): Result<SearchResult> {
+        val service = SearchService.getService(options)
+        return service.search(
+            params = params,
+            commonOptions = commonOptions,
+            serviceOptions = options,
+            locale = locale,
+        )
+    }
+
+    private fun SearchServiceOptions.supportsNativeTopic(): Boolean {
+        return this is SearchServiceOptions.TavilyOptions ||
+            this is SearchServiceOptions.SerperOptions ||
+            this is SearchServiceOptions.SerpApiOptions
+    }
+
+    internal fun acceptedSelectors(options: SearchServiceOptions): List<String> {
+        val aliases = buildList {
+            add(options.serviceName())
+            addAll(options.serviceAliases())
+        }
+        return (
+            listOf(options.id.toString().lowercase(Locale.ROOT)) +
+                aliases.flatMap { it.selectorForms() }
+            ).distinct()
+    }
+
+    private fun SearchServiceOptions.matchesSelector(selector: String): Boolean {
+        val raw = selector.trim().lowercase(Locale.ROOT)
+        if (raw.isBlank()) return false
+        val optionId = this.id.toString().lowercase(Locale.ROOT)
+        return optionId == raw || optionId.startsWith(raw) || raw in acceptedSelectors(this)
+    }
+
+    private fun SearchServiceOptions.serviceAliases(): List<String> = when (this) {
+        is SearchServiceOptions.BingLocalOptions -> listOf("bing", "bing_local", "bing html", "bing html fallback")
+        is SearchServiceOptions.BochaOptions -> listOf("bocha", "博查")
+        is SearchServiceOptions.BraveOptions -> listOf("brave")
+        is SearchServiceOptions.ExaOptions -> listOf("exa")
+        is SearchServiceOptions.FirecrawlOptions -> listOf("firecrawl")
+        is SearchServiceOptions.GrokOptions -> listOf("grok")
+        is SearchServiceOptions.JinaOptions -> listOf("jina")
+        is SearchServiceOptions.LinkUpOptions -> listOf("linkup", "link_up")
+        is SearchServiceOptions.MetasoOptions -> listOf("metaso", "秘塔")
+        is SearchServiceOptions.OllamaOptions -> listOf("ollama")
+        is SearchServiceOptions.PerplexityOptions -> listOf("perplexity")
+        is SearchServiceOptions.SearXNGOptions -> listOf("searxng", "searxng_local")
+        is SearchServiceOptions.SerperOptions -> listOf("serper")
+        is SearchServiceOptions.SerpApiOptions -> listOf("serpapi", "serp_api")
+        is SearchServiceOptions.TavilyOptions -> listOf("tavily")
+        is SearchServiceOptions.ZhipuOptions -> listOf("zhipu", "智谱")
+    }
+
+    private fun String.selectorForms(): Set<String> {
+        val raw = trim().lowercase(Locale.ROOT)
+        if (raw.isBlank()) return emptySet()
+        val underscored = raw.replace(Regex("[\\s-]+"), "_")
+        val spaced = raw.replace(Regex("[_-]+"), " ")
+        return setOf(raw, underscored, spaced)
+    }
+
+    private fun SearchServiceOptions.serviceName(): String {
+        return SearchServiceOptions.TYPES[this::class] ?: "Search"
+    }
+
+    private fun JsonObject.string(name: String): String? {
+        return this[name]?.jsonPrimitive?.contentOrNull
+    }
+
+    private fun JsonObject.int(name: String): Int? {
+        return this[name]?.jsonPrimitive?.intOrNull
+    }
+
+    private fun JsonObject.serviceSelectors(): List<String> {
+        val raw = this["services"] ?: return emptyList()
+        return when {
+            raw is JsonArray -> raw.jsonArray.mapNotNull { it.jsonPrimitive.contentOrNull }
+            raw is JsonPrimitive -> raw.contentOrNull?.split(",")
+            else -> emptyList()
+        }?.map { it.trim() }.orEmpty()
+    }
+}
+
+internal typealias SearchExecutor = suspend (
+    SearchServiceOptions,
+    JsonObject,
+    SearchCommonOptions,
+) -> Result<SearchResult>
+
+private data class SearchSourceResult(
+    val options: SearchServiceOptions,
+    val sourceIndex: Int,
+    val serviceName: String,
+    val params: JsonObject,
+    val result: Result<SearchResult>,
+) {
+    fun toJson(): JsonObject = buildJsonObject {
+        put("service", serviceName)
+        put("service_id", options.id.toString())
+        put("status", if (result.isSuccess) "ok" else "error")
+        put("result_count", result.getOrNull()?.items?.size ?: 0)
+        result.exceptionOrNull()?.message?.let { put("error", it.take(500)) }
+        put("query", params["query"] ?: JsonNull)
+    }
+
+    fun domain(url: String): String {
+        return runCatching {
+            URI(url).host.orEmpty().lowercase(Locale.ROOT).removePrefix("www.")
+        }.getOrDefault("")
+    }
+}
+
+private data class AggregatedSearchItem(
+    val title: String,
+    val url: String,
+    var text: String,
+    val sourceService: String,
+    val sourceServices: LinkedHashSet<String>,
+    val sourceRank: Int,
+    var duplicateCount: Int,
+    var score: Int,
+    var publishedAt: String? = null,
+    var images: List<String> = emptyList(),
+) {
+    fun toJson(index: Int, maxImages: Int = 5): JsonElement = buildJsonObject {
+        put("id", Uuid.random().toString().take(6))
+        put("index", index)
+        put("title", title)
+        put("url", url)
+        put("text", text.take(2_000))
+        put("source_service", sourceService)
+        put("source_services", buildJsonArray {
+            sourceServices.forEach { add(JsonPrimitive(it)) }
+        })
+        put("source_rank", sourceRank)
+        put("duplicate_count", duplicateCount)
+        put("rank_score", score)
+        put("published_at", publishedAt?.let(::JsonPrimitive) ?: JsonNull)
+        val cappedImages = images.distinct().take(maxImages.coerceIn(0, 5))
+        if (cappedImages.isNotEmpty()) {
+            put("images", buildJsonArray {
+                cappedImages.forEach { add(JsonPrimitive(it)) }
+            })
+        }
+    }
+}

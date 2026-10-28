@@ -1,0 +1,469 @@
+package app.amber.feature.ui.pages.log
+
+import com.composables.icons.lucide.Lucide
+import com.composables.icons.lucide.Trash2
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.Switch
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.datastore.preferences.core.edit
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.launch
+import app.amber.agent.R
+import app.amber.common.android.LogEntry
+import app.amber.common.android.Logging
+import app.amber.core.infra.PreferencesKeys
+import app.amber.core.settings.settingsStore
+import app.amber.feature.ui.components.nav.BackButton
+import app.amber.feature.ui.components.ui.JsonTree
+import app.amber.feature.ui.components.ds.AmberCard
+import app.amber.feature.ui.components.ds.SectionLabel
+import app.amber.feature.ui.components.ds.amberCanvas
+import app.amber.feature.ui.components.ds.pressable
+import app.amber.feature.ui.theme.LocalAmberTokens
+import app.amber.feature.ui.theme.LocalAmberType
+import app.amber.feature.ui.theme.JetbrainsMono
+import app.amber.core.utils.JsonInstantPretty
+import app.amber.core.utils.appLocale
+import java.text.SimpleDateFormat
+import java.util.Date
+
+@Composable
+fun LogPage() {
+    var logs by remember { mutableStateOf(Logging.getRecentLogs()) }
+    val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
+    val t = LocalAmberTokens.current
+    val type = LocalAmberType.current
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text(stringResource(R.string.redesign_logs), style = type.screenTitle, color = t.ink) },
+                navigationIcon = { BackButton() },
+                actions = {
+                    IconButton(
+                        onClick = {
+                            Logging.clear()
+                            logs = Logging.getRecentLogs()
+                        }
+                    ) {
+                        Icon(Lucide.Trash2, stringResource(R.string.delete), tint = t.ink2)
+                    }
+                },
+                scrollBehavior = scrollBehavior,
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = t.bg,
+                    scrolledContainerColor = t.bg,
+                    titleContentColor = t.ink,
+                    navigationIconContentColor = t.ink2,
+                    actionIconContentColor = t.ink2,
+                ),
+            )
+        },
+        modifier = Modifier
+            .nestedScroll(scrollBehavior.nestedScrollConnection)
+            .amberCanvas(),
+        containerColor = androidx.compose.ui.graphics.Color.Transparent,
+    ) { contentPadding ->
+        UnifiedLogList(
+            logs = logs,
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(contentPadding)
+        )
+    }
+}
+
+@Composable
+private fun UnifiedLogList(logs: List<LogEntry>, modifier: Modifier = Modifier) {
+    var selectedLog by remember { mutableStateOf<LogEntry.RequestLog?>(null) }
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val scope = rememberCoroutineScope()
+    val sortedLogs = remember(logs) { logs.sortedByDescending { it.timestamp } }
+
+    LazyColumn(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+    ) {
+        item {
+            SectionLabel(stringResource(R.string.log_page_network_requests))
+            NetworkLoggingToggle()
+        }
+        item {
+            SectionLabel(stringResource(R.string.log_page_requests_count, sortedLogs.size))
+        }
+        items(sortedLogs, key = { it.id }, contentType = { it.javaClass.simpleName }) { log ->
+            when (log) {
+                is LogEntry.RequestLog -> RequestLogCard(
+                    log = log,
+                    onClick = {
+                        selectedLog = log
+                        scope.launch { sheetState.show() }
+                    }
+                )
+
+                is LogEntry.TextLog -> TextLogCard(log = log)
+            }
+        }
+    }
+
+    selectedLog?.let { log ->
+        ModalBottomSheet(
+            onDismissRequest = { selectedLog = null },
+            sheetState = sheetState
+        ) {
+            RequestLogDetail(log)
+        }
+    }
+}
+
+@Composable
+private fun NetworkLoggingToggle() {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var enabled by remember { mutableStateOf(true) }
+    LaunchedEffect(Unit) {
+        context.settingsStore.data.collect { p ->
+            enabled = p[PreferencesKeys.REQUEST_LOGGING_ENABLED] ?: true
+        }
+    }
+    val t = LocalAmberTokens.current
+    val type = LocalAmberType.current
+    AmberCard(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                Text(
+                    text = stringResource(R.string.log_page_network_logging_title),
+                    style = type.body,
+                    color = t.ink,
+                )
+                Text(
+                    text = stringResource(R.string.log_page_network_logging_desc),
+                    style = type.secondary,
+                    color = t.ink3,
+                )
+            }
+            Switch(
+                checked = enabled,
+                onCheckedChange = { checked ->
+                    enabled = checked
+                    scope.launch {
+                        context.settingsStore.edit { p ->
+                            p[PreferencesKeys.REQUEST_LOGGING_ENABLED] = checked
+                        }
+                    }
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun RequestLogCard(log: LogEntry.RequestLog, onClick: () -> Unit) {
+    val appLocale = LocalContext.current.appLocale()
+    val dateFormat = remember(appLocale.toLanguageTag()) {
+        SimpleDateFormat("HH:mm:ss", appLocale)
+    }
+
+    AmberCard(
+        modifier = Modifier
+            .fillMaxWidth()
+            .pressable(onClick = onClick),
+    ) {
+        val t = LocalAmberTokens.current
+        val type = LocalAmberType.current
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = log.method,
+                    style = type.meta,
+                    fontWeight = FontWeight.Bold,
+                    color = t.accent,
+                )
+                Text(
+                    text = dateFormat.format(Date(log.timestamp)),
+                    style = type.meta,
+                    color = t.ink3,
+                )
+            }
+
+            Text(
+                text = log.url,
+                style = type.meta,
+                color = t.ink,
+                maxLines = 2
+            )
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                log.responseCode?.let { code ->
+                    Text(
+                        text = "${stringResource(R.string.setting_webmount_global_status_label)}：$code",
+                        style = type.meta,
+                        color = if (code in 200..299) t.signal else MaterialTheme.colorScheme.error,
+                    )
+                }
+                log.durationMs?.let { duration ->
+                    Text(
+                        text = "${duration}ms",
+                        style = type.meta,
+                        color = t.ink3,
+                    )
+                }
+            }
+
+            log.error?.let { error ->
+                Text(
+                    text = stringResource(R.string.setting_cron_tasks_error_value, error),
+                    style = type.meta,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun RequestLogDetail(log: LogEntry.RequestLog) {
+    val appLocale = LocalContext.current.appLocale()
+    val dateFormat = remember(appLocale.toLanguageTag()) {
+        SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", appLocale)
+    }
+
+    SelectionContainer {
+        LazyColumn(
+            modifier = Modifier.fillMaxWidth(),
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            item {
+                Text(
+                    text = stringResource(R.string.redesign_request_details),
+                    style = LocalAmberType.current.sessionTitle,
+                    color = LocalAmberTokens.current.ink,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            item {
+                DetailSection(
+                    stringResource(R.string.placeholder_current_time),
+                    dateFormat.format(Date(log.timestamp)),
+                )
+            }
+
+            item {
+                DetailSection("URL", log.url)
+            }
+
+            item {
+                DetailSection(stringResource(R.string.redesign_method), log.method)
+            }
+
+            log.responseCode?.let { code ->
+                item {
+                    DetailSection(stringResource(R.string.redesign_status_code), code.toString())
+                }
+            }
+
+            log.durationMs?.let { duration ->
+                item {
+                    DetailSection(stringResource(R.string.redesign_duration), "${duration}ms")
+                }
+            }
+
+            log.error?.let { error ->
+                item {
+                    DetailSection(stringResource(R.string.setting_webmount_pill_error), error)
+                }
+            }
+
+            if (log.requestHeaders.isNotEmpty()) {
+                item {
+                    HorizontalDivider()
+                    Text(
+                        text = stringResource(R.string.redesign_request_headers),
+                        style = LocalAmberType.current.body.copy(fontWeight = FontWeight.SemiBold),
+                        color = LocalAmberTokens.current.ink,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                }
+                log.requestHeaders.forEach { (key, value) ->
+                    item {
+                        HeaderItem(key, value)
+                    }
+                }
+            }
+
+            log.requestBody?.let { body ->
+                item {
+                    HorizontalDivider()
+                    Text(
+                        text = stringResource(R.string.redesign_request_body),
+                        style = LocalAmberType.current.body.copy(fontWeight = FontWeight.SemiBold),
+                        color = LocalAmberTokens.current.ink,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                    val jsonElement = remember(body) {
+                        runCatching { JsonInstantPretty.parseToJsonElement(body) }.getOrNull()
+                    }
+                    if (jsonElement != null) {
+                        JsonTree(
+                            json = jsonElement,
+                            modifier = Modifier.padding(top = 4.dp),
+                            initialExpandLevel = 2
+                        )
+                    } else {
+                        Text(
+                            text = body,
+                            fontFamily = JetbrainsMono,
+                            modifier = Modifier.padding(top = 4.dp)
+                        )
+                    }
+                }
+            }
+
+            if (log.responseHeaders.isNotEmpty()) {
+                item {
+                    HorizontalDivider()
+                    Text(
+                        text = stringResource(R.string.redesign_response_headers),
+                        style = LocalAmberType.current.body.copy(fontWeight = FontWeight.SemiBold),
+                        color = LocalAmberTokens.current.ink,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                }
+                log.responseHeaders.forEach { (key, value) ->
+                    item {
+                        HeaderItem(key, value)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DetailSection(label: String, value: String) {
+    val t = LocalAmberTokens.current
+    val type = LocalAmberType.current
+    Column {
+        Text(
+            text = label,
+            style = type.meta,
+            color = t.ink3,
+        )
+        Text(
+            text = value,
+            style = type.meta,
+            color = t.ink,
+            fontFamily = JetbrainsMono
+        )
+    }
+}
+
+@Composable
+private fun HeaderItem(key: String, value: String) {
+    val t = LocalAmberTokens.current
+    val type = LocalAmberType.current
+    Column(modifier = Modifier.padding(vertical = 2.dp)) {
+        Text(
+            text = key,
+            style = type.meta,
+            color = t.accent,
+        )
+        Text(
+            text = value,
+            style = type.meta,
+            color = t.ink,
+            fontFamily = JetbrainsMono
+        )
+    }
+}
+
+@Composable
+private fun TextLogCard(log: LogEntry.TextLog) {
+    val appLocale = LocalContext.current.appLocale()
+    val dateFormat = remember(appLocale.toLanguageTag()) {
+        SimpleDateFormat("HH:mm:ss", appLocale)
+    }
+
+    val t = LocalAmberTokens.current
+    val type = LocalAmberType.current
+    AmberCard(modifier = Modifier.fillMaxWidth()) {
+        SelectionContainer {
+            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = log.tag,
+                        style = type.meta,
+                        fontWeight = FontWeight.Bold,
+                        color = t.accent,
+                    )
+                    Text(
+                        text = dateFormat.format(Date(log.timestamp)),
+                        style = type.meta,
+                        color = t.ink3,
+                    )
+                }
+                Text(
+                    text = log.message,
+                    style = type.meta,
+                    color = t.ink,
+                    fontFamily = JetbrainsMono
+                )
+            }
+        }
+    }
+}

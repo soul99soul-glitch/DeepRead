@@ -1,0 +1,450 @@
+package app.amber.core.memory.store
+
+import app.amber.agent.data.db.dao.MemoryCandidateDAO
+import app.amber.agent.data.db.dao.MemoryDAO
+import app.amber.agent.data.db.dao.MemoryEventDAO
+import app.amber.agent.data.db.entity.MemoryCandidateEntity
+import app.amber.agent.data.db.entity.MemoryEntity
+import app.amber.agent.data.db.entity.MemoryEventEntity
+import app.amber.core.memory.export.MemoryImportExportManager
+import app.amber.core.memory.model.MemoryKind
+import app.amber.core.memory.model.MemoryScope
+import app.amber.core.sync.core.SyncRestoreWriteEpoch
+import app.amber.core.sync.core.SyncRestoreWriteGate
+import app.amber.core.sync.core.SyncRestoreWriteRejectedException
+import app.amber.feature.runtime.ContentDigest
+import java.io.File
+import java.nio.file.Files
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
+import org.junit.Test
+
+/**
+ * P2-06 memory write CAS and pollution audit (parity plan §P2-06).
+ *
+ * Acceptance covered:
+ *  - memory records carry a monotonic revision (start at 1, bump per edit);
+ *  - edit/delete are compare-and-set: a changed revision rejects the stale
+ *    approval (MemoryStaleException) instead of overwriting;
+ *  - successful CAS writes expose old/new digests for the audit trail and
+ *    record provenance (source_run_id / source_trigger);
+ *  - auto-extraction writes are marked with a distinct trigger.
+ */
+class MemoryCasTest {
+
+    /** In-memory MemoryDAO simulating the SQL CAS guards exactly. */
+    private class FakeMemoryDAO : MemoryDAO {
+        val rows = mutableMapOf<Int, MemoryEntity>()
+        private var nextId = 1
+
+        fun seed(content: String, revision: Long = 1): MemoryEntity {
+            val entity = MemoryEntity(
+                id = nextId++,
+                assistantId = MemoryRepository.GLOBAL_MEMORY_ID,
+                content = content,
+                scope = MemoryScope.CORE.wireName,
+                revision = revision,
+            )
+            rows[entity.id] = entity
+            return entity
+        }
+
+        override fun getMemoriesOfAssistantFlow(assistantId: String): Flow<List<MemoryEntity>> = emptyFlow()
+
+        override suspend fun getMemoriesOfAssistant(assistantId: String): List<MemoryEntity> =
+            rows.values.filter { it.assistantId == assistantId }
+
+        override suspend fun getActiveMemories(now: Long?): List<MemoryEntity> = rows.values.toList()
+
+        override suspend fun getActiveMemoriesByScopes(scopes: List<String>, now: Long?): List<MemoryEntity> =
+            rows.values.filter { it.scope in scopes }
+
+        override fun getAllMemoriesFlow(): Flow<List<MemoryEntity>> = emptyFlow()
+
+        override fun getMemoryCountsFlow(): Flow<List<app.amber.agent.data.db.dao.MemoryCount>> = emptyFlow()
+
+        override suspend fun getAllMemories(): List<MemoryEntity> = rows.values.toList()
+
+        override suspend fun getMemoryById(id: Int): MemoryEntity? = rows[id]
+
+        override suspend fun insertMemory(memory: MemoryEntity): Long {
+            val id = if (memory.id == 0) nextId++ else memory.id
+            rows[id] = memory.copy(id = id)
+            return id.toLong()
+        }
+
+        override suspend fun updateMemory(memory: MemoryEntity) {
+            rows[memory.id] = memory
+        }
+
+        override suspend fun updateContentBlind(id: Int, content: String, updatedAt: Long): Int {
+            val current = rows[id] ?: return 0
+            rows[id] = current.copy(
+                content = content,
+                revision = current.revision + 1,
+                updatedAt = updatedAt,
+            )
+            return 1
+        }
+
+        override suspend fun updateRecordCas(
+            id: Int,
+            assistantId: String,
+            content: String,
+            scope: String,
+            kind: String,
+            sourceConversationId: String?,
+            sourceMessageIdsJson: String,
+            supersedesIdsJson: String,
+            expiresAt: Long?,
+            confidence: Float,
+            pinned: Boolean,
+            archived: Boolean,
+            createdAt: Long,
+            updatedAt: Long,
+            lastUsedAt: Long?,
+            sourceRunId: String?,
+            sourceTrigger: String?,
+            topicTitle: String?,
+            memberIdsJson: String,
+            useCount: Int,
+            expectedRevision: Long,
+        ): Int {
+            val current = rows[id] ?: return 0
+            if (current.revision != expectedRevision) return 0
+            rows[id] = current.copy(
+                assistantId = assistantId,
+                content = content,
+                scope = scope,
+                kind = kind,
+                sourceConversationId = sourceConversationId,
+                sourceMessageIdsJson = sourceMessageIdsJson,
+                supersedesIdsJson = supersedesIdsJson,
+                expiresAt = expiresAt,
+                confidence = confidence,
+                pinned = pinned,
+                archived = archived,
+                createdAt = createdAt,
+                updatedAt = updatedAt,
+                lastUsedAt = lastUsedAt,
+                revision = current.revision + 1,
+                sourceRunId = sourceRunId,
+                sourceTrigger = sourceTrigger,
+                topicTitle = topicTitle,
+                memberIdsJson = memberIdsJson,
+                useCount = useCount,
+            )
+            return 1
+        }
+
+        override suspend fun updateContentCas(
+            id: Int,
+            content: String,
+            expectedRevision: Long,
+            updatedAt: Long,
+            sourceRunId: String?,
+            sourceTrigger: String?,
+        ): Int {
+            val current = rows[id] ?: return 0
+            if (current.revision != expectedRevision) return 0
+            rows[id] = current.copy(
+                content = content,
+                revision = expectedRevision + 1,
+                updatedAt = updatedAt,
+                sourceRunId = sourceRunId,
+                sourceTrigger = sourceTrigger,
+            )
+            return 1
+        }
+
+        override suspend fun deleteCas(id: Int, expectedRevision: Long): Int {
+            val current = rows[id] ?: return 0
+            if (current.revision != expectedRevision) return 0
+            rows.remove(id)
+            return 1
+        }
+
+        override suspend fun revisionOf(id: Int): Long? = rows[id]?.revision
+
+        override fun getArchivedMemoriesFlow(): Flow<List<MemoryEntity>> = emptyFlow()
+
+        override suspend fun touchMemories(ids: List<Int>, usedAt: Long) {
+            ids.forEach { id ->
+                rows[id]?.let { rows[id] = it.copy(lastUsedAt = usedAt, useCount = it.useCount + 1) }
+            }
+        }
+
+        override suspend fun deleteMemory(id: Int) {
+            rows.remove(id)
+        }
+
+        override suspend fun deleteMemoriesOfAssistant(assistantId: String) {
+            rows.entries.removeAll { it.value.assistantId == assistantId }
+        }
+    }
+
+    private class EmptyCandidateDAO : MemoryCandidateDAO {
+        override fun getCandidatesFlow(): Flow<List<MemoryCandidateEntity>> = emptyFlow()
+        override fun getCandidatesByStatusFlow(status: String): Flow<List<MemoryCandidateEntity>> = emptyFlow()
+        override fun countCandidatesByStatusFlow(status: String): Flow<Int> = emptyFlow()
+        override suspend fun getCandidatesByStatus(status: String): List<MemoryCandidateEntity> = emptyList()
+        override suspend fun getAllCandidates(): List<MemoryCandidateEntity> = emptyList()
+        override suspend fun getCandidateById(id: String): MemoryCandidateEntity? = null
+        override suspend fun insert(candidate: MemoryCandidateEntity) = Unit
+        override suspend fun insertAll(candidates: List<MemoryCandidateEntity>) = Unit
+        override suspend fun update(candidate: MemoryCandidateEntity) = Unit
+    }
+
+    private class EmptyEventDAO : MemoryEventDAO {
+        override fun getRecentEventsFlow(limit: Int): Flow<List<MemoryEventEntity>> = emptyFlow()
+        override suspend fun getRecentEvents(limit: Int): List<MemoryEventEntity> = emptyList()
+        override suspend fun getEventsOfConversation(conversationId: String, limit: Int): List<MemoryEventEntity> = emptyList()
+        override suspend fun countEventsSince(eventType: String, createdAfter: Long): Int = 0
+        override suspend fun insert(event: MemoryEventEntity) = Unit
+    }
+
+    private fun repository(dao: FakeMemoryDAO) = MemoryRepository(dao, EmptyCandidateDAO(), EmptyEventDAO())
+
+    @Test
+    fun `memory records start at revision 1 and bump on each CAS edit`() = runBlocking {
+        val dao = FakeMemoryDAO()
+        val repo = repository(dao)
+        val created = repo.addMemory(
+            scope = MemoryScope.CORE,
+            kind = MemoryKind.NOTE,
+            content = "v1 content",
+            sourceRunId = "run-1",
+            sourceTrigger = MemoryRepository.TRIGGER_TOOL,
+        )
+        assertEquals(1, created.revision)
+        assertEquals("run-1", created.sourceRunId)
+        assertEquals("tool", created.sourceTrigger)
+
+        val updated = repo.updateContentCas(
+            id = created.id,
+            content = "v2 content",
+            expectedRevision = 1,
+            sourceRunId = "run-2",
+            sourceTrigger = MemoryRepository.TRIGGER_TOOL,
+        )
+        assertEquals(2, updated.memory.revision)
+        assertEquals("v2 content", updated.memory.content)
+
+        // Audit digests: old digest hashes the previous content, new the current.
+        assertEquals(ContentDigest.sha256("v1 content"), updated.oldDigest)
+        assertEquals(ContentDigest.sha256("v2 content"), updated.newDigest)
+    }
+
+    @Test
+    fun `stale revision rejects the edit instead of overwriting`() = runBlocking {
+        val dao = FakeMemoryDAO()
+        val repo = repository(dao)
+        val created = repo.addMemory(MemoryScope.CORE, MemoryKind.NOTE, "original")
+
+        // Another writer bumps the revision between approval and apply.
+        repo.updateContentCas(created.id, "someone else's edit", expectedRevision = 1)
+
+        try {
+            repo.updateContentCas(created.id, "stale edit", expectedRevision = 1)
+            fail("expected MemoryStaleException")
+        } catch (e: MemoryStaleException) {
+            assertEquals(created.id, e.memoryId)
+            assertEquals(1, e.expectedRevision)
+            assertEquals(2, e.actualRevision)
+        }
+        // The newer content was NOT overwritten.
+        assertEquals("someone else's edit", repo.getGlobalMemories().single().content)
+    }
+
+    @Test
+    fun `delete is compare-and-set too`() = runBlocking {
+        val dao = FakeMemoryDAO()
+        val repo = repository(dao)
+        val created = repo.addMemory(MemoryScope.CORE, MemoryKind.NOTE, "to delete")
+        repo.updateContentCas(created.id, "changed", expectedRevision = 1)
+
+        try {
+            repo.deleteMemoryCas(created.id, expectedRevision = 1)
+            fail("expected MemoryStaleException")
+        } catch (e: MemoryStaleException) {
+            assertEquals(2, e.actualRevision)
+        }
+        assertEquals(1, repo.getGlobalMemories().size)
+
+        val deleted = repo.deleteMemoryCas(created.id, expectedRevision = 2)
+        assertEquals(created.id, deleted.memoryId)
+        assertEquals(ContentDigest.sha256("changed"), deleted.oldDigest)
+        assertNull(dao.rows[created.id])
+    }
+
+    @Test
+    fun `auto extraction writes are marked with the extraction trigger`() = runBlocking {
+        val dao = FakeMemoryDAO()
+        val repo = repository(dao)
+        val created = repo.addMemory(
+            scope = MemoryScope.LONG_TERM,
+            kind = MemoryKind.NOTE,
+            content = "extracted fact",
+            sourceTrigger = MemoryRepository.TRIGGER_AUTO_EXTRACTION,
+        )
+        assertEquals(MemoryRepository.TRIGGER_AUTO_EXTRACTION, created.sourceTrigger)
+        assertTrue(created.sourceRunId == null)
+    }
+
+    @Test
+    fun `manual and full-record writes bump revision before an old CAS can apply`() = runBlocking {
+        val dao = FakeMemoryDAO()
+        val repo = repository(dao)
+        val created = repo.addMemory(MemoryScope.LONG_TERM, MemoryKind.NOTE, "v1")
+
+        val manual = repo.updateContent(created.id, "manual v2")
+        assertEquals(2, manual.revision)
+
+        val dreamSnapshot = repo.getAllRecords().single()
+        val dream = repo.upsertRecord(dreamSnapshot.copy(content = "dream v3"))
+        assertEquals(3, dream.revision)
+
+        try {
+            repo.updateContentCas(created.id, "stale approval", expectedRevision = 1)
+            fail("expected MemoryStaleException")
+        } catch (error: MemoryStaleException) {
+            assertEquals(3, error.actualRevision)
+        }
+        assertEquals("dream v3", repo.getLongTermMemories().single().content)
+    }
+
+    @Test
+    fun `repeated export is a snapshot for import`() = runBlocking {
+        val dao = FakeMemoryDAO()
+        val repo = repository(dao)
+        val manager = MemoryImportExportManager(repo)
+        val root = Files.createTempDirectory("memory-export").toFile()
+        try {
+            val deleted = repo.addMemory(MemoryScope.LONG_TERM, MemoryKind.NOTE, "memory to delete")
+            val edited = repo.addMemory(MemoryScope.LONG_TERM, MemoryKind.NOTE, "memory before edit")
+            manager.exportTo(root)
+
+            repo.deleteMemory(deleted.id)
+            repo.updateContent(edited.id, "memory after edit")
+            val secondExport = manager.exportTo(root)
+            assertEquals(1, secondExport.memoryCount)
+
+            val exportedRoot = File(root, "AmberAgentMemory")
+            assertTrue(exportedRoot.walkTopDown().none { it.isFile && it.name.contains("memory-to-delete") })
+            assertTrue(exportedRoot.walkTopDown().none { it.isFile && it.name.contains("memory-before-edit") })
+            assertTrue(exportedRoot.walkTopDown().any { it.isFile && it.name.contains("memory-after-edit") })
+
+            val imported = manager.importFrom(root)
+            assertEquals(1, imported.importedCount)
+            val records = repo.getAllRecords()
+            assertEquals(1, records.size)
+            assertEquals(listOf("memory after edit"), records.map { it.content })
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `single memory lookup returns the revision used by the settings editor`() = runBlocking {
+        val dao = FakeMemoryDAO()
+        val repo = repository(dao)
+        val created = repo.addMemory(MemoryScope.CORE, MemoryKind.NOTE, "before")
+
+        val opened = repo.getMemoryById(created.id)
+        assertEquals(created.id, opened?.id)
+        assertEquals(1L, opened?.revision)
+
+        repo.updateContentCas(created.id, "after", expectedRevision = opened!!.revision)
+        val refreshed = repo.getMemoryById(created.id)
+        assertEquals("after", refreshed?.content)
+        assertEquals(2L, refreshed?.revision)
+    }
+
+    @Test
+    fun `settings edit updates content scope and pinned in one CAS revision`() = runBlocking {
+        val dao = FakeMemoryDAO()
+        val repo = repository(dao)
+        val created = repo.addMemory(MemoryScope.CORE, MemoryKind.NOTE, "before")
+        val draft = repo.getMemoryById(created.id)!!
+
+        val updated = repo.updateMemoryCas(
+            draft.copy(
+                content = "after",
+                scope = MemoryScope.LONG_TERM,
+                pinned = true,
+            )
+        ).memory
+
+        assertEquals(2L, updated.revision)
+        assertEquals("after", updated.content)
+        assertEquals(MemoryScope.LONG_TERM, updated.scope)
+        assertTrue(updated.pinned)
+        assertEquals(MemoryRepository.LONG_TERM_MEMORY_ID, dao.rows.getValue(created.id).assistantId)
+    }
+
+    @Test
+    fun `full add persists settings classification and pin in one record`() = runBlocking {
+        val dao = FakeMemoryDAO()
+        val repo = repository(dao)
+
+        val created = repo.addMemory(
+            scope = MemoryScope.SHORT_TERM,
+            kind = MemoryKind.PROJECT,
+            content = "current release focus",
+            assistantId = MemoryRepository.SHORT_TERM_MEMORY_ID,
+            sourceConversationId = "conversation-7",
+            sourceMessageIds = listOf("message-1", "message-2"),
+            supersedesIds = listOf(4, 4),
+            expiresAt = 1234L,
+            confidence = 0.42f,
+            pinned = true,
+            sourceRunId = "run-7",
+            sourceTrigger = MemoryRepository.TRIGGER_TOOL,
+        )
+
+        assertEquals(MemoryScope.SHORT_TERM, created.scope)
+        assertEquals(MemoryKind.PROJECT, created.kind)
+        assertEquals("current release focus", created.content)
+        assertEquals(MemoryRepository.SHORT_TERM_MEMORY_ID, created.assistantId)
+        assertEquals("conversation-7", created.sourceConversationId)
+        assertEquals(listOf("message-1", "message-2"), created.sourceMessageIds)
+        assertEquals(listOf(4), created.supersedesIds)
+        assertEquals(1234L, created.expiresAt)
+        assertEquals(0.42f, created.confidence)
+        assertTrue(created.pinned)
+        assertEquals("run-7", created.sourceRunId)
+        assertEquals(MemoryRepository.TRIGGER_TOOL, created.sourceTrigger)
+        assertEquals(1L, created.revision)
+    }
+
+    @Test
+    fun `memory writer rejects a pre-restore epoch instead of replaying its payload`() = runBlocking {
+        val dao = FakeMemoryDAO()
+        val gate = SyncRestoreWriteGate()
+        val repo = MemoryRepository(
+            memoryDAO = dao,
+            candidateDAO = EmptyCandidateDAO(),
+            eventDAO = EmptyEventDAO(),
+            restoreWriteGate = gate,
+        )
+        val preRestoreEpoch = gate.currentEpoch()
+
+        gate.withRestore { gate.markDataCommitted() }
+
+        try {
+            withContext(SyncRestoreWriteEpoch(preRestoreEpoch)) {
+                repo.addMemory(MemoryScope.LONG_TERM, MemoryKind.NOTE, "stale extraction result")
+            }
+            fail("expected SyncRestoreWriteRejectedException")
+        } catch (_: SyncRestoreWriteRejectedException) {
+            // A stale extraction callback is cancelled at the durable writer.
+        }
+        assertTrue(dao.rows.isEmpty())
+    }
+}

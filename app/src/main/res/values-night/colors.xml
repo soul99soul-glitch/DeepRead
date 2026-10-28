@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark starting-window canvas. -->
+    <color name="splash_bg">#FF161512</color>
+    <color name="amber_brand_ink">#ECE8DF</color>
+</resources>
